@@ -4,12 +4,12 @@
 **Tagline:** Security For Everyone.
 **Platform:** Windows (.exe)
 
-## Phase 1 — Detection engine
-- [ ] File walker (recursive, symlink-safe, permission-error tolerant)
-- [ ] SHA-256 hashing pipeline (streamed, no whole-file loads)
-- [ ] Signature database format (JSON/SQLite) + loader + integrity check
-- [ ] Pattern rules (YARA-style) evaluation
-- [ ] CLI: `argus scan <path>` with plain-language results
+## Phase 1 — Detection engine ✅ (v0.2.0)
+- [x] File walker (recursive, symlink-safe, permission-error tolerant)
+- [x] SHA-256 hashing pipeline (streamed, no whole-file loads)
+- [x] Signature database format (JSON/SQLite) + loader + integrity check
+- [x] Pattern rules (YARA-style) evaluation
+- [x] CLI: `argus scan <path>` with plain-language results
 
 ## Phase 2 — Heuristics
 - [ ] Entropy analysis (packed/encrypted payload detection)
