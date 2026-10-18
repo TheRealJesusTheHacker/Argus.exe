@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# Signatures & data (never commit live signature DBs or scan data)
+*.sigdb
+signatures/local/
+data/
+logs/
+*.log
+
+# Quarantine vault contents (NEVER commit quarantined samples)
+quarantine/*
+!quarantine/.gitkeep
+
+# OS / IDE
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
