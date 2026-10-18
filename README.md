@@ -40,7 +40,7 @@ Argus is Sentinel Safeguard LLC's antivirus and malware detector for Windows. It
 
 ## Status
 
-**Phase 1 — in development.** Scaffold is up; the detection engine comes first.
+**Phase 1 complete (v0.2.0) — the detection engine is live.** Recursive file walker, streamed SHA-256 hashing, a verified SQLite signature database (seeded with the EICAR test signature), a YARA-style pattern-rule engine with plain-language verdicts, and a CLI: `python -m argus scan <path>`. Next: Phase 2 heuristics.
 
 ## The family
 
