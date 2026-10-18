@@ -18,9 +18,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from .rules import RuleHit
 from .signatures import SignatureHit
+
+if TYPE_CHECKING:  # runtime import would be circular; signals are duck-typed
+    from .heuristics.signals import Signal
+
+
+#: Severity ordering, weakest to strongest. Every detection and every
+#: heuristic signal carries one of these; per-severity actions (e.g.
+#: Critical → auto-quarantine) arrive in Phase 4.
+SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def highest_severity(severities: list[str]) -> str | None:
+    """The strongest severity in *severities*, or None if empty."""
+    best: str | None = None
+    best_rank = 0
+    for severity in severities:
+        rank = SEVERITY_RANK.get(severity, 0)
+        if rank > best_rank:
+            best, best_rank = severity, rank
+    return best
 
 
 class Verdict(Enum):
@@ -75,13 +96,24 @@ class Detection:
 
 @dataclass
 class FileAssessment:
-    """All detections for one file plus the combined verdict."""
+    """All detections for one file plus the combined verdict.
+
+    Phase 1 results live in ``detections``; Phase 2 heuristic results
+    live in ``signals`` (with their combined ``score`` and the
+    heuristic-only ``heuristic_verdict``). The file's overall verdict
+    is the worst of the two worlds — worst verdict wins, and every
+    reason from both sides is kept and shown.
+    """
 
     detections: list[Detection] = field(default_factory=list)
+    signals: list["Signal"] = field(default_factory=list)
+    score: int = 0
+    heuristic_verdict: Verdict = Verdict.CLEAN
+    notes: list[str] = field(default_factory=list)
 
     @property
     def verdict(self) -> Verdict:
-        worst = Verdict.CLEAN
+        worst = self.heuristic_verdict
         for det in self.detections:
             if det.kind == "signature":
                 return Verdict.MALICIOUS
@@ -90,6 +122,14 @@ class FileAssessment:
             elif worst is Verdict.CLEAN:
                 worst = Verdict.SUSPICIOUS
         return worst
+
+    @property
+    def max_severity(self) -> str | None:
+        """Highest severity among this file's detections and signals."""
+        return highest_severity(
+            [d.severity for d in self.detections]
+            + [s.severity for s in self.signals]
+        )
 
     @property
     def flagged(self) -> bool:

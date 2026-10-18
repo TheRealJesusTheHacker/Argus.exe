@@ -15,6 +15,10 @@ Hard rules learned from real-world scanner bugs:
 - **Permission-error tolerant.** Anything that cannot be read is skipped,
   counted, and reported — never a crash, never silently swallowed.
 - **Single pass.** Hashing and rule matching share one read of the file.
+- **Heuristics second pass.** Phase 2 heuristic analysis (PE parsing,
+  entropy, string extraction) makes its own streamed pass over
+  executables and scripts, capped at 64 MB, and merges into the same
+  per-file assessment — worst verdict wins, every reason shown.
 """
 
 from __future__ import annotations
@@ -26,7 +30,9 @@ from pathlib import Path
 from typing import Iterator
 
 from .detections import FileAssessment, Verdict, assess
+from .heuristics.analyze import analyze_file
 from .rules import MAX_RULE_SCAN_SIZE, Rule, RuleMatcher
+from .scoring import score_signals
 from .signatures import SignatureDB
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
@@ -165,12 +171,16 @@ def scan_file(
     db: SignatureDB,
     rules: list[Rule],
     chunk_size: int = CHUNK_SIZE,
+    *,
+    heuristics: bool = True,
 ) -> ScannedFile:
-    """Scan one file: hash it, check signatures, evaluate rules.
+    """Scan one file: hash it, check signatures, evaluate rules, and
+    (unless ``heuristics=False``) run Phase 2 heuristic analysis.
 
     Hashing and rule matching share a single streamed read. Files over
     ``MAX_RULE_SCAN_SIZE`` get hash/signature checks only; the skip is
-    noted on the result rather than hidden.
+    noted on the result rather than hidden. Heuristic results merge
+    into the same assessment: worst verdict wins, all reasons kept.
     """
     result = FileResult(path=path)
     matcher = RuleMatcher(rules)
@@ -213,19 +223,47 @@ def scan_file(
     signature_hit = db.lookup(result.sha256)
     rule_hits = matcher.finish() if rule_scan else []
     assessment = assess(signature_hit, rule_hits)
+
+    if heuristics:
+        _apply_heuristics(path, read_size, assessment)
+
     return ScannedFile(
         result=result, assessment=assessment, rules_skipped_reason=rules_skipped_reason
     )
 
 
-def scan_path(root: Path | str, db: SignatureDB, rules: list[Rule]) -> ScanReport:
+def _apply_heuristics(path: Path, size: int, assessment: FileAssessment) -> None:
+    """Run heuristic analysis and merge its outcome into *assessment*.
+
+    Analysis failures are recorded as notes — heuristics must never
+    break a scan that signatures and rules already completed.
+    """
+    try:
+        report = analyze_file(path, size)
+    except Exception as exc:  # fail safe: note it, keep the Phase 1 verdict
+        assessment.notes.append(f"heuristic analysis failed: {exc}")
+        return
+    scored = score_signals(report.signals, signed=report.signed)
+    assessment.signals = scored.signals
+    assessment.score = scored.score
+    assessment.heuristic_verdict = scored.verdict
+    assessment.notes.extend(report.notes)
+
+
+def scan_path(
+    root: Path | str,
+    db: SignatureDB,
+    rules: list[Rule],
+    *,
+    heuristics: bool = True,
+) -> ScanReport:
     """Scan a file or directory tree and return a full report."""
     root_path = Path(root)
     stats = ScanStats()
     report = ScanReport(root=root_path, stats=stats)
 
     for path in iter_files(root_path, stats):
-        scanned = scan_file(path, db, rules)
+        scanned = scan_file(path, db, rules, heuristics=heuristics)
         if scanned.result.ok:
             stats.files_scanned += 1
             stats.bytes_scanned += scanned.result.size or 0
