@@ -37,9 +37,19 @@ def _print_human(report: ScanReport) -> None:
     for scanned in report.detections:
         verdict = scanned.verdict.value.upper()
         print(f"\n[{verdict}] {scanned.path}")
-        for det in scanned.assessment.detections:
-            print(f"  - {det.name} ({det.severity})")
+        assessment = scanned.assessment
+        if assessment.max_severity:
+            print(f"  Highest severity: {assessment.max_severity.capitalize()}")
+        for det in assessment.detections:
+            print(f"  - {det.name} ({det.severity.capitalize()})")
             print(f"    {det.reason}")
+        if assessment.signals:
+            print(f"  Heuristic signals (risk score: {assessment.score}):")
+            for sig in assessment.signals:
+                print(f"  - {sig.name} ({sig.severity.capitalize()}, +{sig.points})")
+                print(f"    {sig.explanation}")
+        for note in assessment.notes:
+            print(f"  Note: {note}")
         if scanned.result.sha256:
             print(f"    SHA-256: {scanned.result.sha256}")
 
@@ -82,6 +92,8 @@ def _report_to_dict(report: ScanReport) -> dict:
                 "sha256": f.result.sha256,
                 "error": f.result.error,
                 "verdict": f.verdict.value,
+                "max_severity": f.assessment.max_severity,
+                "score": f.assessment.score,
                 "rules_skipped_reason": f.rules_skipped_reason,
                 "detections": [
                     {
@@ -93,6 +105,16 @@ def _report_to_dict(report: ScanReport) -> dict:
                     }
                     for d in f.assessment.detections
                 ],
+                "signals": [
+                    {
+                        "name": s.name,
+                        "severity": s.severity,
+                        "points": s.points,
+                        "explanation": s.explanation,
+                    }
+                    for s in f.assessment.signals
+                ],
+                "notes": list(f.assessment.notes),
             }
             for f in report.files
         ],
@@ -153,7 +175,7 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             return EXIT_ERROR
 
     try:
-        report = scan_path(target, db, rules)
+        report = scan_path(target, db, rules, heuristics=not args.no_heuristics)
     finally:
         db.close()
 
@@ -186,6 +208,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"signature database path (default: {DEFAULT_DB_NAME})")
     p_scan.add_argument("--rules", default=None,
                         help="optional JSON file with extra/replacement rules")
+    p_scan.add_argument("--no-heuristics", action="store_true",
+                        help="skip Phase 2 heuristic analysis (PE structure, "
+                             "entropy, script signals) — signatures and "
+                             "pattern rules only")
     p_scan.add_argument("--json", action="store_true",
                         help="print machine-readable JSON instead of text")
     p_scan.set_defaults(func=_cmd_scan)
