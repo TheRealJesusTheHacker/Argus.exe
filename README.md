@@ -34,13 +34,13 @@ Argus is Sentinel Safeguard LLC's antivirus and malware detector for Windows. It
 |-------|-------|
 | **Phase 1 — Detection engine** | Core scanner: file walking, hashing (SHA-256), signature database format + loader, YARA-style pattern rules. CLI scan. |
 | **Phase 2 — Heuristics** | Behavioral rules engine: entropy analysis, PE inspection, suspicious API/import patterns, packer detection. Risk scoring. |
-| **Phase 3 — Real-time watch** | Filesystem watcher + process monitor; on-write and on-execute scanning; pre-execution blocking. |
-| **Phase 4 — Quarantine & reporting** | Encrypted quarantine vault, restore/remove flows, scan reports, detection explanations, history/audit log. |
-| **Phase 5 — Product** | GUI, signature auto-update channel, installer, settings, performance tuning, release packaging. |
+| **Phase 3 — Real-time watch** | Filesystem watcher + on-execute blocking, built as an always-on background component that becomes a Windows service (starts at boot). |
+| **Phase 4 — Quarantine & actions** | Encrypted quarantine vault, per-severity actions (quarantine / delete / allow), scan reports, detection explanations, history/audit log. Every action user-confirmed — never silent. |
+| **Phase 5 — Product** | Premium GUI (Sentinel green/black) with a Dev Toolkit panel, a proper Windows installer, background service with system tray, Windows Security Center registration as the system's antivirus, signature auto-updates. Argus installs and becomes the machine's default security app — not a portable scanner. |
 
 ## Status
 
-**Phase 1 complete (v0.2.0) — the detection engine is live.** Recursive file walker, streamed SHA-256 hashing, a verified SQLite signature database (seeded with the EICAR test signature), a YARA-style pattern-rule engine with plain-language verdicts, and a CLI: `python -m argus scan <path>`. Next: Phase 2 heuristics.
+**Phase 2 complete (v0.3.0) — heuristics are live.** On top of the Phase 1 engine (walker, streamed SHA-256, verified signature DB, pattern rules), Argus now scores *unknown* files by what they resemble: a pure-stdlib PE parser (sections, imports, exports, TLS callbacks, signature presence, overlay), streamed entropy analysis (whole file, sliding windows, per section), and a weighted signal library — process-injection combos, credential access, persistence mechanisms, keylogging, download-and-execute droppers, packer marks, masqueraded filenames, script and LOLBin abuse — each signal explained in plain language and carrying its own severity (Critical / High / Medium / Low). The scoring model combines signals into Clean / Suspicious / Malicious, with critical combinations short-circuiting to Malicious and a digital signature lowering — never erasing — a score. Next: Phase 3 real-time protection.
 
 ## The family
 
