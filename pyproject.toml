@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "argus-exe"
+version = "0.2.0"
+description = "ARGUS.EXE — antivirus & malware detection by Sentinel Safeguard LLC. All eyes. All detection."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary — Sentinel Safeguard LLC" }
+authors = [{ name = "Sentinel Safeguard LLC" }]
+keywords = ["antivirus", "malware", "security", "scanner"]
+# Phase 1 is pure standard library — no runtime dependencies.
+
+[project.scripts]
+argus = "argus.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["argus*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
