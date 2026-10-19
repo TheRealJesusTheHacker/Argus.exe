@@ -337,6 +337,41 @@ def test_quarantine_page_simulation_records_intent_only(
     ]
 
 
+def test_protection_start_refused_in_simulation(qapp, backend, window):
+    """v1.0.4 sim honesty: with Dev Toolkit simulation mode on,
+    ProtectionController.start refuses to start REAL protection
+    (which would move files) and explains why, in plain language."""
+    backend.dev.simulation_mode = True
+    failures: list[str] = []
+    window.protection.failed.connect(failures.append)
+    assert window.protection.start() is False
+    assert failures and "Simulation mode is on" in failures[0]
+    assert window.protection.running is False
+
+
+def test_pending_page_shows_fingerprint_and_source(
+    qapp, backend, tmp_path, window
+):
+    """v1.0.4 approval safety: the Pending page table shows the
+    short SHA-256 and the source alongside the action."""
+    vault = backend.vault()
+    vault.add_pending(
+        source="realtime",
+        path=str(tmp_path / "evil.exe"),
+        action="quarantine",
+        sha256="abcdef0123456789" + "0" * 48,
+        severity="high",
+        verdict="Malicious",
+        detection_name="Test.Detection",
+        reasons=["looked bad"],
+    )
+    page = window.pending_page
+    page.refresh()
+    assert page.table.rowCount() == 1
+    assert page.table.item(0, 4).text().startswith("abcdef012345")
+    assert page.table.item(0, 5).text() == "realtime"
+
+
 def test_extract_page_argument():
     """Fix #22: --page selects the start page (the Dev Toolkit
     shortcut passes '--page devtoolkit') and is stripped from the
