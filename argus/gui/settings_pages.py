@@ -49,7 +49,7 @@ from ..devtools import (
 from ..rules import BUILTIN_RULES
 from ..signatures import SignatureDB
 from . import theme
-from .backend import GuiBackend, ProtectionController
+from .backend import IS_WINDOWS, GuiBackend, ProtectionController
 from .format import policy_plain_language, score_band
 from .widgets import ScoreRing, SeverityBadge, ToggleSwitch, severity_item
 
@@ -213,7 +213,17 @@ class SettingsPage(QWidget):
         save.clicked.connect(self._save)
         layout.addWidget(save)
         self.saved_label = QLabel("")
+        self.saved_label.setWordWrap(True)
         layout.addWidget(self.saved_label)
+        # Shown only when a save fails because the config file is
+        # not writable by this Windows account (installed layout:
+        # the config lives in the trusted root). Config writes are
+        # never delegated to the service — the honest fix is an
+        # elevated relaunch, offered here.
+        self.relaunch_button = QPushButton("Relaunch as administrator")
+        self.relaunch_button.setVisible(False)
+        self.relaunch_button.clicked.connect(self._relaunch_as_admin)
+        layout.addWidget(self.relaunch_button)
         layout.addStretch(1)
 
     # ------------------------------------------------------------------
@@ -265,12 +275,42 @@ class SettingsPage(QWidget):
             self.excl_hashes.item(i).text()
             for i in range(self.excl_hashes.count())
         )
-        self._backend.save_config()
+        try:
+            self._backend.save_config()
+        except PermissionError:
+            self.saved_label.setText(
+                "Settings could not be saved: this Windows account "
+                "does not have permission to change Argus's "
+                "configuration file (it is protected so that only "
+                "administrators and the Argus service can change "
+                "protection settings). Relaunch Argus as "
+                "administrator to make changes — your edits above "
+                "are still on screen, but they have NOT been saved."
+            )
+            self.relaunch_button.setVisible(IS_WINDOWS)
+            return
+        self.relaunch_button.setVisible(False)
         if self._protection is not None:
             self._protection.reload_config()
         self.saved_label.setText(
             "Settings saved. Running protection picked up the changes."
         )
+
+    def _relaunch_as_admin(self) -> None:
+        from .backend import relaunch_gui_as_admin
+
+        if relaunch_gui_as_admin():
+            self.saved_label.setText(
+                "An administrator copy of Argus is opening — make "
+                "your changes there. (Windows may ask you to approve "
+                "the elevation first.)"
+            )
+        else:
+            self.saved_label.setText(
+                "The elevated relaunch did not start. Right-click "
+                "the Argus shortcut and choose 'Run as administrator' "
+                "instead."
+            )
 
 
 class BenchWorker(QObject):
