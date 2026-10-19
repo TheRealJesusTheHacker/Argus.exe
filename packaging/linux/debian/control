@@ -1,0 +1,20 @@
+Package: argus
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Sentinel Safeguard LLC <Sentinelsafeguard@outlook.com>
+Depends: libc6 (>= 2.31), libstdc++6, libgcc-s1, libgl1, libegl1, libfontconfig1, libglib2.0-0, libxkbcommon0, libdbus-1-3, systemd
+Description: ARGUS.EXE — antivirus & malware detector (Linux edition)
+ Sentinel Safeguard LLC's antivirus for Debian-based systems
+ (Kali Linux, Parrot OS, Debian, Ubuntu): real-time folder
+ protection by a systemd service, signature + heuristic +
+ behaviour-rule scanning, an encrypted quarantine vault, and a
+ desktop window for scans, decisions and reports.
+ .
+ The protection service verifies every privileged action request
+ over a Unix socket using the kernel's own record of who is
+ asking (SO_PEERCRED) plus the installed program's recorded
+ SHA-256 fingerprint — the Linux twin of the Windows edition's
+ verified named pipe.
+Homepage: https://github.com/TheRealJesusTheHacker/Argus.exe
