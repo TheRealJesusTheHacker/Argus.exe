@@ -43,7 +43,11 @@ def _discount_pe(signed: bool) -> bytes:
         .set_entry(0)
     )
     if signed:
-        builder.set_cert(0x1000)
+        # Hunt P1-20: the signed trim requires a certificate
+        # payload that DER-parses as PKCS#7 with an extracted
+        # signer — a valid table header over zero payload (the
+        # old set_cert(0x1000) fixture) earns no trim anymore.
+        builder.set_cert_signer("FixtureSoft Ltd", "FixtureSoft")
     return builder.build()
 
 
