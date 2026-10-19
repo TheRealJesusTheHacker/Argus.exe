@@ -21,17 +21,60 @@ from PySide6.QtWidgets import (
 from . import theme
 
 
+#: Alpha of a badge's tinted background (the old "26" hex alpha:
+#: 0x26 / 255 ≈ 0.15) — expressed honestly as rgba() now.
+BADGE_TINT_ALPHA = 0.15
+
+
+def badge_tint_rgba(color: str) -> str:
+    """The badge background for a severity *color*: the color at
+    :data:`BADGE_TINT_ALPHA` over the panel surface, as an
+    ``rgba()`` string Qt parses literally.
+
+    The previous construction appended the alpha to the hex string
+    (``f"{color}26"``), producing an 8-digit hex — which Qt reads
+    as #AARRGGBB, alpha FIRST. The intended green tint rendered as
+    a different hue entirely (P1-24). Building rgba() channel by
+    channel makes the rendered tint the intended one.
+    """
+    hex_color = color.lstrip("#")
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r}, {g}, {b}, {BADGE_TINT_ALPHA})"
+
+
+def badge_tint_composited(color: str, surface: str = theme.PANEL) -> str:
+    """The tint as it actually renders: the badge color alpha-
+    composited over *surface* (badges sit on panels), as #RRGGBB.
+    Tests assert hue and text contrast against THIS color — the
+    one a user's eyes meet."""
+    hex_color = color.lstrip("#")
+    base = surface.lstrip("#")
+    channels = []
+    for i in (0, 2, 4):
+        fg = int(hex_color[i : i + 2], 16)
+        bg = int(base[i : i + 2], 16)
+        channels.append(round(fg * BADGE_TINT_ALPHA + bg * (1 - BADGE_TINT_ALPHA)))
+    return "#%02x%02x%02x" % tuple(channels)
+
+
 class SeverityBadge(QLabel):
     """A small pill that shows a severity or verdict in its color."""
 
     def __init__(self, text: str = "", color: str | None = None, parent=None):
         super().__init__(text, parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.set_color(color or theme.TEXT_DIM)
+        self._color = color or theme.TEXT_DIM
+        self.set_color(self._color)
+
+    @property
+    def color(self) -> str:
+        """The severity/verdict color this badge is drawn in."""
+        return self._color
 
     def set_color(self, color: str) -> None:
+        self._color = color
         self.setStyleSheet(
-            f"background: {color}26; color: {color}; "
+            f"background: {badge_tint_rgba(color)}; color: {color}; "
             f"border: 1px solid {color}; border-radius: 9px; "
             "padding: 2px 10px; font-weight: 600; font-size: 11px;"
         )
@@ -184,10 +227,15 @@ class StatCard(QFrame):
         self.value_label.setText(value)
 
 
-def make_app_icon(*, alert: bool = False, protected: bool = True) -> QIcon:
+def make_app_icon(
+    *, alert: bool = False, protected: bool = True, paused: bool = False
+) -> QIcon:
     """Draw the Argus eye: a green ring and a watching center dot on
     a dark rounded square. ``alert`` turns the ring red (a detection
-    needs attention); ``protected=False`` greys it (protection off)."""
+    needs attention); ``protected=False`` greys it (protection off);
+    ``paused`` is its own DISTINCT state (tray P2): an amber ring
+    with two pause bars instead of the watching dot — never
+    confusable with on, off, or alert."""
     icon = QIcon()
     for size in (16, 24, 32, 48, 64, 128, 256):
         pixmap = QPixmap(size, size)
@@ -203,6 +251,8 @@ def make_app_icon(*, alert: bool = False, protected: bool = True) -> QIcon:
 
         if alert:
             ring = QColor(theme.SEVERITY_COLORS["critical"])
+        elif paused:
+            ring = QColor(theme.SEVERITY_COLORS["medium"])
         elif protected:
             ring = QColor(theme.GREEN)
         else:
@@ -214,10 +264,24 @@ def make_app_icon(*, alert: bool = False, protected: bool = True) -> QIcon:
         painter.drawEllipse(eye)
         painter.setBrush(ring)
         painter.setPen(Qt.PenStyle.NoPen)
-        dot = size * 0.14
-        painter.drawEllipse(QRectF(
-            size / 2 - dot / 2, size / 2 - dot / 2, dot, dot
-        ))
+        if paused:
+            bar_w = max(1.5, size * 0.10)
+            bar_h = size * 0.30
+            gap = size * 0.07
+            y = size / 2 - bar_h / 2
+            painter.drawRoundedRect(
+                QRectF(size / 2 - gap / 2 - bar_w, y, bar_w, bar_h),
+                bar_w / 2, bar_w / 2,
+            )
+            painter.drawRoundedRect(
+                QRectF(size / 2 + gap / 2, y, bar_w, bar_h),
+                bar_w / 2, bar_w / 2,
+            )
+        else:
+            dot = size * 0.14
+            painter.drawEllipse(QRectF(
+                size / 2 - dot / 2, size / 2 - dot / 2, dot, dot
+            ))
         painter.end()
         icon.addPixmap(pixmap)
     return icon
