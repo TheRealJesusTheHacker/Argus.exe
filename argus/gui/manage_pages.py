@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import action_requests
+from ..paths import vault_view_path
 from ..reporting import render_text_report
 from .backend import GuiBackend
 from .format import human_bytes
@@ -86,11 +88,17 @@ class QuarantinePage(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self._entries: list = []
+        #: True when this process opened the vault itself; False
+        #: when the list came from the service-published vault view
+        #: (installed layout, standard user) — actions then go
+        #: through the service request channel.
+        self._direct = True
         self.refresh()
 
     def refresh(self) -> None:
-        vault = self._backend.vault()
-        self._entries = vault.list_entries(status="quarantined")
+        entries, direct = self._backend.vault_entries_view()
+        self._direct = direct
+        self._entries = [e for e in entries if e.status == "quarantined"]
         self.table.setRowCount(len(self._entries))
         for row, entry in enumerate(self._entries):
             entry_name = Path(entry.original_path).name
@@ -99,9 +107,35 @@ class QuarantinePage(QWidget):
             self.table.setItem(row, 2, severity_item(entry.severity))
             self.table.setItem(row, 3, QTableWidgetItem(human_bytes(entry.size)))
             self.table.setItem(row, 4, QTableWidgetItem(entry.quarantined_at))
+        if not direct and not vault_view_path().exists():
+            # No direct access AND no service snapshot: there is
+            # nothing this window can truthfully show or do.
+            for button in (
+                self.restore_button, self.allow_button, self.delete_button,
+            ):
+                button.setEnabled(False)
+            self.status_label.setText(
+                "Argus cannot read the quarantine vault from this "
+                "Windows account — the vault is protected so that "
+                "only the Argus service and administrators can open "
+                "it, and the protection service has not published a "
+                "vault snapshot. Run Argus as administrator to "
+                "manage quarantine directly."
+            )
+            return
+        for button in (
+            self.restore_button, self.allow_button, self.delete_button,
+        ):
+            button.setEnabled(True)
         if not self._entries:
             self.status_label.setText(
                 "The vault is empty — nothing is quarantined right now."
+            )
+        elif not direct:
+            self.status_label.setText(
+                f"{len(self._entries)} file(s) locked in the vault. "
+                "The list is read from the protection service's "
+                "snapshot; actions are carried out by the service."
             )
         else:
             self.status_label.setText(
@@ -122,42 +156,66 @@ class QuarantinePage(QWidget):
         entry = self._selected_entry()
         if entry is None:
             return
-        # Every action routes through the backend's action surface:
-        # the real engine, or the simulated one while Dev Toolkit
-        # simulation mode is on (then the buttons record intent and
-        # touch nothing — the vault is never reached directly here).
-        engine = self._backend.actions()
         entry_name = Path(entry.original_path).name
+        confirms = {
+            "restore": (
+                "Restore this file?",
+                f"{entry_name} will be put back at "
+                f"{entry.original_path}. Only restore files you "
+                "believe are safe.",
+            ),
+            "allow": (
+                "Restore and allow this file?",
+                f"{entry_name} will be put back AND "
+                "its fingerprint excluded, so Argus stops "
+                "flagging it. Only vouch for files you trust.",
+            ),
+            "delete": (
+                "Delete permanently?",
+                f"{entry_name} will be destroyed for "
+                "good. This cannot be undone.",
+            ),
+        }
+        title, body = confirms[action]
+        if not _confirm(self, title, body):
+            return
+        if not self._direct and not self._backend.simulation_mode:
+            # The vault is not this process's to touch (installed
+            # layout): the human confirmed HERE, and the protection
+            # service carries it out against its own records.
+            result = action_requests.submit_and_wait(
+                action,
+                entry_id=entry.id,
+                sha256=entry.sha256,
+                requested_by="Argus GUI (quarantine page)",
+            )
+            self.refresh()
+            self.status_label.setText(result.message)
+            return
+        # Direct route (portable / elevated / dev, or simulation —
+        # which records intent through the same surface).
+        engine = self._backend.actions()
         try:
             if action == "restore":
-                if not _confirm(
-                    self, "Restore this file?",
-                    f"{entry_name} will be put back at "
-                    f"{entry.original_path}. Only restore files you "
-                    "believe are safe.",
-                ):
-                    return
                 outcome = engine.restore_entry(entry.id, confirmed=True)
-                message = outcome.message
             elif action == "allow":
-                if not _confirm(
-                    self, "Restore and allow this file?",
-                    f"{entry_name} will be put back AND "
-                    "its fingerprint excluded, so Argus stops "
-                    "flagging it. Only vouch for files you trust.",
-                ):
-                    return
                 outcome = engine.allow_entry(entry.id, confirmed=True)
-                message = outcome.message
             else:  # delete
-                if not _confirm(
-                    self, "Delete permanently?",
-                    f"{entry_name} will be destroyed for "
-                    "good. This cannot be undone.",
-                ):
-                    return
                 outcome = engine.delete_entry(entry.id, confirmed=True)
-                message = outcome.message
+            message = outcome.message
+        except PermissionError:
+            # The vault turned out not to be writable by this
+            # process after all — hand the confirmed action to the
+            # service rather than failing the user.
+            result = action_requests.submit_and_wait(
+                action,
+                entry_id=entry.id,
+                sha256=entry.sha256,
+                requested_by="Argus GUI (quarantine page)",
+            )
+            self.refresh()
+            self.status_label.setText(result.message)
+            return
         except Exception as exc:
             QMessageBox.critical(self, "That did not work", str(exc))
             return
@@ -187,9 +245,10 @@ class PendingPage(QWidget):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["Action", "File", "Threat", "Severity", "Detected"]
+            ["Action", "File", "Threat", "Severity", "SHA-256",
+             "Source", "Detected"]
         )
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table, 1)
@@ -211,22 +270,54 @@ class PendingPage(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self._pending: list = []
+        #: True when the list came from the shared pending DB
+        #: because the vault could not be opened by this process —
+        #: decisions then go through the service request channel.
+        self._via_service = False
         self.refresh()
 
     def refresh(self) -> None:
-        engine = self._backend.real_actions()
-        self._pending = engine.list_pending()
+        try:
+            engine = self._backend.real_actions()
+            self._pending = engine.list_pending()
+            self._via_service = False
+        except Exception:
+            # Installed layout, standard user: read the queue from
+            # the shared pending database directly.
+            self._pending = [
+                p for p in self._backend.pending_actions_loose()
+                if p.status == "pending"
+            ]
+            self._via_service = True
         self.table.setRowCount(len(self._pending))
         for row, pending in enumerate(self._pending):
             self.table.setItem(row, 0, QTableWidgetItem(pending.action))
             self.table.setItem(row, 1, QTableWidgetItem(pending.path))
             self.table.setItem(row, 2, QTableWidgetItem(pending.detection_name or "—"))
             self.table.setItem(row, 3, severity_item(pending.severity))
-            self.table.setItem(row, 4, QTableWidgetItem(pending.created_at))
+            short_sha = (
+                pending.sha256[:12] + "…" if pending.sha256 else "none recorded"
+            )
+            self.table.setItem(row, 4, QTableWidgetItem(short_sha))
+            self.table.setItem(row, 5, QTableWidgetItem(pending.source or "—"))
+            self.table.setItem(row, 6, QTableWidgetItem(pending.created_at))
         self.status_label.setText(
             "Nothing is waiting — you are all caught up."
             if not self._pending
             else f"{len(self._pending)} action(s) waiting for your decision."
+        )
+
+    def _confirm_text(self, pending, verb: str) -> str:
+        """The decision dialog text: exactly what will happen, to
+        exactly which file — fingerprint, reasons, and source."""
+        short_sha = pending.sha256[:12] + "…" if pending.sha256 else "none recorded"
+        reasons = " ".join(pending.reasons) if pending.reasons else "—"
+        return (
+            f"Argus will {verb} {pending.path}\n\n"
+            f"Detection: {pending.detection_name or '—'}\n"
+            f"Fingerprint (SHA-256): {short_sha}\n"
+            f"Source: {pending.source or '—'}\n"
+            f"Why it was flagged: {reasons}"
         )
 
     def _act(self, action: str) -> None:
@@ -238,27 +329,56 @@ class PendingPage(QWidget):
             )
             return
         pending = self._pending[row]
-        engine = self._backend.real_actions()
+        verb = pending.action if action == "approve" else "leave alone"
+        if not _confirm(
+            self,
+            f"{'Approve' if action == 'approve' else 'Reject'} {pending.action}?",
+            self._confirm_text(pending, verb),
+        ):
+            return
+        kind = "approve-pending" if action == "approve" else "reject-pending"
+        if self._via_service and not self._backend.simulation_mode:
+            result = action_requests.submit_and_wait(
+                kind,
+                pending_id=pending.id,
+                sha256=pending.sha256,
+                requested_by="Argus GUI (pending page)",
+            )
+            self.refresh()
+            self.status_label.setText(result.message)
+            return
+        # Decisions route through backend.actions() like every
+        # other page: in simulation mode the intent is recorded and
+        # the queue is NOT decided.
+        engine = self._backend.actions()
         try:
             if action == "approve":
-                if not _confirm(
-                    self, f"Approve {pending.action}?",
-                    f"Argus will {pending.action} {pending.path} "
-                    f"({pending.detection_name or 'detection'}).",
-                ):
-                    return
                 # approve() returns the ActionOutcome — its message
                 # says what was done.
                 message = engine.approve(pending.id).message
             else:
-                # reject() returns the decided PendingAction (it has
-                # no .message) — build the text from it.
                 decided = engine.reject(pending.id)
-                message = (
-                    f"Rejected — Argus will leave "
-                    f"{Path(decided.path).name} as it is "
-                    f"(the {decided.action} request was declined)."
-                )
+                # The real engine returns the decided PendingAction
+                # (no .message); the simulated one returns an
+                # ActionOutcome. Handle both honestly.
+                if hasattr(decided, "message"):
+                    message = decided.message
+                else:
+                    message = (
+                        f"Rejected — Argus will leave "
+                        f"{Path(decided.path).name} as it is "
+                        f"(the {decided.action} request was declined)."
+                    )
+        except PermissionError:
+            result = action_requests.submit_and_wait(
+                kind,
+                pending_id=pending.id,
+                sha256=pending.sha256,
+                requested_by="Argus GUI (pending page)",
+            )
+            self.refresh()
+            self.status_label.setText(result.message)
+            return
         except Exception as exc:
             QMessageBox.critical(self, "That did not work", str(exc))
             return
