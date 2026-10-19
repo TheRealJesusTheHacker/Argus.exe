@@ -1,0 +1,32 @@
+#!/bin/sh
+# Argus (.deb edition) — pre-removal script.
+#
+# On remove (and deconfigure): stop the protection service and
+# disable it, so a removed package never leaves a unit pointing
+# at a program that no longer exists. Upgrades do NOT stop the
+# service here (dpkg runs prerm with "upgrade" for those) — the
+# new postinst restarts it onto the new binary.
+# The data tree is NOT touched here: only a purge removes data
+# (see postrm).
+set -e
+
+UNIT=argus-protection.service
+
+case "$1" in
+    remove|deconfigure)
+        if command -v systemctl >/dev/null 2>&1; then
+            if [ -d /run/systemd/system ]; then
+                systemctl stop "$UNIT" || true
+            fi
+            systemctl disable "$UNIT" || true
+        fi
+        ;;
+    upgrade|failed-upgrade)
+        ;;
+    *)
+        echo "prerm called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
