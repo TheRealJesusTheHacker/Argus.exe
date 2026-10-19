@@ -135,6 +135,12 @@ class DirectoryWatcher:
     reported again — modifications are re-scanned.
     """
 
+    #: How change detection is fed: this portable baseline polls.
+    #: The Linux inotify backend (argus.inotify_watcher) reports
+    #: "inotify". The service status surfaces the value so a
+    #: fallback is visible, never silent.
+    backend = "polling"
+
     def __init__(
         self,
         dirs: list[Path | str],
