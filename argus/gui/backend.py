@@ -15,25 +15,27 @@ nothing.
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
+from .. import action_requests
 from ..actions import ActionEngine
 from ..config import DEFAULT_CONFIG_NAME, ArgusConfig
 from ..devtools import DevSettings, SimulatedActionEngine, evaluate_signals
 from ..heuristics.analyze import analyze_file
-from ..paths import data_dir
-from ..quarantine import Vault
+from ..paths import data_dir, default_pending_db, vault_view_path
+from ..quarantine import QuarantineEntry, Vault, read_pending_db
 from ..reporting import History
 from ..rules import BUILTIN_RULES
 from ..scanner import ScannedFile, iter_files, scan_file
 from ..service import ArgusService
-from ..signatures import SignatureDB, ensure_signature_db
+from ..signatures import SignatureDB, SignatureError, bootstrap_signature_db
 
 log = logging.getLogger("argus.gui")
 
@@ -58,10 +60,17 @@ class GuiBackend:
         )
         self.config = ArgusConfig.load(self.config_path)
         # First-run bootstrap: a fresh install has no signature
-        # database yet — create + seed it so the first scan (and
-        # protection start) works instead of failing on a missing
-        # file. An existing database is never touched here.
-        ensure_signature_db(self.config.signature_db)
+        # database yet — create + seed the DEFAULT one so the first
+        # scan (and protection start) works instead of failing on a
+        # missing file. A missing database at a configured path is
+        # an error, but it must never stop the GUI from opening:
+        # record it, log it loudly, and let scans surface it.
+        self.signature_db_error: str | None = None
+        try:
+            bootstrap_signature_db(self.config.signature_db)
+        except SignatureError as exc:
+            self.signature_db_error = str(exc)
+            log.error("signature database bootstrap: %s", exc)
         self.devtools_path = (
             Path(devtools_path)
             if devtools_path
@@ -75,6 +84,10 @@ class GuiBackend:
 
     # -- persistence ---------------------------------------------------
     def save_config(self) -> None:
+        # Merge the on-disk exclusions first: the service may have
+        # vouched for files since this copy was loaded, and saving
+        # must never erase its vouches (lost update).
+        self.config.absorb_disk_exclusions(self.config_path)
         self.config.save(self.config_path)
 
     def save_dev(self) -> None:
@@ -85,10 +98,73 @@ class GuiBackend:
         return self.dev.simulation_mode
 
     # -- stores ---------------------------------------------------------
+    def pending_db_path(self) -> Path:
+        if self.config.pending_db:
+            return Path(self.config.pending_db)
+        return default_pending_db()
+
     def vault(self) -> Vault:
         if self._vault is None:
-            self._vault = Vault.open(Path(self.config.vault_dir or _default_vault()))
+            self._vault = Vault.open(
+                Path(self.config.vault_dir or _default_vault()),
+                self.pending_db_path(),
+            )
         return self._vault
+
+    def vault_writable(self) -> bool:
+        """Can THIS process write to the vault? False on an
+        installed machine for a standard user (the vault sits in
+        the trusted root) — vault actions then go through the
+        service request channel instead."""
+        vault_dir = Path(self.config.vault_dir or _default_vault())
+        return action_requests.path_writable(vault_dir)
+
+    def vault_entries_view(self) -> tuple[list[QuarantineEntry], bool]:
+        """Quarantine entries for display: ``(entries, direct)``.
+
+        Direct when this process can open the vault; otherwise the
+        service-published ``shared/vault-view.json`` snapshot is
+        read (entries only — never blobs). When neither is
+        available, the entry list is empty and ``direct`` is False,
+        and the page shows its administrator guidance.
+        """
+        try:
+            return self.vault().list_entries(), True
+        except Exception:
+            log.exception("vault not directly readable — using the vault view")
+        try:
+            raw = json.loads(vault_view_path().read_text(encoding="utf-8"))
+            entries = []
+            for item in raw.get("entries", []):
+                if isinstance(item, dict):
+                    entries.append(
+                        QuarantineEntry(
+                            id=item["id"],
+                            original_path=item["original_path"],
+                            sha256=item["sha256"],
+                            size=item["size"],
+                            quarantined_at=item["quarantined_at"],
+                            detection_name=item["detection_name"],
+                            severity=item.get("severity"),
+                            verdict=item.get("verdict"),
+                            reasons=list(item.get("reasons") or []),
+                            status=item.get("status", "quarantined"),
+                            blob_name=item.get("blob_name"),
+                            resolved_at=item.get("resolved_at"),
+                            restored_path=item.get("restored_path"),
+                            note=item.get("note"),
+                            mode=item.get("mode"),
+                        )
+                    )
+            return entries, False
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            return [], False
+
+    def pending_actions_loose(self):
+        """Pending actions read straight from the shared pending
+        database — for when the vault itself cannot be opened by
+        this process (installed layout, standard user)."""
+        return read_pending_db(self.pending_db_path())
 
     def history(self) -> History:
         if self._history is None:
@@ -112,11 +188,10 @@ class GuiBackend:
         return self._actions
 
     def real_actions(self) -> ActionEngine:
-        """The real action engine even in simulation mode. Used
-        where the operation is bookkeeping rather than a response
-        to a detection: the Pending Actions queue (approving or
-        rejecting a queued request is itself the human decision,
-        and the queue must reflect reality) and dashboard counts."""
+        """The real action engine even in simulation mode. Used for
+        read-only bookkeeping (dashboard counts) — decisions
+        themselves route through :meth:`actions` like everywhere
+        else, so simulation mode records intent instead of acting."""
         if self._actions is None:
             self._actions = ActionEngine(
                 self.vault(),
@@ -132,12 +207,26 @@ class GuiBackend:
         history = self.history()
         summary = history.summary(days=7)
         recent = history.recent_scans(limit=1)
+        try:
+            quarantined = self.vault().count(status="quarantined")
+            pending = len(self.real_actions().list_pending())
+        except Exception:
+            # Installed layout, standard user: the vault is not
+            # readable here — count from the published view and the
+            # shared pending database instead of failing the page.
+            entries, _direct = self.vault_entries_view()
+            quarantined = sum(
+                1 for e in entries if e.status == "quarantined"
+            )
+            pending = sum(
+                1 for p in self.pending_actions_loose() if p.status == "pending"
+            )
         return {
             "detections_7d": summary["detections"],
             "scans_7d": summary["scans"],
             "files_scanned_7d": summary["files_scanned"],
-            "quarantined": self.vault().count(status="quarantined"),
-            "pending": len(self.real_actions().list_pending()),
+            "quarantined": quarantined,
+            "pending": pending,
             "last_scan": recent[0] if recent else None,
             "summary": summary,
         }
@@ -204,6 +293,24 @@ class ProtectionController(QObject):
         super().__init__(parent)
         self._backend = backend
         self._service: ArgusService | None = None
+        self._last_external_status: dict | None = None
+        # When no in-process engine runs, protection state comes
+        # from the service heartbeat file — poll it so the
+        # dashboard cannot freeze on a stale "protected" (a service
+        # that stopped heartbeating must turn the banner red, and a
+        # service that came back must clear it).
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(5000)
+        self._poll_timer.timeout.connect(self._poll_external_status)
+        self._poll_timer.start()
+
+    def _poll_external_status(self) -> None:
+        if self._service is not None:
+            return  # the in-process engine reports its own changes
+        current = self.status()
+        if current != self._last_external_status:
+            self._last_external_status = current
+            self.status_changed.emit(current)
 
     def _on_engine_event(self, event) -> None:
         self.detection.emit(event.to_dict())
@@ -212,6 +319,17 @@ class ProtectionController(QObject):
     def start(self) -> bool:
         if self._service is not None:
             return True
+        if self._backend.simulation_mode:
+            # Honesty: simulation mode means "report what you WOULD
+            # do" — starting real protection under it would move
+            # files while the UI claims nothing will be touched.
+            self.failed.emit(
+                "Simulation mode is on (Dev Toolkit), so real "
+                "protection cannot start — in simulation Argus only "
+                "reports what it would do. Turn simulation mode off "
+                "in the Dev Toolkit to start real protection."
+            )
+            return False
         service = ArgusService(
             config_path=str(self._backend.config_path),
             on_event=self._on_engine_event,
@@ -244,7 +362,12 @@ class ProtectionController(QObject):
 
     def reload_config(self) -> None:
         if self._service is not None:
-            self._service.reload_config()
+            try:
+                self._service.reload_config()
+            except Exception as exc:  # reported, never swallowed
+                self.failed.emit(f"Settings could not be applied: {exc}")
+                log.exception("protection config reload failed")
+                return
             self.status_changed.emit(self.status())
 
     @property
@@ -257,7 +380,15 @@ class ProtectionController(QObject):
         by this process: this controller runs no service of its own,
         the status says protection is running, and its heartbeat is
         fresh. A stale heartbeat is a service that died — not
-        something managing protection."""
+        something managing protection.
+
+        On Windows the heartbeat alone is not trusted: the status
+        file lives in the user-writable shared folder, so anything
+        could write one. The Service Control Manager must ALSO
+        report ArgusProtection as running (see
+        :func:`argus.winservice.query_service_state`); the status
+        file then only supplies the details.
+        """
         if self._service is not None or not status:
             return False
         if not status.get("running"):
@@ -272,7 +403,13 @@ class ProtectionController(QObject):
         if stamp.tzinfo is None:
             stamp = stamp.replace(tzinfo=timezone.utc)
         age = (datetime.now(timezone.utc) - stamp).total_seconds()
-        return -60.0 <= age <= SERVICE_HEARTBEAT_FRESH_SECONDS
+        if not (-60.0 <= age <= SERVICE_HEARTBEAT_FRESH_SECONDS):
+            return False
+        if IS_WINDOWS:
+            from ..winservice import query_service_state
+
+            return query_service_state() == "running"
+        return True
 
     def status(self) -> dict:
         if self._service is not None:
@@ -392,6 +529,31 @@ class ScanWorker(QObject):
         assessment.score = evaluation.score
         assessment.heuristic_verdict = evaluation.verdict
         assessment.notes.extend(report.notes)
+
+
+def relaunch_gui_as_admin() -> bool:
+    """Relaunch the Argus GUI elevated (Windows "runas" verb).
+
+    Used when a settings save fails because the config file lives
+    in the trusted root: there is deliberately NO delegation
+    channel for config writes, so the honest route is the user
+    re-running the app as administrator. Returns True when the
+    elevated launch was accepted; False anywhere else (non-Windows,
+    no shell, user declined the prompt).
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+
+        params = "" if getattr(sys, "frozen", False) else "-m argus.gui"
+        result = ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
+            None, "runas", sys.executable, params, None, 1
+        )
+        return int(result) > 32
+    except Exception:
+        log.exception("elevated relaunch failed")
+        return False
 
 
 IS_WINDOWS = sys.platform == "win32"
