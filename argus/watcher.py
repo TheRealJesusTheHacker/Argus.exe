@@ -27,6 +27,15 @@ so the scan result can say it judged a moving target.
 data streams (Windows ADS) attached to a watched file are covered by
 the on-demand scanner, not by the watcher's change tracking.
 
+**Content identity (v1.1.0 P1-18).** A file's signature is
+``(size, mtime_ns, sampled_hash)`` where ``sampled_hash`` is a
+SHA-256 over the first 64 KiB plus the last 64 KiB of the file.
+Size+mtime alone can be forged — a same-size content swap with a
+restored ("timestomped") mtime looked identical to the old
+signature and was never re-scanned. The sampled hash makes the
+swap visible while keeping per-poll cost bounded (at most
+128 KiB read per file, however large the file is).
+
 Hard rules, shared with the scanner:
 
 - **Symlinks are never followed.** Directory links are not descended
@@ -38,6 +47,7 @@ Hard rules, shared with the scanner:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -48,8 +58,50 @@ from typing import Callable, Iterator
 
 log = logging.getLogger("argus.watcher")
 
-#: A file's identity-for-change purposes: (size, mtime in nanoseconds).
-Signature = tuple[int, int]
+#: Bytes sampled from each end of a file for its content hash.
+SAMPLE_BYTES = 64 * 1024  # 64 KiB
+
+#: A file's identity-for-change purposes: (size, mtime in
+#: nanoseconds, sampled content hash — see the module docstring).
+#: The hash element is None for a poll where the file's stat had
+#: just changed (fix round 2: no content read was needed — the
+#: stat difference already proves the file differs).
+Signature = tuple[int, int, "str | None"]
+
+
+def _signature_changed(old: Signature, new: Signature) -> bool:
+    """Did the file actually change between two signatures?
+
+    A stat difference always means change. With equal stats, a
+    change exists only when BOTH polls took the content hash and
+    the hashes differ (the timestomp case). A None -> hash
+    transition at equal stats is the hash ARRIVING, not the file
+    changing, so it must not restart the stability wait."""
+    if old[:2] != new[:2]:
+        return True
+    return (
+        old[2] is not None
+        and new[2] is not None
+        and old[2] != new[2]
+    )
+
+
+def sampled_content_hash(path: Path, size: int) -> str:
+    """SHA-256 over the first 64 KiB + the last 64 KiB of *path*.
+
+    For a file of 64 KiB or less the "first" sample is the whole
+    file and there is no separate tail sample. Raises OSError if
+    the file cannot be read — the caller (snapshot) counts that
+    as a stat error, like any other mid-poll race.
+    """
+    hasher = hashlib.sha256()
+    with open(path, "rb") as fh:
+        head = fh.read(SAMPLE_BYTES)
+        hasher.update(head)
+        if size > SAMPLE_BYTES:
+            fh.seek(size - SAMPLE_BYTES)
+            hasher.update(fh.read(SAMPLE_BYTES))
+    return hasher.hexdigest()
 
 
 @dataclass
@@ -139,7 +191,20 @@ class DirectoryWatcher:
                     self.stats.stat_errors += 1
 
     def snapshot(self) -> dict[Path, Signature]:
-        """Map of path -> (size, mtime_ns) for everything watched."""
+        """Map of path -> (size, mtime_ns, sampled content hash)
+        for everything watched.
+
+        The sampled content hash is EXPENSIVE (up to 128 KiB of
+        reads) and is only computed when it answers a question
+        (fix round 2, FIX 6): when the file's stat MATCHES the
+        previous snapshot's — identity confirmation, the
+        timestomp case — or when the file is new here (a scan
+        candidate taking its first fingerprint). A file whose
+        stat CHANGED is already known to differ, so this poll
+        records ``None`` for its hash and lets stat alone restart
+        its stability wait; the hash is taken on the first poll
+        where its stat stands still. The old code hashed every
+        file on every poll, forever."""
         snap: dict[Path, Signature] = {}
         for root in self.dirs:
             if not root.is_dir():
@@ -152,10 +217,24 @@ class DirectoryWatcher:
                 try:
                     st = path.stat()
                 except OSError:
-                    # Vanished between listing and stat — normal race.
+                    # Vanished between listing and stat, or became
+                    # unreadable mid-poll — a normal race.
                     self.stats.stat_errors += 1
                     continue
-                snap[path] = (st.st_size, st.st_mtime_ns)
+                tracked = self._tracked.get(path)
+                previous = tracked.signature if tracked is not None else None
+                if previous is not None and previous[:2] != (
+                    st.st_size,
+                    st.st_mtime_ns,
+                ):
+                    content_hash = None  # stat changed: differs already
+                else:
+                    try:
+                        content_hash = sampled_content_hash(path, st.st_size)
+                    except OSError:
+                        self.stats.stat_errors += 1
+                        continue
+                snap[path] = (st.st_size, st.st_mtime_ns, content_hash)
         return snap
 
     # ------------------------------------------------------------------
@@ -183,12 +262,24 @@ class DirectoryWatcher:
             if tracked is None:
                 tracked = _Tracked(signature=signature, first_seen=now)
                 self._tracked[path] = tracked
-            elif tracked.signature != signature:
+            elif _signature_changed(tracked.signature, signature):
                 # Still being written (or rewritten): restart the wait.
                 tracked.signature = signature
                 tracked.stable_polls = 1
             else:
+                tracked.signature = signature
                 tracked.stable_polls += 1
+                # A signature recorded by a force-scan may carry
+                # no content hash (stat-changed poll); when the
+                # hash arrives at identical stats it is the SAME
+                # content confirmed, so the scanned record keeps
+                # up instead of triggering a redundant rescan.
+                if (
+                    tracked.scanned_signature is not None
+                    and tracked.scanned_signature[:2] == signature[:2]
+                    and tracked.scanned_signature[2] is None
+                ):
+                    tracked.scanned_signature = signature
 
             if tracked.scanned_signature == tracked.signature:
                 continue  # this exact content was already reported
