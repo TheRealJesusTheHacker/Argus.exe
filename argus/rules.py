@@ -243,7 +243,15 @@ class RuleMatcher:
     (:data:`MATCH_TIME_BUDGET_SECONDS`): once it expires, feed()
     becomes a no-op and :attr:`budget_exceeded` is set — the caller
     notes the partial coverage instead of pretending the file was
-    fully matched.
+    fully matched. The budget is polled between rules inside a
+    feed as well as between feeds, so one huge chunk cannot run
+    unboundedly far past it; the worst overshoot is a single
+    pattern scan over the current window.
+
+    Time is read through the instance's ``_clock`` attribute
+    (``time.monotonic`` in production). Tests substitute a
+    deterministic fake so budget behavior never depends on the
+    host clock's resolution.
     """
 
     def __init__(
@@ -256,24 +264,37 @@ class RuleMatcher:
         self._keep = max(overlap, 0)
         self._time_budget = max(0.0, float(time_budget))
         self._started: float | None = None
+        self._clock = time.monotonic
         self.budget_exceeded = False
+
+    def _budget_spent(self) -> bool:
+        """True when the per-file matching budget has expired."""
+        return (
+            self._started is not None
+            and self._clock() - self._started > self._time_budget
+        )
+
+    def _note_budget_exceeded(self) -> None:
+        self.budget_exceeded = True
+        log.warning(
+            "rule matching stopped: per-file time budget "
+            "(%.1fs) exhausted — coverage is partial",
+            self._time_budget,
+        )
 
     def feed(self, chunk: bytes) -> None:
         if not chunk or not self._rules or self.budget_exceeded:
             return
-        now = time.monotonic()
         if self._started is None:
-            self._started = now
-        elif now - self._started > self._time_budget:
-            self.budget_exceeded = True
-            log.warning(
-                "rule matching stopped: per-file time budget "
-                "(%.1fs) exhausted — coverage is partial",
-                self._time_budget,
-            )
+            self._started = self._clock()
+        elif self._budget_spent():
+            self._note_budget_exceeded()
             return
         window = self._tail + chunk
         for idx, rule in enumerate(self._rules):
+            if idx > 0 and self._budget_spent():
+                self._note_budget_exceeded()
+                break
             already = self._matched.setdefault(idx, set())
             if len(already) == len(rule.patterns):
                 continue  # everything already found; condition settled
