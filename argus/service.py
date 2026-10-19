@@ -18,22 +18,36 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from . import __version__
-from .actions import ActionEngine
-from .config import ArgusConfig
-from .paths import default_history_db, default_vault_dir
-from .quarantine import Vault
+from .action_requests import REQUEST_KINDS
+from .actions import ActionEngine, ActionError
+from .config import ArgusConfig, default_watch_dirs
+from .paths import (
+    default_history_db,
+    default_pending_db,
+    default_vault_dir,
+    requests_dir,
+    results_dir,
+    vault_view_path,
+    write_text_atomic,
+)
+from .quarantine import QuarantineError, Vault
 from .realtime import RealtimeEngine, RealtimeEvent
 from .reporting import History
 from .rules import BUILTIN_RULES, Rule, load_rules
-from .signatures import SignatureDB, SignatureError, ensure_signature_db
+from .signatures import SignatureDB, SignatureError, bootstrap_signature_db
 
 log = logging.getLogger("argus.service")
+
+#: How often the service scans the shared requests folder for
+#: GUI/CLI action requests (restore/delete/allow/approve/reject).
+REQUEST_POLL_INTERVAL_SECONDS = 2.0
 
 
 def _utcnow() -> datetime:
@@ -65,9 +79,16 @@ class ArgusService:
         self._db: SignatureDB | None = None
         self._stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
+        self._requests_thread: threading.Thread | None = None
         self._started_at: datetime | None = None
         self.state: str = "stopped"  # stopped | running | paused
         self.last_error: str | None = None
+        #: True when the open signature database carries no
+        #: verifiable HMAC auth tag — surfaced in status, loudly.
+        self._sig_auth_missing = False
+        #: Fingerprint of the last published vault view, so the
+        #: view is only rewritten when the vault actually changed.
+        self._vault_view_fingerprint: tuple | None = None
         #: Cumulative counters carried across config reloads.
         self._carried = {
             "scans_completed": 0,
@@ -99,6 +120,7 @@ class ArgusService:
             self.config = ArgusConfig.load(self.config_path)
         for warning in self.config.load_warnings:
             log.warning("config: %s", warning)
+        self._apply_system_watch_dirs()
 
         try:
             stack = self._open_stack()
@@ -112,6 +134,7 @@ class ArgusService:
             self.last_error = str(exc)
             raise
         self._db, self.vault, self.history, self.actions, self.engine = stack
+        self._note_signature_auth(self._db)
         self._started_at = _utcnow()
         self.state = "running"
         self.last_error = None
@@ -121,6 +144,12 @@ class ArgusService:
                 target=self._heartbeat_loop, name="argus-heartbeat", daemon=True
             )
             self._heartbeat_thread.start()
+        if self._requests_thread is None or not self._requests_thread.is_alive():
+            self._requests_thread = threading.Thread(
+                target=self._requests_loop, name="argus-requests", daemon=True
+            )
+            self._requests_thread.start()
+        self._publish_vault_view(force=True)
         self.write_status()
         log.info("Argus service started (config: %s)", self.config_path or "defaults")
 
@@ -146,6 +175,9 @@ class ArgusService:
         if self._heartbeat_thread is not None:
             self._heartbeat_thread.join(timeout=2.0)
             self._heartbeat_thread = None
+        if self._requests_thread is not None:
+            self._requests_thread.join(timeout=2.0)
+            self._requests_thread = None
         self.write_status()
         log.info("Argus service stopped")
 
@@ -221,14 +253,47 @@ class ArgusService:
             self._db.close()
             self._db = None
         self._db, self.vault, self.history, self.actions, self.engine = stack
+        self._note_signature_auth(self._db)
         try:
             self.engine.start()
         except Exception as exc:
+            # The new stack validated but its engine will not start.
+            # Do not leave the machine unprotected if the PREVIOUS
+            # setup can still run: reopen it and start it again.
             self._close_stack(stack)
             self.engine = None
-            self.state = "stopped"
-            self.last_error = str(exc)
-            raise
+            log.error(
+                "reloaded configuration failed to start (%s) — "
+                "attempting to restore the previous setup", exc,
+            )
+            self.config = old_config
+            try:
+                previous = self._open_stack()
+                previous[4].start()
+            except Exception:
+                self.state = "stopped"
+                self.last_error = (
+                    f"configuration reload failed ({exc}) and the "
+                    "previous setup could not be restarted either — "
+                    "protection is OFF until this is fixed"
+                )
+                log.error("%s", self.last_error)
+                raise
+            self._db, self.vault, self.history, self.actions, self.engine = (
+                previous
+            )
+            self._note_signature_auth(self._db)
+            self._started_at = _utcnow()
+            self.state = "paused" if was_paused else "running"
+            if was_paused:
+                self.engine.pause()
+            self.last_error = (
+                f"configuration reload failed to start ({exc}) — the "
+                "previous setup was restored and is protecting you"
+            )
+            log.error("%s", self.last_error)
+            self.write_status()
+            return
         self._started_at = _utcnow()
         if was_paused:
             self.engine.pause()
@@ -268,6 +333,10 @@ class ArgusService:
                 outcome = None
             if outcome is not None:
                 log.info("real-time action: %s", outcome.message)
+                if outcome.done:
+                    # The vault just changed — republish the
+                    # read-only view the GUI reads.
+                    self._publish_vault_view()
         if self.on_event is not None:
             self.on_event(event)
 
@@ -310,13 +379,20 @@ class ArgusService:
             "pending_actions": (
                 self.vault.pending_count() if self.vault is not None else 0
             ),
+            "signature_db_auth": (
+                "verified"
+                if self._db is not None and self._db.info.auth_verified
+                else "missing" if self._sig_auth_missing else "unknown"
+            ),
             **totals,
             "last_error": self.last_error,
         }
 
     def write_status(self) -> None:
         """Write the status file atomically (tmp file + rename), so a
-        reader never sees a half-written heartbeat."""
+        reader never sees a half-written heartbeat. Also republishes
+        the vault view when the vault changed since the last one."""
+        self._publish_vault_view()
         status_path = Path(self.config.status_file)
         try:
             if status_path.parent and not status_path.parent.exists():
@@ -339,20 +415,27 @@ class ArgusService:
     # ------------------------------------------------------------------
     def _open_stack(self):
         """Open and validate every resource a running service needs,
-        WITHOUT starting the engine: the signature database (created
-        + seeded first if missing), the rules, the vault, the
+        WITHOUT starting the engine: the signature database
+        (bootstrapped first if the DEFAULT one is missing — a
+        missing database at a *configured* path is a loud error,
+        never silently replaced), the rules, the vault, the
         history, and the action engine wired to all of them.
+
+        The signature database is opened with ``require_auth=True``:
+        a present-but-wrong HMAC tag fails the open; a missing tag
+        or key is recorded (see :meth:`_note_signature_auth`) and
+        warned about in status without bricking protection.
 
         Returns ``(db, vault, history, actions, engine)``. On any
         failure, whatever was already opened is closed again and the
         exception propagates — callers never see a half-open stack.
         """
-        ensure_signature_db(self.config.signature_db)
+        bootstrap_signature_db(self.config.signature_db)
         db = None
         vault = None
         history = None
         try:
-            db = SignatureDB.open(self.config.signature_db)
+            db = SignatureDB.open(self.config.signature_db, require_auth=True)
             rules = self._load_rules()
             # Phase 4 wiring: the vault, history, and action engine
             # are opened BEFORE the engine starts, so every real-time
@@ -368,7 +451,12 @@ class ArgusService:
                 if self.config.history_db
                 else default_history_db()
             )
-            vault = Vault.open(vault_dir)
+            pending_path = (
+                Path(self.config.pending_db)
+                if self.config.pending_db
+                else default_pending_db()
+            )
+            vault = Vault.open(vault_dir, pending_path)
             history = History.open(history_path)
             actions = ActionEngine(
                 vault,
@@ -388,6 +476,231 @@ class ArgusService:
                         log.exception("cleanup after a failed open failed")
             raise
         return (db, vault, history, actions, engine)
+
+    def _note_signature_auth(self, db: SignatureDB | None) -> None:
+        """Record (and loudly log) whether the open signature
+        database could be authenticated."""
+        self._sig_auth_missing = bool(
+            db is not None and db.info.auth_missing and not db.info.auth_verified
+        )
+        if self._sig_auth_missing:
+            log.warning(
+                "SIGNATURE DATABASE IS NOT AUTHENTICATED: %s carries no "
+                "verifiable HMAC tag (missing tag or key file). Argus "
+                "will keep protecting you, but the database cannot be "
+                "proven genuine — rebuild it with 'argus sigdb init' "
+                "from a trusted copy to restore authentication.",
+                self.config.signature_db,
+            )
+
+    def _apply_system_watch_dirs(self) -> None:
+        """When the service runs as LocalSystem on Windows, the
+        process "home" is the system profile — the default watch
+        list (that profile's Downloads/Desktop/Documents) would
+        watch folders no user ever touches. Substitute every real
+        user profile's Downloads/Desktop/Documents plus
+        ``C:\\Windows\\Temp``. Only applies when the configured
+        watch list IS the untouched default; an explicit list in
+        the config always wins.
+        """
+        if sys.platform != "win32":
+            return
+        if "systemprofile" not in str(Path.home()).lower():
+            return
+        if [str(d) for d in self.config.watch_dirs] != [
+            str(d) for d in default_watch_dirs()
+        ]:
+            return
+        dirs: list[Path] = []
+        users_root = Path(r"C:\Users")
+        try:
+            profiles = sorted(users_root.iterdir())
+        except OSError:
+            profiles = []
+        for profile in profiles:
+            if not profile.is_dir() or profile.name.lower() in (
+                "public", "default", "default user", "all users",
+            ):
+                continue
+            for sub in ("Downloads", "Desktop", "Documents"):
+                candidate = profile / sub
+                if candidate.is_dir():
+                    dirs.append(candidate)
+        windows_temp = Path(r"C:\Windows\Temp")
+        if windows_temp.is_dir():
+            dirs.append(windows_temp)
+        if dirs:
+            self.config.watch_dirs = dirs
+            log.info(
+                "running as SYSTEM: watching user profile folders %s",
+                [str(d) for d in dirs],
+            )
+
+    # ------------------------------------------------------------------
+    # Vault view (read-only snapshot for user-side processes)
+    # ------------------------------------------------------------------
+    def _publish_vault_view(self, *, force: bool = False) -> None:
+        """Republish ``shared/vault-view.json`` when the vault
+        changed: the standard-user GUI cannot read the vault in the
+        trusted root, so the service mirrors the entry list (never
+        blobs, never the key) into the shared folder. Best-effort —
+        a failed publish is logged, never fatal."""
+        if self.vault is None:
+            return
+        try:
+            entries = self.vault.list_entries()
+        except Exception:
+            log.exception("could not read the vault for the view publish")
+            return
+        fingerprint = tuple(
+            (e.id, e.status, e.resolved_at, e.note) for e in entries
+        )
+        if not force and fingerprint == self._vault_view_fingerprint:
+            return
+        payload = {
+            "generated_at": _utcnow_iso(),
+            "entries": [entry.to_dict() for entry in entries],
+        }
+        try:
+            write_text_atomic(
+                vault_view_path(), json.dumps(payload, indent=2) + "\n"
+            )
+            self._vault_view_fingerprint = fingerprint
+        except OSError:
+            log.exception("could not publish the vault view")
+
+    # ------------------------------------------------------------------
+    # Action-request channel (see argus.action_requests)
+    # ------------------------------------------------------------------
+    def _requests_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.process_requests_once()
+            except Exception:
+                log.exception("action-request scan failed")
+            self._stop.wait(REQUEST_POLL_INTERVAL_SECONDS)
+
+    def process_requests_once(self) -> int:
+        """Execute every pending action request once. Returns how
+        many were processed. Public so tests (and a future admin
+        tool) can drive the channel without the polling thread."""
+        folder = requests_dir()
+        try:
+            candidates = sorted(folder.glob("*.json"))
+        except OSError:
+            return 0
+        processed = 0
+        for request_path in candidates:
+            try:
+                raw = json.loads(request_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                log.warning("ignoring unreadable action request %s", request_path)
+                request_path.unlink(missing_ok=True)
+                continue
+            if not isinstance(raw, dict) or raw.get("id") != request_path.stem:
+                log.warning("ignoring malformed action request %s", request_path)
+                request_path.unlink(missing_ok=True)
+                continue
+            result = self._execute_request(raw)
+            result["id"] = raw["id"]
+            try:
+                write_text_atomic(
+                    results_dir() / f"{raw['id']}.json",
+                    json.dumps(result, indent=2) + "\n",
+                )
+            except OSError:
+                log.exception("could not write action-request result")
+            request_path.unlink(missing_ok=True)
+            processed += 1
+        return processed
+
+    def _execute_request(self, request: dict) -> dict:
+        """Carry out one action request against the service's OWN
+        records. The request names an entry/pending id and the
+        fingerprint the human saw; anything that does not match the
+        service's records is refused, in writing."""
+        kind = request.get("kind")
+        if kind not in REQUEST_KINDS:
+            return {"ok": False, "message": f"unknown request kind {kind!r}"}
+        if self.actions is None or self.vault is None:
+            return {
+                "ok": False,
+                "message": "Argus protection is not running, so the "
+                "request could not be carried out.",
+            }
+        seen_sha = request.get("sha256")
+        try:
+            if kind in ("restore", "delete", "allow"):
+                entry_id = request.get("entry_id")
+                entry = self.vault.get_entry(entry_id) if entry_id else None
+                if entry is None:
+                    return {
+                        "ok": False,
+                        "message": f"no vault entry with id {entry_id} — "
+                        "it may already have been resolved.",
+                    }
+                if seen_sha and seen_sha.lower() != entry.sha256.lower():
+                    return {
+                        "ok": False,
+                        "message": "the vault record for this file does "
+                        "not match the fingerprint you reviewed — Argus "
+                        "refused to act on a different file than the one "
+                        "you saw. Reopen the quarantine page and try again.",
+                    }
+                if kind == "restore":
+                    outcome = self.actions.restore_entry(
+                        entry.id, confirmed=True
+                    )
+                elif kind == "delete":
+                    outcome = self.actions.delete_entry(
+                        entry.id, confirmed=True
+                    )
+                else:
+                    outcome = self.actions.allow_entry(
+                        entry.id, confirmed=True
+                    )
+                self._publish_vault_view()
+                return {
+                    "ok": True,
+                    "message": outcome.message,
+                    "restored_path": outcome.restored_path,
+                }
+            # approve-pending / reject-pending
+            pending_id = request.get("pending_id")
+            pending = self.vault.get_pending(pending_id) if pending_id else None
+            if pending is None or pending.status != "pending":
+                return {
+                    "ok": False,
+                    "message": f"no waiting action with id {pending_id} — "
+                    "it may already have been decided.",
+                }
+            if (
+                seen_sha
+                and pending.sha256
+                and seen_sha.lower() != pending.sha256.lower()
+            ):
+                return {
+                    "ok": False,
+                    "message": "the queued action's fingerprint does not "
+                    "match the one you reviewed — Argus refused to act "
+                    "on a different file than the one you saw.",
+                }
+            if kind == "approve-pending":
+                outcome = self.actions.approve(pending.id)
+                return {"ok": True, "message": outcome.message}
+            decided = self.actions.reject(pending.id)
+            return {
+                "ok": True,
+                "message": (
+                    f"Rejected — Argus will leave {decided.path} as it "
+                    f"is; the queued {decided.action} was declined."
+                ),
+            }
+        except (ActionError, QuarantineError) as exc:
+            return {"ok": False, "message": str(exc)}
+        except Exception as exc:  # never leave a request unanswered
+            log.exception("action request %s failed", request.get("id"))
+            return {"ok": False, "message": f"the action failed: {exc}"}
 
     @staticmethod
     def _close_stack(stack) -> None:
