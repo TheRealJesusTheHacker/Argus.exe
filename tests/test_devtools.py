@@ -203,7 +203,24 @@ def test_self_test_passes_and_cleans_up(tmp_path):
     result = run_self_test(scratch)
     assert result.passed, result.summary()
     assert all(step.ok for step in result.steps)
-    assert not scratch.exists()  # removed every trace
+    # The caller-supplied folder is never removed (Argus does not
+    # own it) — but everything Argus put in it is gone.
+    assert scratch.is_dir()
+    assert list(scratch.iterdir()) == []
+
+
+def test_self_test_refuses_nonempty_supplied_dir(tmp_path):
+    # Regression (fix #20): run_self_test must never rmtree a folder
+    # it did not create. A non-empty pre-existing folder is refused
+    # and its contents are untouched.
+    scratch = tmp_path / "mine"
+    scratch.mkdir()
+    precious = scratch / "precious.txt"
+    precious.write_text("do not delete", encoding="utf-8")
+    result = run_self_test(scratch)
+    assert not result.passed
+    assert precious.read_text(encoding="utf-8") == "do not delete"
+    assert [p.name for p in scratch.iterdir()] == ["precious.txt"]
 
 
 # ----------------------------------------------------------------------
