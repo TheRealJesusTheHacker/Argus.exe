@@ -180,6 +180,17 @@ _VM_STRINGS = (
     "sandboxie", "sbie", "virtual pc", "hyper-v", "xen",
 )
 
+#: DLLs whose named import combinations Argus scores as combos
+#: (see pe_signals), mapped to (named combo points, label). Used
+#: by the ordinal-hidden inference (P1-22): a combo-set DLL
+#: imported almost entirely by ordinal earns partial points.
+_ORDINAL_COMBO_DLLS: dict[str, tuple[int, str]] = {
+    # VirtualAllocEx + WriteProcessMemory + CreateRemoteThread —
+    # the process-injection trio (45 points when named) — all live
+    # in KERNEL32.
+    "kernel32.dll": (45, "process-injection"),
+}
+
 
 def pe_signals(
     pe: PEInfo, strings: StringIndex, entropy: EntropySummary
@@ -208,6 +219,49 @@ def pe_signals(
                 ),
             )
         )
+
+    # ---- ordinal-hidden combo suspicion (P1-22) -------------------
+    # When a DLL that hosts a known-dangerous named combination is
+    # imported almost entirely BY ORDINAL, the named combo check
+    # above is blind — the names are exactly what ordinals hide.
+    # Pinned heuristic: DLL in the combo set + >= 80% of its
+    # imports by ordinal + >= 3 imports earns PARTIAL points
+    # (strictly less than the named combination it might be
+    # hiding). This is INFERENTIAL — Argus cannot see which APIs
+    # the ordinals name — and the explanation says so.
+    for dll_name, dll_funcs in pe.imports.items():
+        combo = _ORDINAL_COMBO_DLLS.get(dll_name.lower())
+        if combo is None or len(dll_funcs) < 3:
+            continue
+        named_points, combo_label = combo
+        ordinal_count = sum(1 for fn in dll_funcs if fn.startswith("#"))
+        if ordinal_count / len(dll_funcs) < 0.8:
+            continue
+        partial_points = named_points // 2
+        if partial_points <= 0 or partial_points >= named_points:
+            continue
+        signals.append(
+            Signal(
+                name="ordinal_hidden_combo_suspect",
+                severity="medium",
+                points=partial_points,
+                explanation=(
+                    f"{ordinal_count} of {len(dll_funcs)} functions "
+                    f"imported from {dll_name} are referenced by "
+                    "ordinal (number) instead of by name. That DLL "
+                    f"is where the {combo_label} combination lives, "
+                    "and importing by ordinal is precisely how a "
+                    "program hides that it uses it. This is an "
+                    "INFERENCE, not a sighting: Argus cannot tell "
+                    "which APIs the numbers name, so it scores a "
+                    f"partial {partial_points} points instead of the "
+                    f"named combination's {named_points} — suspicion "
+                    "proportional to what could be hidden, honestly "
+                    "labeled as such."
+                ),
+            )
+        )
+        break
 
     cred_api = _has_any(funcs, "CredEnumerate", "CredRead", "VaultEnumerateItems")
     lsass_dump = "MiniDumpWriteDump" in funcs and strings.contains("lsass")
@@ -473,33 +527,46 @@ def pe_signals(
             )
         )
 
-    for sec in pe.sections:
-        if not sec.is_executable or sec.raw_size == 0:
+    # Attribution requires the window's DOMINANT section (P2): a
+    # high-entropy region is charged to a section only when that
+    # section holds the MAJORITY of the region's bytes. A window
+    # that merely touches or straddles a section boundary — most
+    # of it living elsewhere — attributes to nobody; the outside-
+    # sections signal above is what covers that data.
+    for region in entropy.high_regions:
+        region_end = region.offset + region.length
+        dominant: Section | None = None
+        dominant_overlap = 0
+        for sec in pe.sections:
+            if sec.raw_size == 0:
+                continue
+            overlap = min(region_end, sec.raw_offset + sec.raw_size) - max(
+                region.offset, sec.raw_offset
+            )
+            if overlap > dominant_overlap:
+                dominant, dominant_overlap = sec, overlap
+        if dominant is None or dominant_overlap * 2 <= region.length:
+            continue  # no section holds the majority of this window
+        sec = dominant
+        if not sec.is_executable:
             continue
         if sec.entropy is not None and sec.entropy >= HIGH_ENTROPY_THRESHOLD:
             continue  # the average already told the story above
-        sec_start, sec_end = sec.raw_offset, sec.raw_offset + sec.raw_size
-        peak = max(
-            (region.entropy for region in entropy.high_regions
-             if region.offset < sec_end and sec_start < region.offset + region.length),
-            default=None,
-        )
-        if peak is not None:
-            signals.append(
-                Signal(
-                    name="high_entropy_window_in_section",
-                    severity="medium",
-                    points=15,
-                    explanation=(
-                        f"Section '{sec.name}' looks ordinary on "
-                        f"average, but contains a window measuring "
-                        f"{peak:.1f} bits of entropy — a packed or "
-                        "encrypted pocket hidden inside otherwise "
-                        "normal-looking code."
-                    ),
-                )
+        signals.append(
+            Signal(
+                name="high_entropy_window_in_section",
+                severity="medium",
+                points=15,
+                explanation=(
+                    f"Section '{sec.name}' looks ordinary on "
+                    f"average, but contains a window measuring "
+                    f"{region.entropy:.1f} bits of entropy — a packed or "
+                    "encrypted pocket hidden inside otherwise "
+                    "normal-looking code."
+                ),
             )
-            break
+        )
+        break
 
     if pe.entry_section is not None:
         idx = pe.entry_section_index or 0
@@ -687,6 +754,11 @@ _ENCODED_CMD_RE = re.compile(
     r"-(?:e|ec|enc|encodedcommand)\s+[A-Za-z0-9+/=]{40,}", re.IGNORECASE
 )
 _LONG_LINE_THRESHOLD = 2000
+#: The smuggling shape the long-line signal hunts: one giant
+#: WHITESPACE-FREE run (an encoded blob, a minified dropper) —
+#: matched against the text as a whole, since a run cannot cross
+#: a line break anyway.
+_LONG_RUN_RE = re.compile(r"\S{" + str(_LONG_LINE_THRESHOLD + 1) + r",}")
 
 
 def script_signals(text: str, filename: str) -> list[Signal]:
@@ -837,17 +909,26 @@ def script_signals(text: str, filename: str) -> list[Signal]:
                 )
             )
 
-    if any(len(line) > _LONG_LINE_THRESHOLD for line in text.splitlines()):
+    # The threshold measures the longest whitespace-free RUN,
+    # not raw line length (fix round 3): what this signal hunts
+    # is a payload smuggled as one giant encoded blob. Natural
+    # language is never that — a prose paragraph can run to
+    # thousands of characters, but its words break it into short
+    # runs — so prose (including prose a mixed-encoding decode
+    # places next to script content) must not trip a payload
+    # signal, while a genuine one-blob line still does.
+    if _LONG_RUN_RE.search(text):
         signals.append(
             Signal(
                 name="very_long_script_line",
                 severity="medium",
                 points=10,
                 explanation=(
-                    "Contains an extremely long single line (over "
-                    f"{_LONG_LINE_THRESHOLD:,} characters). Payloads are "
-                    "commonly smuggled as one giant encoded line so the "
-                    "file looks short and innocent at a glance."
+                    "Contains an extremely long unbroken run of text "
+                    f"(over {_LONG_LINE_THRESHOLD:,} characters with "
+                    "no spaces or line breaks). Payloads are commonly "
+                    "smuggled as one giant encoded line so the file "
+                    "looks short and innocent at a glance."
                 ),
             )
         )
