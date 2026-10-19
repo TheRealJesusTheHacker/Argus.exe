@@ -472,6 +472,40 @@ def test_hunt_p1_13_selftrust_is_under_root_case():
 # ======================================================================
 # P0-3 — Microsoft trust hardening
 # ======================================================================
+# LAYERING (which gate each P0-3 test pins): trust has two gates.
+# Gate 1 is the structural/identity layer — a COMPLETE SignerInfo
+# for a Microsoft signer (pe.py) plus a resolved, non-user-writable
+# system location — which pure-stdlib parsing CAN decide. Gate 2
+# exists only on Windows: WinVerifyTrust must vouch for the
+# signature's chain and digest (argus.platform_authenticode),
+# because stdlib parsing reads the CLAIM, never its content.
+#
+# The fixtures below fabricate their certificate bytes, so the
+# REAL Windows verifier correctly REFUSES them (proven in the
+# v1.1.0 CI run — the product behaving as designed). The
+# positive-trust tests therefore inject the approving double below
+# through analyze_file's authenticode_verifier seam, pinning
+# gate 1 in isolation on every platform; production code is never
+# taught to trust a fixture. The negative tests (two-byte
+# signature, first-cert-only identity, wrong serial/issuer,
+# missing digest algorithm, user-writable subtree) are decided at
+# gate 1 — identity or location is refused before any verifier is
+# consulted — so they need no double: they pin the structural
+# layer everywhere, and on Windows the real verifier would refuse
+# the same files a second time at gate 2.
+def _approving_verifier(path):
+    """Test double for the platform Authenticode verifier: vouches
+    for the synthetic fixture so gate 1 can be pinned in isolation."""
+    from argus.platform_authenticode import (
+        STATUS_VERIFIED,
+        AuthenticodeResult,
+    )
+
+    return AuthenticodeResult(
+        STATUS_VERIFIED, 0, "test double: fixture approved"
+    )
+
+
 def test_hunt_p0_3_complete_signer_info_earns_identity_and_trust(
     tmp_path, windows_tree
 ):
@@ -483,7 +517,10 @@ def test_hunt_p0_3_complete_signer_info_earns_identity_and_trust(
     assert info.signer_info_complete is True
     assert info.signer_name == "Microsoft Windows"
     assert signer_is_microsoft(info)
-    report = analyze_file(target, windows_root_dir=root)
+    report = analyze_file(
+        target, windows_root_dir=root,
+        authenticode_verifier=_approving_verifier,
+    )
     assert report.trusted_system_file is True
 
 
@@ -547,12 +584,21 @@ def test_hunt_p0_3_user_writable_windows_subtrees_never_trusted(windows_tree):
         target = root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
-        report = analyze_file(target, windows_root_dir=root)
+        # The approving double is injected here too, so the ONLY
+        # thing that can refuse these files is the location gate
+        # itself — the subtree check is what this loop pins.
+        report = analyze_file(
+            target, windows_root_dir=root,
+            authenticode_verifier=_approving_verifier,
+        )
         assert report.trusted_system_file is False, relative
     # …while the same bytes in a normal system location are trusted.
     good = system32 / "driverhost.exe"
     good.write_bytes(payload)
-    assert analyze_file(good, windows_root_dir=root).trusted_system_file is True
+    assert analyze_file(
+        good, windows_root_dir=root,
+        authenticode_verifier=_approving_verifier,
+    ).trusted_system_file is True
 
 
 def test_hunt_p0_3_trust_uses_resolved_location(windows_tree, tmp_path):
@@ -603,7 +649,10 @@ def test_hunt_p0_3_trusted_file_with_masquerade_name_not_clean(windows_tree):
     root, system32, _dl = windows_tree
     target = system32 / "driver.jpg.exe"  # double extension masquerade
     target.write_bytes(complete_microsoft_pe())
-    report = analyze_file(target, windows_root_dir=root)
+    report = analyze_file(
+        target, windows_root_dir=root,
+        authenticode_verifier=_approving_verifier,
+    )
     assert report.trusted_system_file is True
     assert "double_extension" in _names(report.signals)
     scored = score_signals(
