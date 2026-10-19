@@ -25,7 +25,7 @@
 ;   the uninstall form.
 
 #define AppName "ARGUS.EXE"
-#define AppVersion "1.0.3"
+#define AppVersion "1.0.4"
 #define AppPublisher "Sentinel Safeguard LLC"
 #define AppExeName "Argus.exe"
 #define ServiceExeName "ArgusService.exe"
@@ -87,13 +87,25 @@ Name: "trayautostart"; Description: "Open the Argus window when I sign in to Win
   GroupDescription: "Startup:"; Flags: unchecked
 
 [Dirs]
-; The shared Argus data root (config, signature DB, vault, history)
-; lives in ProgramData so the LocalSystem service and every user's
-; GUI/CLI see the same data. Create it at install time with user
-; modify rights — otherwise the service (running as SYSTEM) would
-; create it first and standard-user processes could not write the
-; shared vault/history.
-Name: "{commonappdata}\Argus"; Permissions: users-modify
+; Data layout (v1.0.4 trust split) under {commonappdata}\Argus:
+;
+;   TRUSTED ROOT (this folder): argus-config.json, signatures.sigdb
+;   (+ its .key). Users may READ these but never change them —
+;   protection settings and the signature database are only ever
+;   written by administrators or the service itself.
+;   quarantine\ : the vault. NO standard-user access at all (see
+;   the icacls lockdown in [Run]) — malware samples and the vault
+;   key are not user-readable.
+;   shared\ : the deliberately user-writable subtree — status
+;   heartbeat, history, the pending-decision queue, the service
+;   request/results channel, and the published vault snapshot.
+;   The service treats everything under shared\ as untrusted
+;   input and re-verifies fingerprints before acting on it.
+Name: "{commonappdata}\Argus"; Permissions: users-readexec
+Name: "{commonappdata}\Argus\quarantine"
+Name: "{commonappdata}\Argus\shared"; Permissions: users-modify
+Name: "{commonappdata}\Argus\shared\requests"; Permissions: users-modify
+Name: "{commonappdata}\Argus\shared\results"; Permissions: users-modify
 
 [Files]
 Source: "..\dist\{#AppExeName}"; DestDir: "{app}"; Flags: ignoreversion
@@ -122,6 +134,19 @@ Name: "{autodesktop}\ARGUS.EXE"; Filename: "{app}\{#AppExeName}"; \
   Tasks: desktopicon; Comment: "ARGUS.EXE — Sentinel Safeguard"
 
 [Run]
+; Trust-split ACLs, applied BEFORE the service is installed/started
+; so the vault is locked down from the first moment it exists:
+; the quarantine subtree loses inherited permissions entirely —
+; SYSTEM and Administrators only. The shared subtree is confirmed
+; user-modifiable (Inno's [Dirs] entry plus this, belt and braces).
+Filename: "icacls.exe"; \
+  Parameters: """{commonappdata}\Argus\quarantine"" /inheritance:r /grant:r ""SYSTEM:(OI)(CI)F"" ""Administrators:(OI)(CI)F"""; \
+  StatusMsg: "Locking down the quarantine vault..."; \
+  Flags: runhidden waituntilterminated
+Filename: "icacls.exe"; \
+  Parameters: """{commonappdata}\Argus\shared"" /grant ""Users:(OI)(CI)M"" /T /Q"; \
+  StatusMsg: "Preparing the shared Argus data folder..."; \
+  Flags: runhidden waituntilterminated
 ; Install the service (automatic start), set crash recovery to
 ; restart it, register with Windows Security Center, then start it.
 Filename: "{app}\{#ServiceExeName}"; Parameters: "install"; \
