@@ -17,11 +17,24 @@ and Security Center registration are machine-wide settings.
 
 YOUR DATA
 ---------
-Argus keeps its settings, signature database, quarantine vault,
-and scan history in one shared machine location:
+Argus keeps its data in one shared machine location:
 C:\ProgramData\Argus. The protection service, the Argus app, and
 the command line all use that same folder, so what one of them
 sees is what all of them see.
+
+The folder is split by trust, on purpose:
+
+  * Settings and the signature database sit in the root, where
+    standard Windows accounts can read but never change them.
+  * The quarantine vault is locked down completely — only the
+    Argus service and administrators can open it, so a piece of
+    malware (or a curious hand) cannot reach what Argus caught.
+    If the app cannot open the vault from your account, it shows
+    the service's snapshot of it and asks the service to carry
+    out restores and deletions for you.
+  * A "shared" subfolder holds the status heartbeat, history,
+    and your pending decisions — the pieces every account
+    legitimately needs to see and answer.
 
 If you ever uninstall: the program and service are removed, but
 the vault and history are KEPT unless you check "remove all
