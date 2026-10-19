@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
+from types import SimpleNamespace
 
 from PySide6.QtWidgets import (
     QHBoxLayout,
@@ -28,6 +30,8 @@ from ..paths import vault_view_path
 from ..reporting import render_text_report
 from .backend import GuiBackend
 from .format import human_bytes
+
+log = logging.getLogger("argus.gui")
 from .widgets import severity_item
 
 
@@ -38,6 +42,32 @@ def _confirm(parent, title: str, body: str) -> bool:
         QMessageBox.StandardButton.No,
     )
     return answer == QMessageBox.StandardButton.Yes
+
+
+def _fetch_service_details(kind: str, record_id: str):
+    """Ask the protection service for its OWN record of one
+    vault entry / pending action (fix round 2, FIX 1).
+
+    Returns ``(details, error)``: *details* is the service's
+    record dict, or None when the verified pipe is not required
+    in this layout (the page's own data is already
+    authoritative). *error* is designed status-label text when
+    the record could not be obtained — in the installed layout a
+    confirmation is NEVER built from the unsigned view files
+    when the service cannot be asked, because those files are
+    display hints any local process could rewrite."""
+    try:
+        if kind == "entry":
+            return action_requests.fetch_entry_details(record_id), None
+        return action_requests.fetch_pending_details(record_id), None
+    except action_requests.PipeUnavailableError as exc:
+        return None, action_requests.pipe_failure_message(exc)
+    except action_requests.ServiceDetailsError as exc:
+        return None, (
+            f"Argus asked its protection service to confirm that "
+            f"record, and the service answered: {exc} Nothing was "
+            "done — refresh the list and try again."
+        )
 
 
 class QuarantinePage(QWidget):
@@ -156,37 +186,79 @@ class QuarantinePage(QWidget):
         entry = self._selected_entry()
         if entry is None:
             return
+        via_service = not self._direct and not self._backend.simulation_mode
+        details = None
+        if via_service and action_requests.pipe_channel_required():
+            # Authoritative confirmation (fix round 2): the
+            # dialog shows the SERVICE's own record — the view
+            # file this list came from is unsigned and only a
+            # hint about which row to ask about.
+            details, error = _fetch_service_details("entry", entry.id)
+            if error is not None:
+                self.status_label.setText(error)
+                return
         entry_name = Path(entry.original_path).name
-        confirms = {
-            "restore": (
-                "Restore this file?",
-                f"{entry_name} will be put back at "
-                f"{entry.original_path}. Only restore files you "
-                "believe are safe.",
-            ),
-            "allow": (
-                "Restore and allow this file?",
-                f"{entry_name} will be put back AND "
-                "its fingerprint excluded, so Argus stops "
-                "flagging it. Only vouch for files you trust.",
-            ),
-            "delete": (
-                "Delete permanently?",
-                f"{entry_name} will be destroyed for "
-                "good. This cannot be undone.",
-            ),
-        }
+        if details is not None:
+            name = Path(details["original_path"]).name
+            reported = (
+                "The protection service reports:\n"
+                f"File: {details['original_path']}\n"
+                f"Detection: {details.get('detection_name') or '—'}\n"
+                f"Fingerprint (SHA-256): {details['sha256'][:12]}…\n\n"
+            )
+            confirms = {
+                "restore": (
+                    "Restore this file?",
+                    reported
+                    + f"{name} will be put back at the location "
+                    "above. Only restore files you believe are safe.",
+                ),
+                "allow": (
+                    "Restore and allow this file?",
+                    reported
+                    + f"{name} will be put back AND its fingerprint "
+                    "excluded, so Argus stops flagging it. Only "
+                    "vouch for files you trust.",
+                ),
+                "delete": (
+                    "Delete permanently?",
+                    reported
+                    + f"{name} will be destroyed for good. "
+                    "This cannot be undone.",
+                ),
+            }
+        else:
+            confirms = {
+                "restore": (
+                    "Restore this file?",
+                    f"{entry_name} will be put back at "
+                    f"{entry.original_path}. Only restore files you "
+                    "believe are safe.",
+                ),
+                "allow": (
+                    "Restore and allow this file?",
+                    f"{entry_name} will be put back AND "
+                    "its fingerprint excluded, so Argus stops "
+                    "flagging it. Only vouch for files you trust.",
+                ),
+                "delete": (
+                    "Delete permanently?",
+                    f"{entry_name} will be destroyed for "
+                    "good. This cannot be undone.",
+                ),
+            }
         title, body = confirms[action]
         if not _confirm(self, title, body):
             return
-        if not self._direct and not self._backend.simulation_mode:
+        submit_sha = details["sha256"] if details is not None else entry.sha256
+        if via_service:
             # The vault is not this process's to touch (installed
             # layout): the human confirmed HERE, and the protection
             # service carries it out against its own records.
             result = action_requests.submit_and_wait(
                 action,
                 entry_id=entry.id,
-                sha256=entry.sha256,
+                sha256=submit_sha,
                 requested_by="Argus GUI (quarantine page)",
             )
             self.refresh()
@@ -216,8 +288,17 @@ class QuarantinePage(QWidget):
             self.refresh()
             self.status_label.setText(result.message)
             return
-        except Exception as exc:
-            QMessageBox.critical(self, "That did not work", str(exc))
+        except Exception:
+            # Plain language on screen; the technical record goes
+            # to the log — never a raw exception in a dialog.
+            log.exception("quarantine/pending action failed")
+            QMessageBox.critical(
+                self,
+                "That did not work",
+                "Argus couldn't do that just now. Nothing was "
+                "changed. Try again — if it keeps failing, "
+                "restart Argus.",
+            )
             return
         # Refresh first: refresh() rewrites the status line with the
         # queue summary, so the outcome message is set after it —
@@ -270,25 +351,21 @@ class PendingPage(QWidget):
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self._pending: list = []
-        #: True when the list came from the shared pending DB
-        #: because the vault could not be opened by this process —
-        #: decisions then go through the service request channel.
+        #: True when the list came from the service-published
+        #: pending VIEW because this process does not own the
+        #: (trusted, service-owned) pending store — decisions then
+        #: go through the service request channel.
         self._via_service = False
         self.refresh()
 
     def refresh(self) -> None:
-        try:
-            engine = self._backend.real_actions()
-            self._pending = engine.list_pending()
-            self._via_service = False
-        except Exception:
-            # Installed layout, standard user: read the queue from
-            # the shared pending database directly.
-            self._pending = [
-                p for p in self._backend.pending_actions_loose()
-                if p.status == "pending"
-            ]
-            self._via_service = True
+        # The pinned pending interface: direct from the store ONLY
+        # when this process owns it (portable / elevated / dev);
+        # in the installed layout the pending database lives in
+        # the trusted vault directory and the GUI reads the
+        # service-published pending view instead — never the
+        # service-owned database itself.
+        self._pending, self._via_service = self._backend.pending_display()
         self.table.setRowCount(len(self._pending))
         for row, pending in enumerate(self._pending):
             self.table.setItem(row, 0, QTableWidgetItem(pending.action))
@@ -329,19 +406,47 @@ class PendingPage(QWidget):
             )
             return
         pending = self._pending[row]
-        verb = pending.action if action == "approve" else "leave alone"
+        via_service = self._via_service and not self._backend.simulation_mode
+        details = None
+        if via_service and action_requests.pipe_channel_required():
+            # Authoritative confirmation (fix round 2): ask the
+            # service for its OWN queue row and build the dialog
+            # from THAT — never from the unsigned pending view.
+            details, error = _fetch_service_details("pending", pending.id)
+            if error is not None:
+                self.status_label.setText(error)
+                return
+        shown = pending
+        if details is not None:
+            shown = SimpleNamespace(
+                id=details["pending_id"],
+                action=details["action"],
+                path=details["path"],
+                detection_name=details.get("detection_name"),
+                severity=details.get("severity"),
+                sha256=details.get("sha256") or "",
+                source=details.get("source"),
+                reasons=list(details.get("reasons") or []),
+            )
+        verb = shown.action if action == "approve" else "leave alone"
+        body = self._confirm_text(shown, verb)
+        if details is not None:
+            body = "The protection service reports:\n\n" + body
         if not _confirm(
             self,
-            f"{'Approve' if action == 'approve' else 'Reject'} {pending.action}?",
-            self._confirm_text(pending, verb),
+            f"{'Approve' if action == 'approve' else 'Reject'} {shown.action}?",
+            body,
         ):
             return
         kind = "approve-pending" if action == "approve" else "reject-pending"
-        if self._via_service and not self._backend.simulation_mode:
+        submit_sha = (
+            details["sha256"] if details is not None else pending.sha256
+        )
+        if via_service:
             result = action_requests.submit_and_wait(
                 kind,
                 pending_id=pending.id,
-                sha256=pending.sha256,
+                sha256=submit_sha,
                 requested_by="Argus GUI (pending page)",
             )
             self.refresh()
@@ -379,8 +484,17 @@ class PendingPage(QWidget):
             self.refresh()
             self.status_label.setText(result.message)
             return
-        except Exception as exc:
-            QMessageBox.critical(self, "That did not work", str(exc))
+        except Exception:
+            # Plain language on screen; the technical record goes
+            # to the log — never a raw exception in a dialog.
+            log.exception("quarantine/pending action failed")
+            QMessageBox.critical(
+                self,
+                "That did not work",
+                "Argus couldn't do that just now. Nothing was "
+                "changed. Try again — if it keeps failing, "
+                "restart Argus.",
+            )
             return
         # Refresh first: refresh() rewrites the status line with the
         # queue summary, so the outcome message is set after it —
