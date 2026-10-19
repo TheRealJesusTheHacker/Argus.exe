@@ -1,0 +1,42 @@
+#!/bin/sh
+# Argus (.deb edition) — post-removal script.
+#
+# A plain remove keeps the user's data (vault, history,
+# settings) — reinstalling Argus picks everything back up, and
+# an accidental remove never destroys the quarantine record.
+# Only `apt purge` deletes the data tree, the logs, and the
+# configuration directory. That split is deliberate and matches
+# how the Windows uninstaller treats the shared data root.
+set -e
+
+UNIT=argus-protection.service
+
+case "$1" in
+    purge)
+        rm -rf /var/lib/argus
+        rm -rf /var/log/argus
+        rm -rf /etc/argus
+        if command -v systemctl >/dev/null 2>&1; then
+            if [ -d /run/systemd/system ]; then
+                systemctl daemon-reload || true
+            fi
+        fi
+        ;;
+    remove)
+        # The unit file is gone with the payload; let systemd
+        # forget it. Data stays (see the header).
+        if command -v systemctl >/dev/null 2>&1; then
+            if [ -d /run/systemd/system ]; then
+                systemctl daemon-reload || true
+            fi
+        fi
+        ;;
+    upgrade|disappear|abort-install|abort-upgrade|failed-upgrade)
+        ;;
+    *)
+        echo "postrm called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
