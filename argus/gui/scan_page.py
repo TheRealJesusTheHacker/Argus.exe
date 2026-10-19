@@ -368,7 +368,6 @@ class ScanPage(QWidget):
                 severity=row.get("severity") or "high",
                 verdict=row["verdict"],
                 sha256=row.get("sha256"),
-                score=row.get("score") or 0,
                 reasons=list(row.get("reasons") or []),
             )
         try:
