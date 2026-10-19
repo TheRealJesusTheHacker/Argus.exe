@@ -85,9 +85,38 @@ SELF_CHECK_MODULES = (
     "argus.gui.onboarding",
 )
 
+#: The import census for the LINUX build (v1.2.0): the modules
+#: the packaged Linux program loads lazily — the systemd service
+#: host, the Unix-socket verified channel, the dpkg trust, the
+#: inotify watcher — in place of the pywin32 stack, which does
+#: not exist there. :func:`main` selects it on Linux; the Windows
+#: census above stays the default everywhere (existing callers
+#: and tests are untouched).
+SELF_CHECK_MODULES_LINUX = (
+    # GUI stack
+    "PySide6",
+    "PySide6.QtCore",
+    "PySide6.QtGui",
+    "PySide6.QtWidgets",
+    # Argus's own lazy halves (Linux platform layer)
+    "argus.linuxservice",
+    "argus.socket_channel",
+    "argus.platform_dpkg",
+    "argus.inotify_watcher",
+    "argus.setup_engine",
+    "argus.service",
+    "argus.pipe_channel",
+    "argus.gui.backend",
+    "argus.gui.setup_app",
+    "argus.gui.app",
+    "argus.gui.onboarding",
+)
 
-def run_self_check(import_module=None) -> int:
-    """Import every module in :data:`SELF_CHECK_MODULES`.
+
+def run_self_check(import_module=None, modules=None) -> int:
+    """Import every module in the census (*modules*, default
+    :data:`SELF_CHECK_MODULES` — the Windows census; the Linux
+    build passes :data:`SELF_CHECK_MODULES_LINUX`).
 
     Prints the product version and the census result. Returns 0
     when everything imports; returns 1 and names each failing
@@ -95,9 +124,10 @@ def run_self_check(import_module=None) -> int:
     nothing — importing ``argus.gui.*`` modules does not create a
     QApplication; only running the GUI does that.
     """
+    census = tuple(modules) if modules is not None else SELF_CHECK_MODULES
     importer = import_module or importlib.import_module
     failures: list[tuple[str, BaseException]] = []
-    for name in SELF_CHECK_MODULES:
+    for name in census:
         try:
             importer(name)
         except BaseException as exc:  # named, counted — never hidden
@@ -110,14 +140,14 @@ def run_self_check(import_module=None) -> int:
             )
         print(
             f"ARGUS.EXE {__version__} self-check FAILED: "
-            f"{len(failures)} of {len(SELF_CHECK_MODULES)} modules "
+            f"{len(failures)} of {len(census)} modules "
             "could not be imported.",
             file=sys.stderr,
         )
         return 1
     print(
         f"ARGUS.EXE {__version__} self-check OK: "
-        f"{len(SELF_CHECK_MODULES)} modules imported."
+        f"{len(census)} modules imported."
     )
     return 0
 
@@ -260,6 +290,16 @@ def main(argv: list[str] | None = None) -> int:
     route = route_invocation(args)
 
     if route == "service":
+        if sys.platform.startswith("linux"):
+            # systemd is starting the protection service: host it
+            # in the foreground (argus.linuxservice.run_daemon).
+            from .linuxservice import ServiceUnavailable, run_daemon
+
+            try:
+                return run_daemon()
+            except ServiceUnavailable as exc:
+                print(f"argus service: {exc}")
+                return 2
         from .winservice import ServiceUnavailable, run_service_dispatcher
 
         try:
@@ -282,12 +322,25 @@ def main(argv: list[str] | None = None) -> int:
         return run_self_check_qt()
 
     if route == "self-check":
+        if sys.platform.startswith("linux") and getattr(
+            sys, "frozen", False
+        ):
+            # The packaged Linux build (PyInstaller-frozen): its
+            # census is the Linux module set — the pywin32 names
+            # in the default census do not exist there. A source
+            # run keeps the historical default census on every
+            # platform (that is the seam the test suite pins).
+            return run_self_check(modules=SELF_CHECK_MODULES_LINUX)
         return run_self_check()
 
     if route == "manage":
+        words = args[1:] if args and args[0].lower() == "service" else args
+        if sys.platform.startswith("linux"):
+            from .linuxservice import main as service_main
+
+            return service_main(words)
         from .winservice import main as service_main
 
-        words = args[1:] if args and args[0].lower() == "service" else args
         return service_main(words)
 
     from . import gui
