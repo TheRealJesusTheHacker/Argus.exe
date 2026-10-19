@@ -1,22 +1,30 @@
-name: build-windows
+name: build-release
 
-# Builds the Windows product when a release is published:
+# Builds the products when a release is published:
 #   * checks the release tag against argus.__version__ (a vX.Y.Z
 #     tag that disagrees with the code never ships)
 #   * runs the full test suite (GUI tests run offscreen)
-#   * builds THE Argus.exe with PyInstaller — one file containing
-#     the GUI, the protection service host, and the self-install
-#     engine (v1.1.0+; there is no separate service exe and no
-#     installer anymore — Argus.exe installs itself)
-#   * smoke-tests the built exe with --self-check (imports every
-#     lazy module) and --self-check-qt (creates the QApplication
-#     offscreen and builds the real main window — importing Qt is
-#     not proof its platform plugin shipped), and greps the
-#     PyInstaller warn file for the lazy-import watchlist — a build
-#     that silently dropped the service stack or Qt fails HERE,
-#     not on a user's machine
+#   * Windows job: builds THE Argus.exe with PyInstaller — one
+#     file containing the GUI, the protection service host, and
+#     the self-install engine (v1.1.0+; there is no separate
+#     service exe and no installer anymore — Argus.exe installs
+#     itself)
+#   * Linux job (v1.2.0+): builds the same product as a .deb for
+#     Debian-based systems (Kali Linux, Parrot OS, Debian,
+#     Ubuntu) — the .deb is the installer there: PyInstaller
+#     binary + systemd unit + desktop entry, packaged with
+#     dpkg-deb by packaging/linux/build-deb.sh
+#   * smoke-tests the built programs with --self-check (imports
+#     every lazy module) and --self-check-qt (creates the
+#     QApplication offscreen and builds the real main window —
+#     importing Qt is not proof its platform plugin shipped), and
+#     greps the PyInstaller warn file for the lazy-import
+#     watchlist — a build that silently dropped a platform stack
+#     or Qt fails HERE, not on a user's machine
 #   * assembles the portable edition (the same exe + launcher)
-#   * attaches Argus.exe, ArgusPortable.zip and SHA256SUMS.txt
+#   * a final checksums job attaches ONE SHA256SUMS.txt covering
+#     every asset (Argus.exe, ArgusPortable.zip, Argus.deb) once
+#     both platform jobs have uploaded theirs
 on:
   release:
     types: [published]
@@ -119,17 +127,130 @@ jobs:
           Copy-Item packaging\portable\README-PORTABLE.txt dist\ArgusPortable\
           Compress-Archive -Path dist\ArgusPortable\* -DestinationPath dist\ArgusPortable.zip -Force
 
-      - name: Generate SHA256SUMS.txt for the release assets
-        run: |
-          $assets = "dist/Argus.exe", "dist/ArgusPortable.zip"
-          $lines = foreach ($asset in $assets) {
-            $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
-            "$hash  $(Split-Path $asset -Leaf)"
-          }
-          $lines | Out-File -Encoding ascii dist/SHA256SUMS.txt
-          Get-Content dist/SHA256SUMS.txt
-
-      - name: Attach the exe, portable edition and checksums to the release
+      - name: Attach the exe and portable edition to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.ref_name }} dist/Argus.exe dist/ArgusPortable.zip dist/SHA256SUMS.txt --clobber
+        run: gh release upload ${{ github.ref_name }} dist/Argus.exe dist/ArgusPortable.zip --clobber
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      # Same pinned actions as the Windows job (see its note).
+      - name: Check out the release tag
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Check the release tag matches the code version
+        run: |
+          tag="${{ github.ref_name }}"
+          code="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' argus/__init__.py)"
+          if [ -z "$code" ]; then
+            echo "Could not read __version__ from argus/__init__.py."
+            exit 1
+          fi
+          if [ "v$code" != "$tag" ]; then
+            echo "Release tag '$tag' does not match argus.__version__ '$code' (expected tag 'v$code')."
+            exit 1
+          fi
+          echo "Release tag $tag matches argus.__version__ $code."
+
+      # The Qt runtime libraries the GUI links (the same list the
+      # .deb declares in Depends), plus desktop-file-utils for
+      # validating the packaged .desktop entry.
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libfontconfig1 libglib2.0-0 \
+            libxkbcommon0 libdbus-1-3 desktop-file-utils
+
+      - name: Install dependencies
+        run: |
+          pip install -r packaging/requirements-ci-linux.txt
+          pip install --no-deps ".[gui]"
+
+      - name: Run the test suite (GUI offscreen)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Build Argus.deb (PyInstaller binary + dpkg-deb package)
+        run: bash packaging/linux/build-deb.sh
+
+      - name: Check the build for missing lazy imports (warn file)
+        run: |
+          warn="build/linux-work/argus/warn-argus.txt"
+          if [ ! -f "$warn" ]; then
+            echo "PyInstaller warn file not found at $warn — cannot verify the lazy-import watchlist."
+            exit 1
+          fi
+          if grep -E "PySide6" "$warn"; then
+            echo "PyInstaller could not find modules on the lazy-import watchlist (above)."
+            exit 1
+          fi
+          echo "No watchlist modules missing from the build."
+
+      - name: Smoke-test the built program (--self-check)
+        run: |
+          ./dist/argus --self-check
+
+      # Same reasoning as the Windows job: importing PySide6 is
+      # not proof the GUI can start — the Qt platform plugin
+      # loads only when a QApplication is created.
+      - name: Smoke-test the built program's GUI stack (--self-check-qt, offscreen)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ./dist/argus --self-check-qt
+
+      - name: Inspect the package (control, unit, desktop entry)
+        run: |
+          dpkg-deb -I dist/Argus.deb
+          dpkg-deb -c dist/Argus.deb
+          scratch="$(mktemp -d)"
+          dpkg-deb -x dist/Argus.deb "$scratch"
+          systemd-analyze verify \
+            "$scratch/usr/lib/systemd/system/argus-protection.service" || true
+          desktop-file-validate \
+            "$scratch/usr/share/applications/argus.desktop"
+
+      - name: Attach the .deb to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} dist/Argus.deb --clobber
+
+  # One SHA256SUMS.txt for the whole release, generated only
+  # after BOTH platform jobs have attached their assets — a sums
+  # file generated inside either platform job could never cover
+  # the other platform's asset, and two racing sums files would
+  # clobber each other.
+  checksums:
+    runs-on: ubuntu-latest
+    needs: [build, build-linux]
+    steps:
+      - name: Download the release assets and generate SHA256SUMS.txt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir release-assets
+          gh release download ${{ github.ref_name }} \
+            --repo ${{ github.repository }} \
+            --pattern "Argus.exe" --pattern "ArgusPortable.zip" \
+            --pattern "Argus.deb" --dir release-assets
+          cd release-assets
+          sha256sum Argus.exe ArgusPortable.zip Argus.deb > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Attach SHA256SUMS.txt to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload ${{ github.ref_name }} \
+            release-assets/SHA256SUMS.txt --clobber \
+            --repo ${{ github.repository }}
