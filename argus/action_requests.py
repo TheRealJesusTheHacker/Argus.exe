@@ -39,6 +39,14 @@ Two transports, one discipline:
   Pipe failure is a designed error, never a silent fallback to
   the forgeable file drop.
 
+- **Verified socket channel** (v1.2.0) — the Linux twin: on a
+  .deb-installed machine, privileged kinds travel over the Unix
+  domain socket in :mod:`argus.socket_channel`, where the kernel
+  itself (SO_PEERCRED) vouches for the calling process, and the
+  same canonical-path + recorded-fingerprint proof decides.
+  :func:`pipe_channel_required` covers both platforms; the
+  transport is chosen per platform in :func:`_verified_roundtrip`.
+
 The helpers here are the caller side only; the executing side lives
 in :mod:`argus.service`. The direct route stays the default
 everywhere it works (portable edition, elevated shells, dev trees):
@@ -237,26 +245,52 @@ def submit_and_wait(
 # Verified pipe transport (fix round 2, FIX 1)
 # ----------------------------------------------------------------------
 def pipe_channel_required() -> bool:
-    """True when privileged actions must use the verified pipe:
-    Windows, the INSTALLED layout (not portable — no
-    ``ARGUS_DATA_DIR``), and a completed setup (the canonical
+    """True when privileged actions must use the verified
+    channel: the INSTALLED layout (not portable — no
+    ``ARGUS_DATA_DIR``) and a completed setup (the canonical
     program file exists AND setup recorded its fingerprint).
-    Anywhere else, caller and service share one user's trust
-    domain and the file channel stands (see the module
-    docstring and docs/ROADMAP.md)."""
-    if sys.platform != "win32":
-        return False
+
+    Windows gets the named pipe (:mod:`argus.pipe_channel`);
+    Linux gets the Unix socket (:mod:`argus.socket_channel`) —
+    same rule, same strictness, platform transport. Anywhere
+    else, caller and service share one user's trust domain and
+    the file channel stands (see the module docstring and
+    docs/ROADMAP.md)."""
     if os.environ.get("ARGUS_DATA_DIR"):
         return False
-    try:
-        from .selftrust import load_recorded_exe_sha256
-        from .setup_engine import canonical_exe_path
+    if sys.platform == "win32":
+        try:
+            from .selftrust import load_recorded_exe_sha256
+            from .setup_engine import canonical_exe_path
 
-        return canonical_exe_path().is_file() and bool(
-            load_recorded_exe_sha256()
-        )
-    except Exception:
-        return False
+            return canonical_exe_path().is_file() and bool(
+                load_recorded_exe_sha256()
+            )
+        except Exception:
+            return False
+    if sys.platform.startswith("linux"):
+        try:
+            from . import paths
+            from .selftrust import load_recorded_exe_sha256
+
+            return paths.LINUX_PROGRAM_PATH.is_file() and bool(
+                load_recorded_exe_sha256()
+            )
+        except Exception:
+            return False
+    return False
+
+
+def _verified_roundtrip(payload: dict, *, timeout: float) -> dict:
+    """One request over the platform's verified channel (the
+    Windows pipe, the Linux socket). Raises
+    :class:`PipeUnavailableError` on transport failure — the
+    caller phrases the designed error and never falls back."""
+    if sys.platform.startswith("linux"):
+        from . import socket_channel
+
+        return socket_channel.socket_roundtrip(payload, timeout=timeout)
+    return pipe_channel.pipe_roundtrip(payload, timeout=timeout)
 
 
 _PIPE_CONNECT_MESSAGE = (
@@ -294,7 +328,7 @@ def _submit_via_pipe(
         "nonce": nonce,
     }
     try:
-        response = pipe_channel.pipe_roundtrip(payload, timeout=timeout)
+        response = _verified_roundtrip(payload, timeout=timeout)
     except PipeUnavailableError as exc:
         _outstanding_nonces.pop(rid, None)
         message = (
@@ -357,7 +391,7 @@ def _fetch_details(kind: str, key: str, record_id: str) -> dict | None:
     rid = new_request_id()
     nonce = uuid.uuid4().hex
     payload = {"id": rid, "kind": kind, key: record_id, "nonce": nonce}
-    response = pipe_channel.pipe_roundtrip(payload, timeout=DEFAULT_TIMEOUT_SECONDS)
+    response = _verified_roundtrip(payload, timeout=DEFAULT_TIMEOUT_SECONDS)
     if response.get("id") != rid or response.get("nonce") != nonce:
         raise ServiceDetailsError(
             "the protection service's answer could not be verified, "
