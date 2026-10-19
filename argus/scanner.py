@@ -35,6 +35,20 @@ Hard rules learned from real-world scanner bugs:
 - **Exclusions honoured.** User-configured exclusions (by path or by
   SHA-256) short-circuit scanning in both on-demand and real-time
   scans — the file is left alone and the skip is noted, never hidden.
+- **Argus never scans itself — narrowly defined.** The quarantine
+  vault subtree, the signature database file and its key, and the
+  identity-proven program file are skipped before any read (see
+  :mod:`argus.selftrust`): the program file is exempt only with
+  proof of identity, never by name, and a stranger sitting at the
+  program's own address whose fingerprint contradicts the record
+  setup left is scanned in full and reported as a tamper
+  indicator. Everything else — including the user-writable
+  ``shared`` data subtree and install-folder support files —
+  scans normally.
+- **Normal Windows files are recognised.** A structurally-valid
+  Microsoft-signed binary in its system location has its heuristic
+  suspicion cleared (see :mod:`argus.scoring`) — signature and
+  pattern-rule detections on it still stand.
 """
 
 from __future__ import annotations
@@ -50,9 +64,18 @@ from typing import Iterator
 
 from .config import Exclusions
 from .detections import FileAssessment, Verdict, assess
-from .heuristics.analyze import SCRIPT_EXTENSIONS, analyze_file
+from .heuristics.analyze import (
+    SCRIPT_EXTENSIONS,
+    _looks_like_script,
+    _u16le_segment_offset,
+    analyze_file,
+    sniff_script_content,
+    waive_oversize_floor,
+)
+from .heuristics.signals import Signal
 from .rules import MAX_RULE_SCAN_SIZE, Rule, RuleMatcher
 from .scoring import score_signals
+from .selftrust import SelfExclusions, default_self_exclusions
 from .signatures import SignatureDB
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
@@ -100,6 +123,93 @@ class _Utf16Folder:
         return buf[:even][0::2]
 
 
+class _FoldedRuleViews:
+    """The pair of UTF-16LE folded rule matchers (even + odd
+    parity) over one byte stream, with their folders and the
+    odd-stream alignment state. One instance covers exactly one
+    full pass over a file — the scan's main pass, or the folded
+    second pass a late UTF-16 detection triggers."""
+
+    def __init__(self, rules: list[Rule]) -> None:
+        self.matchers: list[RuleMatcher] = [
+            RuleMatcher(rules),
+            RuleMatcher(rules),
+        ]
+        self._folders = [_Utf16Folder(), _Utf16Folder()]
+        self._odd_started = False
+
+    def feed(self, chunk: bytes) -> None:
+        even_matcher, odd_matcher = self.matchers
+        even_folder, odd_folder = self._folders
+        even_matcher.feed(even_folder.feed(chunk))
+        # The odd view is the same stream shifted by one byte:
+        # its folder sees every byte from global offset 1 on,
+        # so a UTF-16 passage starting at an odd offset folds
+        # whole instead of shredded.
+        if not self._odd_started:
+            odd_input = chunk[1:]
+            self._odd_started = True
+        else:
+            odd_input = chunk
+        if odd_input:
+            odd_matcher.feed(odd_folder.feed(odd_input))
+
+    def finish(self) -> list:
+        hits: list = []
+        for matcher in self.matchers:
+            hits.extend(matcher.finish())
+        return hits
+
+
+def _folded_second_pass(
+    path: Path,
+    rules: list[Rule],
+    chunk_size: int,
+    *,
+    include_raw: bool,
+) -> tuple[_FoldedRuleViews | None, RuleMatcher | None]:
+    """Re-read *path* streaming the UTF-16 folded views (both
+    parities) over the WHOLE file — plus a raw matcher when the
+    main pass never ran rules at all (oversize script content).
+
+    This is the placement-independent half of the UTF-16 fix
+    (fix round 3): the main pass tests every chunk for a UTF-16
+    segment, and a positive anywhere — at ANY offset — sends
+    the file through this pass, so there is no sampled geometry
+    left for a payload to hide between. Each matcher carries
+    the standard per-file rule budget (including the tail
+    pass), so the second pass is bounded exactly like the main
+    one. A file that vanishes mid-scan yields ``(None, None)``:
+    the main pass's hash/signature outcome already stands.
+    """
+    views = _FoldedRuleViews(rules)
+    raw_matcher = RuleMatcher(rules) if include_raw else None
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(chunk_size)
+                if not chunk:
+                    break
+                if raw_matcher is not None:
+                    raw_matcher.feed(chunk)
+                views.feed(chunk)
+    except OSError:
+        return None, None
+    return views, raw_matcher
+
+
+#: Carry for the scanner's per-chunk UTF-16 segment test: a
+#: segment straddling a chunk boundary stays contiguous inside
+#: (carry + chunk) — it needs 16 pairs (32 bytes), so at most
+#: 15 pairs (30 bytes) of it can sit behind the boundary.
+_SEGMENT_TEST_CARRY = 64
+
+#: A UTF-16LE segment carries at least this many NUL bytes, so a
+#: window with fewer cannot contain one — a one-pass C-speed
+#: pre-filter that keeps the lane test off NUL-free chunks.
+_SEGMENT_MIN_NULS = 16
+
+
 # ----------------------------------------------------------------------
 # Per-file results
 # ----------------------------------------------------------------------
@@ -128,6 +238,11 @@ class ScannedFile:
     #: file alone (by path or by hash). Excluded files are not scanned
     #: and always carry an explanatory note on the assessment.
     excluded: bool = False
+    #: Why Argus left this file alone as one of its OWN (see
+    #: :mod:`argus.selftrust`) — "Argus's own data folder", "the
+    #: Argus program itself", ... Set only for self-exclusions;
+    #: user-configured exclusions explain themselves in the notes.
+    exclusion_source: str | None = None
 
     @property
     def path(self) -> Path:
@@ -247,6 +362,7 @@ def scan_file(
     *,
     heuristics: bool = True,
     exclusions: Exclusions | None = None,
+    self_exclusions: SelfExclusions | None = None,
 ) -> ScannedFile:
     """Scan one file: hash it, check signatures, evaluate rules, and
     (unless ``heuristics=False``) run Phase 2 heuristic analysis.
@@ -260,17 +376,83 @@ def scan_file(
     exclusion returns before the file is even read, and a hash
     exclusion returns a clean, noted result right after hashing —
     Argus leaves excluded files alone, everywhere, always.
+
+    ``self_exclusions`` (Argus's own territory + identity proofs,
+    see :mod:`argus.selftrust`) is consulted before ANY read: Argus
+    does not scan its own data tree or its own program. When the
+    caller does not supply a set, the machine default is built once
+    and reused. A file at the program's own address that fails the
+    identity proofs is scanned in full and reported as a tamper
+    indicator.
     """
     result = FileResult(path=path)
+
+    # --- self-exclusion, before the file is touched ---------------
+    self_check = None
+    try:
+        self_check = (
+            self_exclusions
+            if self_exclusions is not None
+            else default_self_exclusions()
+        ).check(path)
+    except Exception:
+        # Self-trust must never take a scan down; a failure to even
+        # ASK means the file is treated as a stranger's (the safe
+        # direction — it gets scanned).
+        self_check = None
+    if self_check is not None and self_check.excluded:
+        try:
+            result.size = path.stat().st_size
+        except OSError:
+            result.size = None
+        assessment = FileAssessment()
+        assessment.notes.append(
+            f"skipped — this is {self_check.source}; "
+            "Argus does not scan its own files"
+        )
+        return ScannedFile(
+            result=result,
+            assessment=assessment,
+            excluded=True,
+            exclusion_source=self_check.source,
+        )
+    tamper_suspect = bool(self_check and self_check.tamper_suspect)
+
     matcher = RuleMatcher(rules)
-    # Scripts also get a UTF-16LE-folded view through a second
-    # matcher: a .ps1 saved as UTF-16 (PowerShell's own default for
-    # years) must not sail past text rules just because every other
-    # byte is NUL.
-    folded_matcher = (
-        RuleMatcher(rules) if path.suffix.lower() in SCRIPT_EXTENSIONS else None
-    )
-    folder = _Utf16Folder() if folded_matcher is not None else None
+    # Scripts also get UTF-16LE-folded views through second
+    # matchers: a .ps1 saved as UTF-16 (PowerShell's own default
+    # for years) must not sail past text rules just because every
+    # other byte is NUL. The folded views are built when the
+    # EXTENSION or the CONTENT says "script" (P0-4): a UTF-16
+    # cradle wearing a .txt/.dat/no extension gets the same
+    # folded treatment as a .ps1.
+    #
+    # TWO folded views (both byte parities): a UTF-16 passage
+    # that starts at an ODD offset (behind an odd-length ASCII
+    # preface) folds into the odd view; the even view alone
+    # would shred it into garbage and miss every pattern.
+    #
+    # Placement independence (fix round 3): the folded views
+    # normally start before the first byte is fed, on the
+    # extension or the head/sample content routing. Any file
+    # they did NOT start for is still tested — EVERY chunk of
+    # the streaming pass runs the UTF-16 segment test — and a
+    # positive at ANY offset triggers a bounded folded second
+    # pass over the whole file (:func:`_folded_second_pass`).
+    # There is no sampled geometry left for a payload to hide
+    # between: not at 200 KB, not at 2 MiB, not at 6 MiB.
+    script_by_extension = path.suffix.lower() in SCRIPT_EXTENSIONS
+    folded_views: _FoldedRuleViews | None = None
+    u16_segment_seen = False
+    segment_carry = b""
+
+    def _start_folded() -> None:
+        nonlocal folded_views
+        if folded_views is None:
+            folded_views = _FoldedRuleViews(rules)
+
+    if script_by_extension:
+        _start_folded()
     rules_skipped_reason: str | None = None
 
     try:
@@ -292,12 +474,15 @@ def scan_file(
         return ScannedFile(result=result, assessment=assessment, excluded=True)
 
     # The blanket oversize skip applies to bulk data only. A file
-    # whose content is executable gets rule matching at ANY size —
-    # the matcher streams in chunks, so a padded executable cannot
-    # hide its head/tail bytes behind a size cap. Content decides:
-    # the first chunk is checked for the MZ magic before the choice.
+    # whose content is executable — OR a script (by extension or
+    # by content) — gets rule matching at ANY size (P0-5: scripts
+    # get the PE treatment; the folded streaming matcher below is
+    # how script rules reach a cradle parked at the end of a huge
+    # file): the matcher streams in chunks, so a padded file
+    # cannot hide its head/tail bytes behind a size cap. Content
+    # decides: the first chunk is sniffed before the choice.
     oversize = size > MAX_RULE_SCAN_SIZE
-    feed_rules = not oversize
+    feed_rules = not oversize or script_by_extension
     rules_ran = False
 
     hasher = hashlib.sha256()
@@ -308,15 +493,50 @@ def scan_file(
                 chunk = fh.read(chunk_size)
                 if not chunk:
                     break
-                if read_size == 0 and oversize and chunk.startswith(b"MZ"):
-                    feed_rules = True  # executable content: rules run
+                if read_size == 0:
+                    # Content routing decides BEFORE the first
+                    # byte is fed: the head check, backstopped by
+                    # bounded head/middle/tail sampling when the
+                    # head is an innocent preface (FIX 4).
+                    script_by_content = _looks_like_script(chunk)
+                    if (
+                        not script_by_content
+                        and not chunk.startswith(b"MZ")
+                        and size > len(chunk)
+                    ):
+                        script_by_content = sniff_script_content(
+                            path, size, head=chunk
+                        )
+                    if script_by_content:
+                        _start_folded()
+                    if oversize and (
+                        chunk.startswith(b"MZ")
+                        or script_by_extension
+                        or script_by_content
+                    ):
+                        feed_rules = True  # program/script content: rules run
                 hasher.update(chunk)
                 read_size += len(chunk)
                 if feed_rules:
                     matcher.feed(chunk)
                     rules_ran = True
-                    if folded_matcher is not None and folder is not None:
-                        folded_matcher.feed(folder.feed(chunk))
+                    if folded_views is not None:
+                        folded_views.feed(chunk)
+                if folded_views is None and not u16_segment_seen:
+                    # The placement-independent UTF-16 test: run
+                    # on EVERY chunk (with a short carry, so a
+                    # segment straddling a chunk boundary is
+                    # contiguous in the tested window). A positive
+                    # at any offset arms the folded second pass
+                    # below — the payload's position no longer
+                    # matters, only its presence.
+                    window = segment_carry + chunk
+                    if (
+                        window.count(0) >= _SEGMENT_MIN_NULS
+                        and _u16le_segment_offset(window) is not None
+                    ):
+                        u16_segment_seen = True
+                    segment_carry = chunk[-_SEGMENT_TEST_CARRY:]
     except OSError as exc:
         result.error = f"could not read file: {exc.strerror or exc}"
         assessment = (
@@ -324,6 +544,21 @@ def scan_file(
         )
         return ScannedFile(result=result, assessment=assessment,
                            rules_skipped_reason="file could not be read")
+
+    # Folded second pass (fix round 3): a UTF-16 segment was
+    # seen somewhere in the stream but the folded views never
+    # covered it (the head/sample routing said "not a script").
+    # Run the folded views over the whole file now — and a raw
+    # matcher too when rules never ran (oversize content) — so
+    # the passage is judged like any other script content.
+    folded_second: _FoldedRuleViews | None = None
+    second_raw_matcher: RuleMatcher | None = None
+    if u16_segment_seen and folded_views is None:
+        folded_second, second_raw_matcher = _folded_second_pass(
+            path, rules, chunk_size, include_raw=not rules_ran
+        )
+        if second_raw_matcher is not None:
+            rules_ran = True
 
     if oversize and not rules_ran:
         rules_skipped_reason = (
@@ -343,17 +578,51 @@ def scan_file(
         return ScannedFile(result=result, assessment=assessment, excluded=True)
 
     signature_hit = db.lookup(result.sha256)
-    rule_hits = matcher.finish() if rules_ran else []
-    if folded_matcher is not None and rules_ran:
+    if second_raw_matcher is not None:
+        # The main matcher never ran (oversize); the second
+        # pass's raw matcher is the raw coverage of this file.
+        rule_hits = second_raw_matcher.finish()
+    elif rules_ran:
+        rule_hits = matcher.finish()
+    else:
+        rule_hits = []
+    folded_sources: list[_FoldedRuleViews] = []
+    if folded_views is not None and rules_ran:
+        folded_sources.append(folded_views)
+    if folded_second is not None:
+        folded_sources.append(folded_second)
+    if folded_sources:
         seen_names = {hit.name for hit in rule_hits}
-        for hit in folded_matcher.finish():
-            if hit.name not in seen_names:
-                rule_hits.append(hit)
+        for views in folded_sources:
+            for hit in views.finish():
+                if hit.name not in seen_names:
+                    seen_names.add(hit.name)
+                    rule_hits.append(hit)
     assessment = assess(signature_hit, rule_hits)
-    if getattr(matcher, "budget_exceeded", False) or (
-        folded_matcher is not None
-        and getattr(folded_matcher, "budget_exceeded", False)
-    ):
+    # Coverage honesty (fix round 2, FIX 6): when a matcher ran
+    # its two-pass coverage (primary + tail), its coverage_note
+    # is the statement users see — it says exactly which passes
+    # ran. Only when no matcher produced one does the plain
+    # budget note apply.
+    all_matchers: list[RuleMatcher] = []
+    if rules_ran:
+        all_matchers.append(
+            second_raw_matcher
+            if second_raw_matcher is not None
+            else matcher
+        )
+    if folded_views is not None and rules_ran:
+        all_matchers.extend(folded_views.matchers)
+    if folded_second is not None:
+        all_matchers.extend(folded_second.matchers)
+    coverage_notes = [
+        m.coverage_note for m in all_matchers
+        if getattr(m, "coverage_note", None)
+    ]
+    if coverage_notes:
+        for note in dict.fromkeys(coverage_notes):
+            assessment.notes.append(note)
+    elif any(getattr(m, "budget_exceeded", False) for m in all_matchers):
         assessment.notes.append(
             "pattern matching stopped early: the per-file rule time "
             "budget was exhausted (the file was still hashed and "
@@ -361,7 +630,19 @@ def scan_file(
         )
 
     if heuristics:
-        _apply_heuristics(path, read_size, assessment)
+        _apply_heuristics(path, read_size, assessment,
+                          tamper_suspect=tamper_suspect)
+    elif tamper_suspect:
+        # Tamper evidence is not an optional heuristic: even with
+        # heuristic analysis off, a stranger at Argus's own
+        # program address is surfaced on the standard ScannedFile
+        # surface (assessment.signals / notes / verdict) that
+        # every consumer — CLI, realtime, GUI result rows — reads.
+        scored = score_signals([_tamper_signal()])
+        assessment.signals = scored.signals
+        assessment.score = scored.score
+        assessment.heuristic_verdict = scored.verdict
+        assessment.notes.append(_TAMPER_NOTE)
 
     return ScannedFile(
         result=result, assessment=assessment, rules_skipped_reason=rules_skipped_reason
@@ -433,6 +714,7 @@ def scan_named_streams(
     *,
     heuristics: bool = True,
     exclusions: Exclusions | None = None,
+    self_exclusions: SelfExclusions | None = None,
 ) -> list[ScannedFile]:
     """Scan each named data stream of *path* as a virtual file,
     reported as ``path:stream``. Empty list off Windows."""
@@ -443,12 +725,47 @@ def scan_named_streams(
             scan_file(
                 stream_path, db, rules,
                 heuristics=heuristics, exclusions=exclusions,
+                self_exclusions=self_exclusions,
             )
         )
     return results
 
 
-def _apply_heuristics(path: Path, size: int, assessment: FileAssessment) -> None:
+#: The tamper signal added when a file sits at Argus's own program
+#: address but is not the program Argus installed.
+_TAMPER_SIGNAL_NAME = "argus_program_file_replaced"
+
+_TAMPER_NOTE = (
+    "tamper indicator: a file at Argus's own program "
+    "address failed Argus's identity checks — it was "
+    "scanned in full, not skipped"
+)
+
+
+def _tamper_signal() -> Signal:
+    return Signal(
+        name=_TAMPER_SIGNAL_NAME,
+        severity="high",
+        points=35,
+        explanation=(
+            "This file sits exactly where Argus's own "
+            "program should be, but it is NOT the program "
+            "Argus installed — its fingerprint does not match "
+            "the fingerprint recorded at setup. Something has "
+            "replaced Argus's program file. Treat this as "
+            "tampering until proven otherwise, and reinstall "
+            "Argus from a trusted source."
+        ),
+    )
+
+
+def _apply_heuristics(
+    path: Path,
+    size: int,
+    assessment: FileAssessment,
+    *,
+    tamper_suspect: bool = False,
+) -> None:
     """Run heuristic analysis and merge its outcome into *assessment*.
 
     Analysis failures are recorded as notes — heuristics must never
@@ -459,7 +776,29 @@ def _apply_heuristics(path: Path, size: int, assessment: FileAssessment) -> None
     except Exception as exc:  # fail safe: note it, keep the Phase 1 verdict
         assessment.notes.append(f"heuristic analysis failed: {exc}")
         return
-    scored = score_signals(report.signals, signed=report.signed)
+    if tamper_suspect:
+        report.signals.append(_tamper_signal())
+        assessment.notes.append(_TAMPER_NOTE)
+    # Oversize script floor waiver (script-routing spot audit,
+    # fix-round-3 follow-up): the heuristic half is the report's
+    # own flag; the rule half is decided here — the rule layer
+    # streamed the WHOLE file (raw and UTF-16-folded passes) and
+    # its detections are already on the assessment. One rule hit
+    # anywhere keeps the floor exactly as before.
+    waive_oversize_floor(
+        report,
+        rule_detection_count=sum(
+            1 for det in assessment.detections if det.kind == "rule"
+        ),
+    )
+    scored = score_signals(
+        report.signals,
+        # The trim is earned by a DER-parseable PKCS#7 with an
+        # extracted signer (P1-20), not by the mere presence of a
+        # structurally valid certificate table.
+        signed=getattr(report, "signed_trim_eligible", report.signed),
+        trusted_system_file=report.trusted_system_file,
+    )
     assessment.signals = scored.signals
     assessment.score = scored.score
     assessment.heuristic_verdict = scored.verdict
@@ -473,15 +812,19 @@ def scan_path(
     *,
     heuristics: bool = True,
     exclusions: Exclusions | None = None,
+    self_exclusions: SelfExclusions | None = None,
 ) -> ScanReport:
     """Scan a file or directory tree and return a full report."""
     root_path = Path(root)
     stats = ScanStats()
     report = ScanReport(root=root_path, stats=stats)
+    if self_exclusions is None:
+        self_exclusions = default_self_exclusions()
 
     for path in iter_files(root_path, stats):
         scanned = scan_file(path, db, rules, heuristics=heuristics,
-                            exclusions=exclusions)
+                            exclusions=exclusions,
+                            self_exclusions=self_exclusions)
         batch = [scanned]
         if scanned.result.ok and not scanned.excluded:
             # Named NTFS data streams ride along as virtual files.
@@ -489,6 +832,7 @@ def scan_path(
                 scan_named_streams(
                     path, db, rules,
                     heuristics=heuristics, exclusions=exclusions,
+                    self_exclusions=self_exclusions,
                 )
             )
         for item in batch:
