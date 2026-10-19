@@ -98,14 +98,24 @@ def test_cli_scan_bootstraps_default_db(tmp_path, monkeypatch):
 def test_init_db_reinit_keeps_count_truthful(tmp_path):
     db_path = tmp_path / "sigs.sigdb"
     init_db(db_path, seed=True)
-    assert SignatureDB.open(db_path).info.count >= 1
+    with SignatureDB.open(db_path) as db:
+        assert db.info.count >= 1
+    # The handle MUST be closed before re-init (as above): init_db
+    # publishes via os.replace, and Windows refuses to replace a
+    # file that is still open anywhere — WinError 5. The previous
+    # version of this test left the open() temporary unclosed;
+    # pytest's assertion rewriting keeps it alive in a frame local
+    # for the whole test, so the replace failed on Windows CI while
+    # Linux (which happily replaces open files) never noticed. Real
+    # callers (CLI sigdb init, the devtools self-test) never hold a
+    # database open across init_db either.
     # Re-init unseeded ("create a new database" contract): the old
     # rows must be gone AND the stored count must say so — the old
     # bug left the seeded count in meta with an empty table, and
     # open() then refused the DB as corrupt.
     init_db(db_path, seed=False)
-    info = SignatureDB.open(db_path).info
-    assert info.count == 0
+    with SignatureDB.open(db_path) as db:
+        assert db.info.count == 0
 
 
 def test_signature_db_path_with_uri_characters(tmp_path):
