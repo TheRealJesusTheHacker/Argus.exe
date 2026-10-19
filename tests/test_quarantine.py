@@ -202,10 +202,33 @@ def test_stale_temp_files_swept_on_open(tmp_path):
     vault = Vault.open(tmp_path / "vault")
     stale = vault.blobs_dir / "orphan.encrypt.tmp"
     stale.write_bytes(b"leftover")
+    # Only STALE temps (older than an hour) are swept: an
+    # interrupted quarantine from long ago, not a transfer still in
+    # flight in another Argus process.
+    import time
+
+    old = time.time() - 2 * 3600
+    os.utime(stale, (old, old))
     vault.close()
 
     reopened = Vault.open(tmp_path / "vault")
     try:
         assert not stale.exists()
+    finally:
+        reopened.close()
+
+
+def test_fresh_temp_files_survive_open(tmp_path):
+    # Regression (fix #10): a temp written moments ago may belong to
+    # a quarantine still running in another process — opening the
+    # vault must not delete it from under that process.
+    vault = Vault.open(tmp_path / "vault")
+    fresh = vault.blobs_dir / "inflight.encrypt.tmp"
+    fresh.write_bytes(b"still being written")
+    vault.close()
+
+    reopened = Vault.open(tmp_path / "vault")
+    try:
+        assert fresh.exists()
     finally:
         reopened.close()
