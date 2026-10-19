@@ -205,7 +205,14 @@ def test_oversize_file_skips_rules_but_not_hash(tmp_path, db, monkeypatch):
     payload = tmp_path / "big.bin"
     payload.write_bytes(b"DownloadString " + b"A" * 100)
     report = scan_path(tmp_path, db, BUILTIN_RULES)
-    scanned = report.files[0]
+    # Pick the payload by path, never by position: the db fixture's
+    # own files (sigs.sigdb + its key file) live in this same
+    # directory, and directory enumeration order is filesystem-
+    # dependent — on the Linux CI filesystem they enumerate ahead
+    # of big.bin, which made files[0] the signature DB and this
+    # test compare the DB's hash instead of the payload's (v1.2.0
+    # build). The assertions below are about big.bin's result.
+    scanned = next(f for f in report.files if f.result.path == payload)
     assert scanned.result.ok
     assert scanned.result.sha256 == hashlib.sha256(payload.read_bytes()).hexdigest()
     assert scanned.rules_skipped_reason is not None
