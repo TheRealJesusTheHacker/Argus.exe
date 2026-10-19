@@ -46,6 +46,12 @@ class StringIndex:
 
     strings: list[str] = field(default_factory=list)
     truncated: bool = False
+    #: High-value needles found by the analyzer's independent
+    #: streaming needle search — which keeps running even after the
+    #: extraction cap truncates the string list, so flooding a file
+    #: with junk strings cannot push the interesting ones out of
+    #: view.
+    needle_hits: set[str] = field(default_factory=set)
 
     _lower_set: set[str] = field(default_factory=set, repr=False)
     _blob: str = field(default="", repr=False)
@@ -62,8 +68,10 @@ class StringIndex:
         return needle.lower() in self._lower_set
 
     def contains(self, needle: str) -> bool:
-        """True if *needle* appears anywhere in the extracted text."""
-        return needle.lower() in self._blob
+        """True if *needle* appears anywhere in the extracted text
+        — including via the cap-independent needle search."""
+        lowered = needle.lower()
+        return lowered in self._blob or lowered in self.needle_hits
 
 
 # ----------------------------------------------------------------------
@@ -330,6 +338,77 @@ def pe_signals(
         )
 
     # ---- structure ----------------------------------------------------
+    if pe.cert_malformed:
+        signals.append(
+            Signal(
+                name="malformed_certificate",
+                severity="high",
+                points=25,
+                explanation=(
+                    "The file CLAIMS an Authenticode signature, but the "
+                    "certificate region is structurally invalid — wrong "
+                    "type, impossible lengths, or running past the end "
+                    "of the file. It is not a real signature: it earns "
+                    "no trust, and the bytes are counted as unexplained "
+                    "overlay data. Forged signature blocks are a known "
+                    "way to make malware look signed."
+                ),
+            )
+        )
+
+    if pe.imports_truncated:
+        signals.append(
+            Signal(
+                name="imports_truncated",
+                severity="medium",
+                points=10,
+                explanation=(
+                    "The import table was so large that Argus stopped "
+                    "reading it at a safety cap before its natural end. "
+                    "Honest programs have modest import tables; a "
+                    "bloated or looping one is a way to exhaust or "
+                    "blind analyzers."
+                ),
+            )
+        )
+
+    all_funcs = [fn for names in pe.imports.values() for fn in names]
+    if len(all_funcs) >= 8:
+        ordinals = sum(1 for fn in all_funcs if fn.startswith("#"))
+        if ordinals / len(all_funcs) >= 0.5:
+            signals.append(
+                Signal(
+                    name="ordinal_heavy_imports",
+                    severity="medium",
+                    points=15,
+                    explanation=(
+                        f"{ordinals} of {len(all_funcs)} imported "
+                        "functions are referenced by number (ordinal) "
+                        "instead of by name. Importing by ordinal hides "
+                        "what a program actually calls — a deliberate "
+                        "concealment technique, rare in honest software "
+                        "at this ratio."
+                    ),
+                )
+            )
+
+    if strings.truncated:
+        signals.append(
+            Signal(
+                name="string_extraction_truncated",
+                severity="low",
+                points=10,
+                explanation=(
+                    "The file contains more embedded text strings than "
+                    "Argus extracts, so string analysis hit its cap. "
+                    "Flooding a file with junk strings is a known way "
+                    "to push the interesting ones out of an analyzer's "
+                    "view. (Argus's high-value needle search keeps "
+                    "running independently of the cap.)"
+                ),
+            )
+        )
+
     for sec in pe.sections:
         if sec.is_executable and sec.entropy is not None and sec.entropy >= HIGH_ENTROPY_THRESHOLD:
             signals.append(
@@ -348,10 +427,93 @@ def pe_signals(
             )
             break
 
+    # ---- entropy geography ------------------------------------------
+    # A section's AVERAGE entropy can look tame while one region
+    # inside it is packed solid — and high-entropy data can hide
+    # entirely outside every section (overlay / inter-section gaps),
+    # where per-section analysis never looks. Judge the map, not
+    # just the averages.
+    section_ranges = [
+        (s.raw_offset, s.raw_offset + s.raw_size) for s in pe.sections if s.raw_size
+    ]
+
+    def _uncovered_length(region) -> int:
+        # The part of the region no section accounts for. A region
+        # that merely TOUCHES a section is not "covered" — a window
+        # straddling the section boundary holds most of its bytes
+        # outside, and those outside bytes are the hiding place
+        # this signal exists for. (Section raw ranges are disjoint,
+        # so per-range overlaps can simply be summed.)
+        start, end = region.offset, region.offset + region.length
+        covered = 0
+        for r_start, r_end in section_ranges:
+            lo, hi = max(start, r_start), min(end, r_end)
+            if hi > lo:
+                covered += hi - lo
+        return (end - start) - covered
+
+    uncovered_bytes = sum(
+        _uncovered_length(region) for region in entropy.high_regions
+    )
+    if uncovered_bytes >= 4096:
+        signals.append(
+            Signal(
+                name="high_entropy_outside_sections",
+                severity="medium",
+                points=15,
+                explanation=(
+                    f"{uncovered_bytes:,} bytes of high-entropy "
+                    "(packed/encrypted-looking) data sit OUTSIDE every "
+                    "declared section — in the overlay or the gaps "
+                    "between sections, where the program structure "
+                    "does not account for them. Payloads are hidden "
+                    "there precisely because section-based checks "
+                    "never look."
+                ),
+            )
+        )
+
+    for sec in pe.sections:
+        if not sec.is_executable or sec.raw_size == 0:
+            continue
+        if sec.entropy is not None and sec.entropy >= HIGH_ENTROPY_THRESHOLD:
+            continue  # the average already told the story above
+        sec_start, sec_end = sec.raw_offset, sec.raw_offset + sec.raw_size
+        peak = max(
+            (region.entropy for region in entropy.high_regions
+             if region.offset < sec_end and sec_start < region.offset + region.length),
+            default=None,
+        )
+        if peak is not None:
+            signals.append(
+                Signal(
+                    name="high_entropy_window_in_section",
+                    severity="medium",
+                    points=15,
+                    explanation=(
+                        f"Section '{sec.name}' looks ordinary on "
+                        f"average, but contains a window measuring "
+                        f"{peak:.1f} bits of entropy — a packed or "
+                        "encrypted pocket hidden inside otherwise "
+                        "normal-looking code."
+                    ),
+                )
+            )
+            break
+
     if pe.entry_section is not None:
         idx = pe.entry_section_index or 0
         entry = pe.entry_section
-        if idx != 0 or entry.name.strip().lower() not in _STANDARD_ENTRY_SECTIONS:
+        # Layout, not just names: an entry point in a section with
+        # no bytes in the file starts in zero-filled memory the
+        # program must fill for itself — a hollowing/packing trait
+        # whatever the section is called.
+        entry_in_vapor = entry.raw_size == 0 and entry.virtual_size > 0
+        if (
+            idx != 0
+            or entry.name.strip().lower() not in _STANDARD_ENTRY_SECTIONS
+            or entry_in_vapor
+        ):
             signals.append(
                 Signal(
                     name="entry_point_unusual",
@@ -362,9 +524,28 @@ def pe_signals(
                         f"(section {idx + 1} of {len(pe.sections)}), not in a "
                         "standard first code section. Packers and modified "
                         "binaries commonly move the starting point like this."
+                        + (
+                            " The section has no bytes in the file at all — "
+                            "the starting code must be produced at runtime."
+                            if entry_in_vapor else ""
+                        )
                     ),
                 )
             )
+    elif pe.entry_point_rva != 0:
+        signals.append(
+            Signal(
+                name="entry_point_outside_sections",
+                severity="medium",
+                points=15,
+                explanation=(
+                    "The program's starting address does not fall inside "
+                    "any declared section. Honest executables always "
+                    "start inside a code section; a start in unaccounted "
+                    "space is a malformed or tampered structure."
+                ),
+            )
+        )
 
     packer_names = [s.name for s in pe.sections if s.name.strip().lower() in _PACKER_SECTION_NAMES]
     if packer_names:
@@ -399,14 +580,17 @@ def pe_signals(
         )
 
     for sec in pe.sections:
-        if sec.name.strip().lower() in (".text", ".code") and sec.raw_size == 0 and sec.virtual_size > 0:
+        # Name-independent: ANY executable section that exists only
+        # in memory (zero bytes in the file) must produce its code
+        # at runtime — whatever the section calls itself.
+        if sec.is_executable and sec.raw_size == 0 and sec.virtual_size > 0:
             signals.append(
                 Signal(
                     name="zero_raw_code_section",
                     severity="medium",
                     points=15,
                     explanation=(
-                        f"Code section '{sec.name}' claims {sec.virtual_size:,} "
+                        f"Executable section '{sec.name}' claims {sec.virtual_size:,} "
                         "bytes in memory but occupies zero bytes in the file. "
                         "The real code must appear from somewhere at runtime — "
                         "a hallmark of packed or hollowed executables."
@@ -506,9 +690,63 @@ _LONG_LINE_THRESHOLD = 2000
 
 
 def script_signals(text: str, filename: str) -> list[Signal]:
-    """Signals from script content (.ps1/.bat/.vbs/.js/...)."""
+    """Signals from script content (.ps1/.bat/.vbs/.js/...).
+
+    *text* is the DECODED script (UTF-16 included — see
+    :func:`argus.heuristics.analyze._decode_script`), so these
+    checks see exactly what the interpreter will see, however the
+    bytes were stored.
+    """
     signals: list[Signal] = []
     lower = text.lower()
+
+    # ---- download cradles -------------------------------------------
+    # The pattern that defines fileless malware delivery: fetch
+    # code from the network and execute it in memory. Graded by
+    # completeness — a download API alone is common in honest
+    # scripts; download + execute + a remote address is the whole
+    # weapon.
+    has_download = (
+        "downloadstring" in lower
+        or "downloadfile" in lower
+        or "net.webclient" in lower
+    )
+    has_invoke = "invoke-expression" in lower or bool(
+        re.search(r"\biex\b", lower)
+    )
+    has_url = "http://" in lower or "https://" in lower
+    if has_download and has_invoke:
+        signals.append(
+            Signal(
+                name="powershell_download_cradle",
+                severity="critical",
+                points=50,
+                explanation=(
+                    "This script downloads code from the network and "
+                    "executes it in memory (a 'download cradle': "
+                    "WebClient DownloadString/DownloadFile combined "
+                    "with Invoke-Expression). Whatever it fetches "
+                    "never exists as a file for a scanner to check — "
+                    "the defining delivery technique of fileless "
+                    "malware."
+                ),
+            )
+        )
+    if has_download and has_url:
+        signals.append(
+            Signal(
+                name="script_fetches_remote_content",
+                severity="medium",
+                points=15,
+                explanation=(
+                    "The script fetches content from a web address "
+                    "(a download API together with an http(s) URL). "
+                    "Honest scripts do this too — but combined with "
+                    "execution it is a download cradle, and the "
+                    "address deserves a hard look."
+                ),
+            )
+        )
 
     if _ENCODED_CMD_RE.search(text) or "frombase64string" in lower:
         signals.append(
