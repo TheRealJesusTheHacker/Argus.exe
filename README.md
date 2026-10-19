@@ -30,7 +30,7 @@ Argus is Sentinel Safeguard LLC's antivirus and malware detector for Windows. It
 3. **Honest.** Argus says what it found, why it flagged it, and what it did — no scareware tactics, no fake "threats detected" upsells. Ever.
 4. **User in control.** Quarantine-first. Nothing is deleted behind your back.
 
-## Build plan
+## Development phases
 
 | Phase | Scope |
 |-------|-------|
@@ -41,6 +41,8 @@ Argus is Sentinel Safeguard LLC's antivirus and malware detector for Windows. It
 | **Phase 5 — Product** | Premium GUI (Sentinel green/black) with a Dev Toolkit panel, background service with system tray, Windows Security Center registration as the system's antivirus, signature auto-updates. Since v1.1.0 the installer is Argus itself: one self-installing `Argus.exe`, no separate installer (the earlier installer is retired). Argus installs and becomes the machine's default security app — not a portable scanner. |
 
 ## Status
+
+**Current version: 1.1.1** (see `argus/__init__.py` and `pyproject.toml`), released on GitHub. The defining change of the current line arrived in v1.1.0:
 
 **v1.1.0 — one file that installs itself.** Argus is now a single `Argus.exe`: the app, the protection service, and the setup engine in one file. Download it, open it, choose **Set up protection**, allow the one Windows permission prompt — Argus places itself in `Program Files\Sentinel Safeguard\Argus`, sets up the always-on `ArgusProtection` service, registers with Windows Security, starts protection, and *verifies each of those steps before it calls itself done*. No installer wizard, no separate service download, no command line, nothing to configure to be protected. Uninstalling is just as plain — from the Argus window or Windows Settings — and **keeps your quarantine vault and history** unless you explicitly ask to remove them. This release exists because the v1.0.5 installer's hidden service step silently failed on a real machine (the service was never installed, and the old GUI then dead-ended against the locked vault); v1.1.0 removes that entire class of failure — every setup step is performed by Argus itself, checked, and reported in plain language. Underneath: machine data under `C:\ProgramData\Argus` with the v1.0.4 trust split (the service never trusts user-writable state; the signature database carries an HMAC authenticity tag), so the service and the app always see the same vault and history. The portable edition is the *same* exe in portable mode (ArgusPortable.zip — unzip and run; it never installs, protection runs while the app is open). This build also teaches Argus to recognise **itself** and **Windows**: it never scans its own program or data (by proven identity, never by name — an impostor `Argus.exe` is scanned like any stranger, and a replaced program file is reported as tampering), and it recognises genuine Microsoft-signed system files in their system home, clearing their behaviour suspicion while leaving signature and rule detections fully in force.
 
@@ -63,9 +65,27 @@ python -m argus service install   # (Windows, admin) install the service
 
 The engine core is pure Python standard library; PySide6 and pywin32 are optional layers used only by the GUI and the Windows service/registration modules.
 
+## Usage
+
+- **GUI:** open `Argus.exe` (installed or portable) — Dashboard, Scan, Quarantine, Pending Actions, History, and Settings are all in the main window.
+- **CLI:** `python -m argus scan <path>` scans a file or folder; `python -m argus watch` runs real-time protection in the foreground; `python -m argus sigdb init` builds a signature database.
+- **Service (Windows, admin):** `python -m argus service install` installs the `ArgusProtection` service from source; the packaged `Argus.exe` sets the same service up itself during "Set up protection".
+
+## How it works
+
+- **Detection layers, in order:** signature matching against the signature database (SHA-256 hashes plus pattern rules), then heuristic analysis — entropy analysis, PE structure inspection, and weighted behaviour signals — combined by the risk-scoring model into a verdict (clean / suspicious / malicious) where every point traces back to a named signal. Every detection also carries a severity (Critical / High / Medium / Low) that drives the action offered.
+- **Real-time watch:** a filesystem watcher with write-debounce plus a process monitor that scans a program as it starts. Pre-execution blocking and kernel tamper protection are not claimed — they need Microsoft's driver signing programs and are listed as future work in the Status section above.
+- **Quarantine & actions:** detected threats go to the encrypted quarantine vault under `C:\ProgramData\Argus`; actions (quarantine / delete / allow) are always user-confirmed, and deletion is never automatic. Reports explain each detection in plain language, with full scan history and an audit trail.
+- **Trust boundaries:** the service never trusts user-writable state, and the signature database carries an HMAC authenticity tag. Argus's self-recognition and Windows system-file recognition work as described under "What it does" — by proven identity, never by name or path alone.
+- **Layout:** the detection engine, heuristics, quarantine, real-time watch, service, and reporting live in `argus/`; the PySide6 GUI in `argus/gui/`; packaging (PyInstaller spec, portable launcher) in `packaging/`; the test suite in `tests/`; and the full phase-by-phase plan in `docs/ROADMAP.md`.
+
 ## The family
 
-Argus is a Sentinel Safeguard product, alongside **Hellhound.exe** (malware education — see what real malware does, safely announced) and **J.A.D.E.** (local AI assistant). Argus is the shield to Hellhound's lesson: one shows you the threat, the other stops it.
+Argus is a Sentinel Safeguard product, alongside **Hellhound.exe** (malware education — see what real malware does, safely announced) and **Cyra** (local AI assistant, formerly J.A.D.E.). Argus is the shield to Hellhound's lesson: one shows you the threat, the other stops it.
+
+## License
+
+Argus is proprietary software of Sentinel Safeguard LLC — see [LICENSE](LICENSE). All rights reserved; no copying, redistribution, resale, or derivative works without prior written permission from Sentinel Safeguard LLC.
 
 ---
 
