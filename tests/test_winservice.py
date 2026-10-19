@@ -85,6 +85,11 @@ def test_require_windows_message_is_plain_language():
 # ----------------------------------------------------------------------
 def test_status_command_reads_heartbeat(tmp_path, capsys, monkeypatch):
     status_file = tmp_path / "argus-status.json"
+    # The status command now applies the freshness gate (P2): a
+    # "running" claim needs a FRESH heartbeat when the SCM cannot
+    # be asked — real services always write heartbeat_at.
+    from datetime import datetime, timezone
+
     status_file.write_text(
         json.dumps(
             {
@@ -92,6 +97,7 @@ def test_status_command_reads_heartbeat(tmp_path, capsys, monkeypatch):
                 "running": True,
                 "version": "1.0.0",
                 "started_at": "2026-01-01T00:00:00+00:00",
+                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
                 "scans_completed": 42,
                 "detections": 3,
             }
@@ -137,10 +143,144 @@ def test_perform_delegates_with_mapped_command(monkeypatch):
     _, argv = calls[0]
     assert argv[-1] == "remove"  # uninstall maps to pywin32's "remove"
 
-    calls.clear()
-    perform_service_command("run", handler=fake_handler)
-    _, argv = calls[0]
-    assert len(argv) == 1  # SCM launch: bare argv, no command word
+
+@pytest.mark.parametrize("command,word", [("start", "start"), ("stop", "stop")])
+def test_start_stop_argv_carry_no_stray_args(monkeypatch, command, word):
+    """start/stop reach the handler as exactly [exe, word] — no
+    extra arguments pywin32's parser could trip over."""
+    calls = []
+
+    def fake_handler(service_class, *, argv):
+        calls.append(argv)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(winservice.sys, "platform", "win32")
+    monkeypatch.setattr(winservice, "HAS_PYWIN32", True)
+    monkeypatch.setattr(
+        winservice, "ArgusWindowsService", type("FakeSvc", (), {})
+    )
+    assert perform_service_command(command, handler=fake_handler) == 0
+    (argv,) = calls
+    assert argv[1:] == [word]
+
+
+def test_install_argv_options_before_command_word(monkeypatch):
+    """REGRESSION (v1.0.5 silent no-install): pywin32's
+    HandleCommandLine parses with POSIX getopt, which stops at the
+    first non-option. The install argv was [exe, "install",
+    "--startup", "auto"] — the options were never parsed, the
+    arity check failed, usage printed, NOTHING was installed.
+    The options must come BEFORE the command word."""
+    calls = []
+
+    def fake_handler(service_class, *, argv):
+        calls.append(argv)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(winservice.sys, "platform", "win32")
+    monkeypatch.setattr(winservice, "HAS_PYWIN32", True)
+    monkeypatch.setattr(
+        winservice, "ArgusWindowsService", type("FakeSvc", (), {})
+    )
+    assert perform_service_command("install", handler=fake_handler) == 0
+    (argv,) = calls
+    assert argv[1:] == ["--startup", "auto", "install"]
+
+
+def test_run_uses_servicemanager_dispatcher_never_handler(monkeypatch):
+    """REGRESSION (v1.0.5 service could never start): the SCM
+    launch was routed to HandleCommandLine as "run" — a command
+    pywin32 does not have, in a handler that contains no
+    StartServiceCtrlDispatcher call. Hosting must go through the
+    servicemanager dispatcher seam, and the command handler must
+    not be touched at all."""
+    def bomb_handler(service_class, *, argv):  # pragma: no cover
+        raise AssertionError("HandleCommandLine must not host the service")
+
+    hosted = []
+
+    def fake_dispatcher():
+        hosted.append(True)
+        return 0
+
+    monkeypatch.setattr(winservice.sys, "platform", "win32")
+    code = perform_service_command(
+        "run", handler=bomb_handler, dispatcher=fake_dispatcher
+    )
+    assert code == 0
+    assert hosted == [True]
+
+
+def test_run_service_dispatcher_calls_servicemanager_in_order(monkeypatch):
+    """The hosting sequence itself: Initialize →
+    PrepareToHostSingle(cls) → StartServiceCtrlDispatcher."""
+    import types
+
+    calls = []
+    fake_sm = types.ModuleType("servicemanager")
+    fake_sm.Initialize = lambda: calls.append("Initialize")
+    fake_sm.PrepareToHostSingle = lambda cls: calls.append(
+        ("PrepareToHostSingle", cls)
+    )
+    fake_sm.StartServiceCtrlDispatcher = lambda: calls.append(
+        "StartServiceCtrlDispatcher"
+    )
+    monkeypatch.setitem(sys.modules, "servicemanager", fake_sm)
+    monkeypatch.setattr(winservice.sys, "platform", "win32")
+    monkeypatch.setattr(winservice, "HAS_PYWIN32", True)
+    sentinel_class = type("FakeSvc", (), {})
+    monkeypatch.setattr(winservice, "ArgusWindowsService", sentinel_class)
+
+    assert winservice.run_service_dispatcher() == 0
+    assert calls == [
+        "Initialize",
+        ("PrepareToHostSingle", sentinel_class),
+        "StartServiceCtrlDispatcher",
+    ]
+
+
+def test_service_image_path_carries_service_marker():
+    """The registered ImagePath must launch the one exe WITH the
+    --service marker, or Windows would open the GUI at boot
+    instead of hosting protection."""
+    image = winservice.service_image_path(
+        r"C:\Program Files\Sentinel Safeguard\Argus\Argus.exe"
+    )
+    assert image == (
+        r'"C:\Program Files\Sentinel Safeguard\Argus\Argus.exe" --service'
+    )
+    assert winservice.SERVICE_EXE_ARGS == "--service"
+
+
+def test_detailed_state_distinguishes_not_installed(monkeypatch):
+    """Error 1060 from the SCM means NOT INSTALLED — setup's
+    difference between "set up" and "turn on". Other failures and
+    other platforms stay honestly "unknown"."""
+    class FakeScmError(Exception):
+        def __init__(self, winerror):
+            super().__init__("scm error")
+            self.winerror = winerror
+
+    monkeypatch.setattr(winservice.sys, "platform", "win32")
+
+    def missing(name):
+        raise FakeScmError(1060)
+
+    monkeypatch.setattr(winservice, "_query_service_status", missing)
+    assert winservice.query_service_state_detailed() == "not-installed"
+
+    def other_failure(name):
+        raise FakeScmError(5)
+
+    monkeypatch.setattr(winservice, "_query_service_status", other_failure)
+    assert winservice.query_service_state_detailed() == "unknown"
+
+    def running(name):
+        return (0, 4, 0, 0, 0, 0, 0)  # dwCurrentState = SERVICE_RUNNING
+
+    monkeypatch.setattr(winservice, "_query_service_status", running)
+    assert winservice.query_service_state_detailed() == "running"
+    assert winservice.query_service_state() == "running"
 
 
 def test_register_command_uses_service_paths(monkeypatch, capsys):
@@ -159,7 +299,7 @@ def test_register_command_uses_service_paths(monkeypatch, capsys):
     monkeypatch.setattr(
         winservice, "service_exe_path",
         lambda: PureWindowsPath(
-            r"C:\Program Files\Sentinel Safeguard\Argus\ArgusService.exe"
+            r"C:\Program Files\Sentinel Safeguard\Argus\Argus.exe"
         ),
     )
     # The register command verifies the product exe exists (fix
@@ -173,7 +313,8 @@ def test_register_command_uses_service_paths(monkeypatch, capsys):
     )
     code = perform_service_command("register")
     assert code == 0
-    assert seen["pathToSignedReportingExe"].endswith("ArgusService.exe")
+    # One executable (v1.1.0): product and reporter are the same file.
+    assert seen["pathToSignedReportingExe"].endswith("Argus.exe")
     assert seen["pathToSignedProductExe"].endswith("Argus.exe")
     assert seen["instanceGuid"] == winregister.INSTANCE_GUID
     assert "Security Center" in capsys.readouterr().out
@@ -195,7 +336,7 @@ def test_register_command_refuses_missing_product_exe(monkeypatch, capsys):
     monkeypatch.setattr(
         winservice, "service_exe_path",
         lambda: PureWindowsPath(
-            r"C:\Program Files\Sentinel Safeguard\Argus\ArgusService.exe"
+            r"C:\Program Files\Sentinel Safeguard\Argus\Argus.exe"
         ),
     )
     monkeypatch.setattr(Path, "exists", lambda self: False)
