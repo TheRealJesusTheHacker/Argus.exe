@@ -1,11 +1,22 @@
 name: build-windows
 
 # Builds the Windows product when a release is published:
+#   * checks the release tag against argus.__version__ (a vX.Y.Z
+#     tag that disagrees with the code never ships)
 #   * runs the full test suite (GUI tests run offscreen)
-#   * builds Argus.exe (GUI) and ArgusService.exe (service host)
-#     with PyInstaller
-#   * builds ArgusSetup.exe with Inno Setup
-#   * attaches the installer and both portable exes to the release
+#   * builds THE Argus.exe with PyInstaller — one file containing
+#     the GUI, the protection service host, and the self-install
+#     engine (v1.1.0+; there is no separate service exe and no
+#     installer anymore — Argus.exe installs itself)
+#   * smoke-tests the built exe with --self-check (imports every
+#     lazy module) and --self-check-qt (creates the QApplication
+#     offscreen and builds the real main window — importing Qt is
+#     not proof its platform plugin shipped), and greps the
+#     PyInstaller warn file for the lazy-import watchlist — a build
+#     that silently dropped the service stack or Qt fails HERE,
+#     not on a user's machine
+#   * assembles the portable edition (the same exe + launcher)
+#   * attaches Argus.exe, ArgusPortable.zip and SHA256SUMS.txt
 on:
   release:
     types: [published]
@@ -31,6 +42,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Check the release tag matches the code version
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $code = python -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('argus/__init__.py').read()).group(1))"
+          if ("v$code" -ne $tag) {
+            Write-Host "Release tag '$tag' does not match argus.__version__ '$code' (expected tag 'v$code')."
+            exit 1
+          }
+          Write-Host "Release tag $tag matches argus.__version__ $code."
+
       - name: Install dependencies
         run: |
           pip install -r packaging/requirements-ci.txt
@@ -41,30 +62,61 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q
 
-      - name: Build Argus.exe (GUI)
+      - name: Build Argus.exe (the whole product, one file)
         run: pyinstaller packaging/Argus.spec --noconfirm
 
-      - name: Build ArgusService.exe (service host)
-        run: pyinstaller packaging/ArgusService.spec --noconfirm
+      - name: Check the build for missing lazy imports (warn file)
+        run: |
+          $warn = "build\Argus\warn-Argus.txt"
+          if (-not (Test-Path $warn)) {
+            Write-Host "PyInstaller warn file not found at $warn — cannot verify the lazy-import watchlist."
+            exit 1
+          }
+          $watchlist = "win32service", "win32serviceutil", "servicemanager", "pywintypes", "pythoncom", "PySide6"
+          $hits = Select-String -Path $warn -Pattern ($watchlist -join "|")
+          if ($hits) {
+            Write-Host "PyInstaller could not find modules on the lazy-import watchlist:"
+            $hits | ForEach-Object { Write-Host $_.Line }
+            exit 1
+          }
+          Write-Host "No watchlist modules missing from the build."
 
-      - name: Install Inno Setup
-        run: choco install innosetup --yes --no-progress
+      - name: Smoke-test the built exe (--self-check)
+        run: |
+          $proc = Start-Process -FilePath "dist\Argus.exe" -ArgumentList "--self-check" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Write-Host "Argus.exe --self-check failed with exit code $($proc.ExitCode)."
+            exit 1
+          }
+          Write-Host "Argus.exe --self-check passed."
 
-      - name: Build the installer
-        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\argus.iss'
+      # Importing PySide6 is not proof the GUI can start: the Qt
+      # platform plugin loads only when a QApplication is created.
+      # --self-check-qt creates the application (offscreen), applies
+      # the theme and builds the real main window, then closes it —
+      # a build whose interface would die on launch fails here.
+      - name: Smoke-test the built exe's GUI stack (--self-check-qt, offscreen)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $proc = Start-Process -FilePath "dist\Argus.exe" -ArgumentList "--self-check-qt" -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Write-Host "Argus.exe --self-check-qt failed with exit code $($proc.ExitCode)."
+            exit 1
+          }
+          Write-Host "Argus.exe --self-check-qt passed."
 
       - name: Assemble the portable edition
         run: |
           New-Item -ItemType Directory -Force dist\ArgusPortable | Out-Null
           Copy-Item dist\Argus.exe dist\ArgusPortable\
-          Copy-Item dist\ArgusService.exe dist\ArgusPortable\
           Copy-Item packaging\portable\Argus-Portable.bat dist\ArgusPortable\
           Copy-Item packaging\portable\README-PORTABLE.txt dist\ArgusPortable\
           Compress-Archive -Path dist\ArgusPortable\* -DestinationPath dist\ArgusPortable.zip -Force
 
       - name: Generate SHA256SUMS.txt for the release assets
         run: |
-          $assets = "dist/ArgusSetup.exe", "dist/ArgusPortable.zip", "dist/Argus.exe", "dist/ArgusService.exe"
+          $assets = "dist/Argus.exe", "dist/ArgusPortable.zip"
           $lines = foreach ($asset in $assets) {
             $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
             "$hash  $(Split-Path $asset -Leaf)"
@@ -72,7 +124,7 @@ jobs:
           $lines | Out-File -Encoding ascii dist/SHA256SUMS.txt
           Get-Content dist/SHA256SUMS.txt
 
-      - name: Attach the installer, portable edition, exes and checksums to the release
+      - name: Attach the exe, portable edition and checksums to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.ref_name }} dist/ArgusSetup.exe dist/ArgusPortable.zip dist/Argus.exe dist/ArgusService.exe dist/SHA256SUMS.txt --clobber
+        run: gh release upload ${{ github.ref_name }} dist/Argus.exe dist/ArgusPortable.zip dist/SHA256SUMS.txt --clobber
