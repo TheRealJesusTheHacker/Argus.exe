@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
@@ -32,9 +33,15 @@ from ..reporting import History
 from ..rules import BUILTIN_RULES
 from ..scanner import ScannedFile, iter_files, scan_file
 from ..service import ArgusService
-from ..signatures import SignatureDB
+from ..signatures import SignatureDB, ensure_signature_db
 
 log = logging.getLogger("argus.gui")
+
+#: A heartbeat from an external Argus service counts as "live" for
+#: this long. The service heartbeats every few seconds, so anything
+#: older means the writer is gone (crashed/killed), not managing
+#: protection right now.
+SERVICE_HEARTBEAT_FRESH_SECONDS = 45.0
 
 
 class GuiBackend:
@@ -50,6 +57,11 @@ class GuiBackend:
             else base / DEFAULT_CONFIG_NAME
         )
         self.config = ArgusConfig.load(self.config_path)
+        # First-run bootstrap: a fresh install has no signature
+        # database yet — create + seed it so the first scan (and
+        # protection start) works instead of failing on a missing
+        # file. An existing database is never touched here.
+        ensure_signature_db(self.config.signature_db)
         self.devtools_path = (
             Path(devtools_path)
             if devtools_path
@@ -100,9 +112,11 @@ class GuiBackend:
         return self._actions
 
     def real_actions(self) -> ActionEngine:
-        """The real action engine even in simulation mode (used by the
-        Quarantine page for vault bookkeeping like restore, where the
-        simulation banner is handled by the page)."""
+        """The real action engine even in simulation mode. Used
+        where the operation is bookkeeping rather than a response
+        to a detection: the Pending Actions queue (approving or
+        rejecting a queued request is itself the human decision,
+        and the queue must reflect reality) and dashboard counts."""
         if self._actions is None:
             self._actions = ActionEngine(
                 self.vault(),
@@ -141,11 +155,15 @@ class GuiBackend:
         return [r for r in roots if r.exists()]
 
     def full_scan_roots(self) -> list[Path]:
-        roots = [Path.home()]
-        anchor = Path(Path.home().anchor) if Path.home().anchor else None
-        if anchor and anchor.exists() and anchor != Path.home():
-            roots.append(anchor)
-        return roots
+        """Everything: the drive/filesystem anchor the home folder
+        lives on. Home is NOT scanned separately — it sits inside
+        the anchor, so scanning both would walk (and count) the
+        user's own files twice."""
+        home = Path.home()
+        anchor = Path(home.anchor) if home.anchor else None
+        if anchor is not None and anchor.exists() and anchor != home:
+            return [anchor]
+        return [home]
 
     def close(self) -> None:
         if self._vault is not None:
@@ -232,6 +250,29 @@ class ProtectionController(QObject):
     @property
     def running(self) -> bool:
         return self._service is not None
+
+    def service_managed(self, status: dict | None) -> bool:
+        """True when *status* describes protection run by an
+        EXTERNAL Argus service (the installed Windows service), not
+        by this process: this controller runs no service of its own,
+        the status says protection is running, and its heartbeat is
+        fresh. A stale heartbeat is a service that died — not
+        something managing protection."""
+        if self._service is not None or not status:
+            return False
+        if not status.get("running"):
+            return False
+        heartbeat = status.get("heartbeat_at")
+        if not heartbeat:
+            return False
+        try:
+            stamp = datetime.fromisoformat(str(heartbeat))
+        except ValueError:
+            return False
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - stamp).total_seconds()
+        return -60.0 <= age <= SERVICE_HEARTBEAT_FRESH_SECONDS
 
     def status(self) -> dict:
         if self._service is not None:
