@@ -114,6 +114,9 @@ class MainWindow(QMainWindow):
         self.protection.status_changed.connect(self.tray.set_protection_state)
         self.protection.detection.connect(self.tray.notify_detection)
         self.protection.detection.connect(lambda _e: self._refresh_pages())
+        # Initial tray state: reflect protection as it is right now,
+        # not just after the first status change arrives.
+        self.tray.set_protection_state(self.protection.status())
 
         self.statusBar().showMessage(
             "Real-time protection runs in this window, or as the "
