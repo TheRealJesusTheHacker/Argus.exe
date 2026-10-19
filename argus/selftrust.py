@@ -86,6 +86,7 @@ SOURCE_SIGNATURE_DB = "Argus's own signature database"
 SOURCE_INSTALL_DIR = "Argus's own program folder"
 SOURCE_RUNNING_EXE = "the Argus program itself"
 SOURCE_SCM_EXE = "the Argus program registered with Windows"
+SOURCE_SYSTEMD_EXE = "the Argus program registered with systemd"
 SOURCE_RECORDED_EXE = "the Argus program (fingerprint recorded at setup)"
 
 
@@ -337,14 +338,24 @@ def default_self_exclusions() -> SelfExclusions:
     data_root = paths.data_dir()
     install_dir: Path | None = None
     own_exe: Path | None = None
-    try:
-        from . import setup_engine
+    if sys.platform.startswith("linux"):
+        # The .deb layout's canonical address is an FHS constant
+        # (argus.paths), the same kind of fact as the Windows
+        # Program Files address — and it gets the same treatment:
+        # the address earns NOTHING by itself; the recorded
+        # fingerprint (or, with no record, the running-process
+        # proof) decides at the address, exactly as on Windows.
+        install_dir = paths.LINUX_INSTALL_DIR
+        own_exe = paths.LINUX_PROGRAM_PATH
+    else:
+        try:
+            from . import setup_engine
 
-        install_dir = setup_engine.canonical_install_dir()
-        own_exe = setup_engine.canonical_exe_path()
-    except Exception:
-        install_dir = None
-        own_exe = None
+            install_dir = setup_engine.canonical_install_dir()
+            own_exe = setup_engine.canonical_exe_path()
+        except Exception:
+            install_dir = None
+            own_exe = None
     key = (
         _norm(data_root),
         _norm(install_dir) if install_dir is not None else "",
@@ -353,6 +364,16 @@ def default_self_exclusions() -> SelfExclusions:
     if cached is not None:
         return cached
     scm_exe = scm_registered_exe()
+    if sys.platform.startswith("linux") and scm_exe is None:
+        # The systemd unit's ExecStart is the SCM ImagePath's
+        # twin: a LOCATOR for the candidate program address,
+        # never an identity proof.
+        try:
+            from . import linuxservice
+
+            scm_exe = linuxservice.systemd_registered_exe()
+        except Exception:
+            scm_exe = None
     if own_exe is None and scm_exe is not None:
         # The SCM entry's one legitimate job: locating the
         # candidate program address when setup's canonical
