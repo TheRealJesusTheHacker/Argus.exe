@@ -9,9 +9,11 @@ Hard rules learned from real-world scanner bugs:
   loaded whole into memory — a multi-GB file costs the same RAM as a
   text file. (Whole-file reads crash on large files; see Hellhound's
   MemoryError bug.)
-- **Symlink-safe.** Directory symlinks are never followed, so a scan can
-  never wander out of the tree it was pointed at or loop forever.
-  Symlinks to files are scanned like regular files.
+- **Symlink-safe.** Directory symlinks inside a tree are never
+  followed, so a scan can never wander out of the tree it was
+  pointed at or loop forever. (A symlink to a directory given *as*
+  the scan root is entered — that is the user pointing Argus there
+  on purpose.) Symlinks to files are scanned like regular files.
 - **Permission-error tolerant.** Anything that cannot be read is skipped,
   counted, and reported — never a crash, never silently swallowed.
 - **Single pass.** Hashing and rule matching share one read of the file.
@@ -142,7 +144,13 @@ def iter_files(root: Path, stats: ScanStats) -> Iterator[Path]:
     files (sockets, devices, broken links) are counted as skipped
     files. Nothing here raises for filesystem problems.
     """
-    if root.is_file() or root.is_symlink():
+    if root.is_symlink() and root.is_dir():
+        # A symlink to a directory AS THE ROOT is the walk's entry
+        # point — the user pointed Argus at it deliberately, so the
+        # walk enters it. The no-follow rule below applies to links
+        # found INSIDE the tree, which are never chased.
+        pass
+    elif root.is_file() or root.is_symlink():
         stats.files_seen += 1
         yield root
         return
