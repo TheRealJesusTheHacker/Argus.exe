@@ -30,11 +30,17 @@ into the vault.
 
 Everything the user-side processes legitimately write lives in the
 **shared** subdirectory (:func:`shared_dir`): the heartbeat status
-file, the scan history, the pending-actions database, the
-service action-request channel (``requests\\`` / ``results\\``), and
-the read-only vault snapshot (``vault-view.json``) the service
-publishes for the GUI. The installer grants users modify rights
-there — and only there.
+file, the scan history, the service action-request channel
+(``requests\\`` / ``results\\``), and the read-only snapshots
+(``vault-view.json`` / ``pending-view.json``) the service publishes
+for the GUI. The installer grants users modify rights there — and
+only there.
+
+The pending-actions database itself is **service-owned** and lives
+in the trusted root (:func:`default_pending_db`): only the service
+may create pending rows (from its own detections), so a user-side
+process cannot forge a queued action. User-side processes read the
+queue through the service-published ``pending-view.json`` snapshot.
 """
 
 from __future__ import annotations
@@ -85,14 +91,29 @@ def default_history_db() -> Path:
 
 
 def default_pending_db() -> Path:
-    """Where the pending-actions database lives by default (shared).
+    """Where the pending-actions database lives by default (TRUSTED).
 
-    Pending rows are written by whichever process noticed a threat
-    and decided by whichever human-facing process the user drives —
-    they are shared state, NOT vault state, so since v1.0.4 they
-    live in their own database here instead of inside vault.db.
+    The pending queue is service-owned: the service creates rows
+    only from its own detections, so the database lives under the
+    trusted vault root where standard users cannot write it. A
+    forged row in a user-writable database could otherwise drive an
+    approval — or an exclusion — for a file nobody flagged.
+    """
+    return default_vault_dir() / "pending.db"
+
+
+def legacy_shared_pending_db() -> Path:
+    """The pre-v1.1.0 shared location of the pending database.
+
+    Kept only so the service can migrate (and re-validate) any rows
+    left there once, then rename the file away.
     """
     return shared_dir() / "pending.db"
+
+
+def pending_view_path() -> Path:
+    """The service-published read-only snapshot of the pending queue."""
+    return shared_dir() / "pending-view.json"
 
 
 def default_status_file() -> Path:
