@@ -169,14 +169,17 @@ def test_failed_reload_keeps_old_engine_running(tmp_path):
         service.stop()
 
 
-def test_start_creates_and_seeds_missing_db(tmp_path):
-    # Regression (P0 fix #1): a fresh install has no signature DB —
-    # start() must create + seed it, not fail. (A database that
-    # EXISTS but is corrupt is a different story: see the next test.)
+def test_start_creates_and_seeds_missing_db_at_default_path(tmp_path, monkeypatch):
+    # Regression (P0 fix #1, narrowed by the v1.0.4 trust-split
+    # audit): a fresh install has no signature DB — start() must
+    # create + seed it at the DEFAULT location. (A missing database
+    # at a *configured* path is a different story: see the next
+    # test, and a database that EXISTS but is corrupt raises too.)
+    monkeypatch.setenv("ARGUS_DATA_DIR", str(tmp_path / "data"))
     config = ArgusConfig(
-        signature_db=str(tmp_path / "brand-new.sigdb"),
         status_file=str(tmp_path / "status.json"),
     )
+    assert config.signature_db == str(tmp_path / "data" / "signatures.sigdb")
     service = ArgusService(config=config)
     service.start()
     try:
@@ -186,6 +189,25 @@ def test_start_creates_and_seeds_missing_db(tmp_path):
         assert Path(config.signature_db).is_file()
     finally:
         service.stop()
+
+
+def test_start_with_missing_db_at_configured_path_raises(tmp_path):
+    # v1.0.4 configured-path respect: bootstrap auto-creates ONLY at
+    # the default path. A configured path whose database was never
+    # built (or was removed) is a loud SignatureError — Argus must
+    # not silently invent an empty database and call it protection.
+    config = ArgusConfig(
+        signature_db=str(tmp_path / "never-built.sigdb"),
+        status_file=str(tmp_path / "status.json"),
+    )
+    service = ArgusService(config=config)
+    import pytest
+    from argus.signatures import SignatureError
+
+    with pytest.raises(SignatureError):
+        service.start()
+    assert service.state == "stopped"
+    assert service.last_error  # the failure was reported, not hidden
 
 
 def test_start_with_corrupt_existing_db_raises(tmp_path):
