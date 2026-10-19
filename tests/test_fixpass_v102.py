@@ -35,12 +35,16 @@ from argus.signatures import (
 def test_signature_and_status_defaults_are_absolute_under_data_dir(
     tmp_path, monkeypatch
 ):
+    # v1.0.4 trust split: the signature DB stays in the trusted data
+    # root; the status heartbeat moved into the shared subdirectory.
     monkeypatch.setenv("ARGUS_DATA_DIR", str(tmp_path / "data"))
     config = ArgusConfig()
-    for value in (config.signature_db, config.status_file):
-        path = Path(value)
-        assert path.is_absolute()
-        assert path.parent == tmp_path / "data"
+    sig_path = Path(config.signature_db)
+    assert sig_path.is_absolute()
+    assert sig_path.parent == tmp_path / "data"
+    status_path = Path(config.status_file)
+    assert status_path.is_absolute()
+    assert status_path.parent == tmp_path / "data" / "shared"
 
 
 def test_data_dir_windows_uses_programdata(tmp_path, monkeypatch):
@@ -409,8 +413,11 @@ def test_duplicate_import_descriptors_are_merged():
                 end = offset + max_len
             return bytes(blob[offset:end]).decode("ascii", "replace")
 
-    imports = _parse_imports(FakeReader(), lambda rva: rva - 0x1000, 0x1000, False)
+    imports, truncated = _parse_imports(
+        FakeReader(), lambda rva: rva - 0x1000, 0x1000, False
+    )
     assert imports == {"KERNEL32.dll": ["CreateFileA", "ExitProcess"]}
+    assert truncated is False
 
 
 # ----------------------------------------------------------------------
