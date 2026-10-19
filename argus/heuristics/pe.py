@@ -15,10 +15,16 @@ Design rules:
   ``PEInfo.warnings``. A malformed file must never take a scan down.
 - **Bounded everything.** Every count read from the file (sections,
   import descriptors, thunks, names) is capped, so a hostile header
-  cannot make the parser loop or allocate without limit.
-- **Presence, not validation, for signatures.** The Authenticode
-  certificate table is reported as present/absent with its size.
-  Cryptographic chain validation is deliberately out of scope here.
+  cannot make the parser loop or allocate without limit. Thunk
+  arrays are read in batches under a combined work cap; hitting a
+  cap is recorded (``imports_truncated``), never silent.
+- **Structural validation for signatures.** The Authenticode
+  certificate table is validated structurally: the WIN_CERTIFICATE
+  chain must be length-consistent, in bounds, and of type
+  0x0002 (PKCS signed data). A region that merely CLAIMS to be a
+  certificate but fails validation is reported as overlay data with
+  ``cert_malformed`` set — it earns no "signed" credit. Full
+  cryptographic digest/chain verification is future work.
 """
 
 from __future__ import annotations
@@ -50,10 +56,19 @@ DIR_TLS = 9
 MAX_SECTIONS = 96
 MAX_IMPORT_DESCRIPTORS = 256
 MAX_IMPORT_FUNCTIONS = 4096
+#: Combined descriptor+thunk entries the import parser will process
+#: across the WHOLE table before declaring it truncated — stops a
+#: header claiming hundreds of fat descriptors from grinding.
+MAX_IMPORT_WORK = 65536
+#: Thunk entries read per batch (one read_at per batch, not per thunk).
+_THUNK_BATCH = 256
 MAX_EXPORT_NAMES = 1024
 MAX_TLS_CALLBACKS = 32
 _MAX_NAME_BYTES = 512
 _MAX_DLL_NAME_BYTES = 256
+
+#: WIN_CERTIFICATE type for PKCS#7 signed data (Authenticode).
+_CERT_TYPE_PKCS_SIGNED_DATA = 0x0002
 
 
 class PEError(Exception):
@@ -114,6 +129,12 @@ class PEInfo:
     tls_callback_count: int | None = None
     signed: bool = False
     cert_size: int = 0
+    #: True when a certificate region was claimed but failed
+    #: structural validation — it is overlay data, NOT a signature.
+    cert_malformed: bool = False
+    #: True when the import table hit a parser cap (per-descriptor
+    #: thunks or the combined work cap) before its natural end.
+    imports_truncated: bool = False
     overlay_offset: int = 0
     overlay_size: int = 0
     warnings: list[str] = field(default_factory=list)
@@ -301,11 +322,25 @@ def _parse(r: _Reader) -> PEInfo:
 
     # ---- certificate table (Authenticode) ------------------------------
     # NOTE: for the certificate directory, the "RVA" field is a file
-    # offset — the one exception in the PE format.
+    # offset — the one exception in the PE format. The region only
+    # counts as a signature if the WIN_CERTIFICATE chain inside it
+    # is structurally sound (length-consistent, in bounds, PKCS
+    # type) — malware can otherwise fake the "signed" trim by
+    # pointing the directory at junk bytes.
     cert_offset, cert_size = directories[DIR_CERTIFICATE]
-    if cert_size >= 8 and 0 < cert_offset < r.size:
-        info.signed = True
-        info.cert_size = cert_size
+    if cert_size >= 8 and 0 < cert_offset:
+        if cert_offset + cert_size <= r.size and _validate_certificate_table(
+            r, cert_offset, cert_size
+        ):
+            info.signed = True
+            info.cert_size = cert_size
+        else:
+            info.cert_malformed = True
+            info.cert_size = cert_size
+            info.warnings.append(
+                "certificate table failed structural validation — the "
+                "claimed signature region is treated as overlay data"
+            )
 
     # ---- overlay --------------------------------------------------------
     data_end = size_of_headers
@@ -323,7 +358,14 @@ def _parse(r: _Reader) -> PEInfo:
     imp_rva, _ = directories[DIR_IMPORT]
     if imp_rva:
         try:
-            info.imports = _parse_imports(r, rva_to_offset, imp_rva, is_64bit)
+            info.imports, info.imports_truncated = _parse_imports(
+                r, rva_to_offset, imp_rva, is_64bit
+            )
+            if info.imports_truncated:
+                info.warnings.append(
+                    "import table hit a parser cap before its natural "
+                    "end — the import list is partial"
+                )
         except PEError as exc:
             info.warnings.append(f"import table could not be parsed: {exc}")
 
@@ -349,7 +391,52 @@ def _parse(r: _Reader) -> PEInfo:
     return info
 
 
-def _parse_imports(r: _Reader, rva_to_offset, imp_rva: int, is_64bit: bool) -> dict[str, list[str]]:
+def _validate_certificate_table(r: _Reader, offset: int, size: int) -> bool:
+    """Structurally validate the WIN_CERTIFICATE chain at
+    ``offset``/``size`` (bounds are checked by the caller).
+
+    Each entry: ``dwLength`` (u32, includes the 8-byte header),
+    ``wRevision`` (u16), ``wCertificateType`` (u16, must be
+    0x0002 for the first entry). Entries are 8-byte aligned; the
+    chain must exactly consume the table (final zero padding of
+    fewer than 8 bytes is tolerated). This is structural sanity —
+    it proves the region is a well-formed certificate table, NOT
+    that the signature is genuine (digest verification is future
+    work).
+    """
+    end = offset + size
+    pos = offset
+    first = True
+    while pos < end:
+        remaining = end - pos
+        if remaining < 8:
+            # Only zero padding may trail the last entry.
+            return not first and r.read_at(pos, remaining) == b"\x00" * remaining
+        try:
+            length = r.u32(pos)
+            cert_type = r.u16(pos + 6)
+        except PEError:
+            return False
+        if first and cert_type != _CERT_TYPE_PKCS_SIGNED_DATA:
+            return False
+        if length < 8 or length > remaining:
+            return False
+        pos += (length + 7) & ~7
+        if pos > end:
+            return False
+        first = False
+    return not first and pos == end
+
+
+def _parse_imports(r: _Reader, rva_to_offset, imp_rva: int, is_64bit: bool) -> tuple[dict[str, list[str]], bool]:
+    """Parse the import table. Returns ``(imports, truncated)`` —
+    ``truncated`` is True when a cap (per-descriptor thunks or the
+    combined work budget) stopped parsing before the table's
+    natural end, instead of grinding through a hostile header.
+
+    Thunk arrays are read in batches (one read per
+    :data:`_THUNK_BATCH` entries) rather than one read per thunk.
+    """
     base = rva_to_offset(imp_rva)
     if base is None:
         raise PEError("import directory RVA does not map to file data")
@@ -358,10 +445,16 @@ def _parse_imports(r: _Reader, rva_to_offset, imp_rva: int, is_64bit: bool) -> d
     unpack_thunk = "<Q" if is_64bit else "<I"
 
     imports: dict[str, list[str]] = {}
+    truncated = False
+    work = 0
     for d in range(MAX_IMPORT_DESCRIPTORS):
         desc = base + d * 20
         fields = struct.unpack("<IIIII", r.read_at(desc, 20))
         if fields == (0, 0, 0, 0, 0):
+            break
+        work += 1
+        if work > MAX_IMPORT_WORK:
+            truncated = True
             break
         original_first_thunk, _stamp, _chain, name_rva, first_thunk = fields
         name_off = rva_to_offset(name_rva)
@@ -373,19 +466,54 @@ def _parse_imports(r: _Reader, rva_to_offset, imp_rva: int, is_64bit: bool) -> d
         thunk_off = rva_to_offset(thunk_rva)
         functions: list[str] = []
         if thunk_off is not None:
-            for i in range(MAX_IMPORT_FUNCTIONS):
-                raw = r.read_at(thunk_off + i * thunk_size, thunk_size)
-                (value,) = struct.unpack(unpack_thunk, raw)
-                if value == 0:
+            index = 0
+            terminated = False
+            batch_hint = _THUNK_BATCH
+            while not terminated:
+                if index >= MAX_IMPORT_FUNCTIONS:
+                    truncated = True
                     break
-                if value & ordinal_flag:
-                    functions.append(f"#{value & 0xFFFF}")
-                    continue
-                name_entry = rva_to_offset(value)
-                if name_entry is None:
-                    continue
-                # 2-byte hint precedes the function name.
-                functions.append(r.c_string(name_entry + 2, _MAX_NAME_BYTES))
+                batch = min(batch_hint, MAX_IMPORT_FUNCTIONS - index)
+                block: bytes | None = None
+                # Batch reads stop at the file's end: if the full
+                # batch overruns, halve until a read succeeds — a
+                # thunk array ending flush with EOF (terminator
+                # included) must parse completely, while one that
+                # runs off the file entirely is truncated.
+                while batch >= 1:
+                    try:
+                        block = r.read_at(
+                            thunk_off + index * thunk_size, batch * thunk_size
+                        )
+                        break
+                    except PEError:
+                        batch //= 2
+                if block is None:
+                    truncated = True  # ran off the file with no terminator
+                    break
+                batch_hint = batch
+                values = struct.unpack(
+                    f"<{len(block) // thunk_size}{unpack_thunk[1]}", block
+                )
+                for value in values:
+                    work += 1
+                    if work > MAX_IMPORT_WORK:
+                        truncated = True
+                        terminated = True
+                        break
+                    if value == 0:
+                        terminated = True
+                        break
+                    index += 1
+                    if value & ordinal_flag:
+                        functions.append(f"#{value & 0xFFFF}")
+                        continue
+                    name_entry = rva_to_offset(value)
+                    if name_entry is None:
+                        continue
+                    # 2-byte hint precedes the function name.
+                    functions.append(r.c_string(name_entry + 2, _MAX_NAME_BYTES))
+            # (loop ends when terminated or truncated)
         if dll_name in imports:
             # The same DLL can appear in more than one descriptor
             # (duplicates, delay-load mirrors): merge the function
@@ -393,7 +521,11 @@ def _parse_imports(r: _Reader, rva_to_offset, imp_rva: int, is_64bit: bool) -> d
             imports[dll_name].extend(functions)
         else:
             imports[dll_name] = functions
-    return imports
+        if truncated:
+            break
+    else:
+        truncated = True  # descriptor cap reached without a terminator
+    return imports, truncated
 
 
 def _parse_exports(r: _Reader, rva_to_offset, exp_rva: int) -> list[str]:
