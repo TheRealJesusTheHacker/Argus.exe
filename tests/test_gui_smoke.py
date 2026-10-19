@@ -131,7 +131,19 @@ def test_bench_page_scores_powershell_fixture(qapp, backend, tmp_path, window):
     page = window.devkit_page
     page.bench_path_edit.setText(str(fixture))
     page._run_bench()
+    # The bench runs OFF the UI thread (fix #24) so dissecting a
+    # file can never freeze the window. Drive the event loop while
+    # waiting — the worker's completion signal is delivered through
+    # it (a bare blocking wait() would starve exactly that loop).
+    import time
+
+    deadline = time.monotonic() + 15
+    while page.last_bench is None and time.monotonic() < deadline:
+        qapp.processEvents()
+        if page._bench_thread is not None:
+            page._bench_thread.wait(50)
     result = page.last_bench
+    assert result is not None
     assert result.verdict in ("Suspicious", "Malicious")
     names = {s.name for s in result.signals}
     assert "encoded_powershell_command" in names
@@ -201,3 +213,150 @@ def test_onboarding_flag_shown_once(qapp, tmp_path, monkeypatch):
     assert reloaded.onboarding_completed is True
     assert needs_onboarding(reloaded) is False
     backend.close()
+
+
+# ----------------------------------------------------------------------
+# v1.0.2 fix-pass GUI regressions
+# ----------------------------------------------------------------------
+
+def test_tray_notification_uses_real_event_keys(qapp, backend):
+    """Fix #6: RealtimeEvent.to_dict() emits kind/message/severity —
+    the tray used to read type/detection_name/outcome (keys that
+    never exist), so notifications could never fire."""
+    from datetime import datetime, timezone
+
+    from argus.gui.tray import TrayController as ArgusTray
+    from argus.realtime import RealtimeEvent
+
+    tray = ArgusTray()
+    alerts = []
+    tray.alert = lambda: alerts.append("alert")  # observe the branch taken
+    event = RealtimeEvent(
+        kind="detection",
+        message="Argus flagged evil.exe as Malicious.",
+        path="evil.exe",
+        verdict="Malicious",
+        severity="critical",
+    )
+    tray.notify_detection(event.to_dict())  # must not raise
+    assert alerts == ["alert"]  # the detection branch actually fired
+    # An action event with a plain dict in the real shape works too:
+    tray.notify_detection(
+        {
+            "kind": "action",
+            "message": "Argus wants to quarantine evil.exe.",
+            "severity": "high",
+            "action": "quarantine",
+            "path": "evil.exe",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+
+def test_tray_initial_state_reflects_protection(qapp, backend, window):
+    """Fix #26: the tray is set from protection.status() at startup,
+    not left in its construction default until the first change."""
+    assert "off" in window.tray.tray.toolTip().lower()
+
+
+def test_dashboard_service_managed_disables_toggle(qapp, backend, window):
+    """Fix #8: a live external (Windows service) heartbeat means
+    protection is service-managed — the dashboard must not offer to
+    start a second engine next to it."""
+    from datetime import datetime, timezone
+
+    status = {
+        "running": True,
+        "paused": False,
+        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+        "state": "running",
+    }
+    assert window.protection.service_managed(status) is True
+    window.dashboard.set_status(status)
+    assert window.dashboard.toggle_button.isEnabled() is False
+    assert "Windows service" in window.dashboard.toggle_button.text()
+    # A stale heartbeat is a dead service, not a managing one:
+    stale = dict(status, heartbeat_at="2020-01-01T00:00:00+00:00")
+    assert window.protection.service_managed(stale) is False
+    # And no heartbeat at all (plain dicts/tests) is not managed:
+    plain = {"running": True, "paused": False}
+    assert window.protection.service_managed(plain) is False
+
+
+def test_pending_reject_does_not_crash(qapp, backend, tmp_path, window, monkeypatch):
+    """Fix #5: reject() returns a PendingAction, which has no
+    .message — the page used to crash reading it."""
+    vault = backend.vault()
+    pending = vault.add_pending(
+        source="realtime",
+        path=str(tmp_path / "evil.exe"),
+        action="quarantine",
+        sha256="0" * 64,
+        severity="high",
+        verdict="Malicious",
+        detection_name="Test.Detection",
+        reasons=["looked bad"],
+    )
+    page = window.pending_page
+    page.refresh()
+    assert page.table.rowCount() == 1
+    page.table.selectRow(0)
+    monkeypatch.setattr("argus.gui.manage_pages._confirm", lambda *a, **k: True)
+    page._act("reject")
+    assert "Rejected" in page.status_label.text()
+    assert vault.get_pending(pending.id).status == "rejected"
+
+
+def test_quarantine_page_simulation_records_intent_only(
+    qapp, backend, tmp_path, window, monkeypatch
+):
+    """Fix #7: with Dev Toolkit simulation mode on, the Quarantine
+    page's restore/delete go through the simulated engine — intent
+    is recorded, the vault is never touched."""
+    vault = backend.vault()
+    target = tmp_path / "evil.exe"
+    target.write_bytes(b"MZ" + b"x" * 64)
+    entry = vault.quarantine_file(
+        target, detection_name="Test.Detection", severity="high"
+    )
+    backend.dev.simulation_mode = True
+    page = window.quarantine_page
+    page.refresh()
+    page.table.selectRow(0)
+    monkeypatch.setattr("argus.gui.manage_pages._confirm", lambda *a, **k: True)
+    page._act("restore")
+    assert "Simulation mode is on" in page.status_label.text()
+    assert vault.get_entry(entry.id).status == "quarantined"
+    sim = backend.actions()  # the same simulated engine the page used
+    assert [r.action for r in sim.records] == ["restore"]
+    page._act("delete")
+    assert vault.get_entry(entry.id).status == "quarantined"
+    assert [r.action for r in sim.records] == [
+        "restore",
+        "delete",
+    ]
+
+
+def test_extract_page_argument():
+    """Fix #22: --page selects the start page (the Dev Toolkit
+    shortcut passes '--page devtoolkit') and is stripped from the
+    argv handed to QApplication."""
+    from argus.gui.app import extract_page_argument
+
+    argv, page = extract_page_argument(["argus", "--page", "devtoolkit"])
+    assert argv == ["argus"]
+    assert page == "Dev Toolkit"
+    argv, page = extract_page_argument(["argus", "--page", "Scan"])
+    assert page == "Scan"
+    argv, page = extract_page_argument(["argus"])
+    assert argv == ["argus"] and page is None
+    # An unrecognized page is consumed quietly — never a crash:
+    argv, page = extract_page_argument(["argus", "--page", "nonsense"])
+    assert argv == ["argus"] and page is None
+
+
+def test_full_scan_roots_never_double_home(qapp, backend):
+    """Fix #21: a full scan walks the filesystem anchor OR home,
+    never both (home lives inside the anchor)."""
+    roots = backend.full_scan_roots()
+    assert len(roots) == 1
