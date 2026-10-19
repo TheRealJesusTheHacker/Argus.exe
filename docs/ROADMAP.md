@@ -52,6 +52,20 @@ Everything Argus ships is judged against four pillars:
       points, critical-combination short-circuit, signature discount
       that lowers but never erases; every point traceable to a named
       signal
+- [x] Windows system-file recognition (v1.1.0) — signer identity
+      extracted from the structurally-validated certificate
+      (bounded stdlib DER walk of the PKCS#7); trust requires ALL
+      THREE of valid cert + Microsoft signer ("Microsoft Windows" /
+      "Microsoft Corporation", one pinned constant) + a home under
+      the Windows folder. Trust zeroes the HEURISTIC score only —
+      signals stay listed with an explanatory note, and signature /
+      pattern-rule detections are never cleared by it. A Microsoft-
+      signed file outside system locations gets no trust. Honest
+      limit: this is structural validation + signer-identity
+      extraction, not full Authenticode chain/digest verification
+      (see backlog) — the system-location gate is what bounds the
+      claim; real-world signer strings across Windows versions
+      still want field confirmation on real machines.
 
 ## Phase 3 — Real-time protection ✅ (v0.4.0)
 - [x] Filesystem watcher (on-write scanning) — an always-on background
@@ -68,6 +82,19 @@ Everything Argus ships is judged against four pillars:
       **Honest limit:** polling detects a launch as it happens; true
       *pre-execution blocking* (stopping the program before it runs)
       arrives with the Phase 5 service/driver work.
+- **Known limit — the hit-and-run window (documented and accepted,
+  P1-23).** Both watchers poll. A file that is created, executed,
+  and deleted *entirely inside one poll interval* can complete its
+  run before Argus ever sees it: the filesystem watcher never
+  observes a stable file to scan, and the process monitor may never
+  observe the process. Shortening the poll interval only narrows
+  the window — it cannot close it, and polling faster burns the
+  machine Argus is meant to stay lightweight on. This is an
+  inherent limit of the polling design, not a bug being tracked:
+  it is accepted for the current product, and Argus's copy must
+  never claim otherwise. The real fix is a **filesystem minifilter
+  driver** (below), which receives file and process events from
+  the kernel as they happen — no interval, no window.
 - [x] Download/execute interception points — the watched folders are
       exactly the landing zones (Downloads, Desktop, Documents, temp);
       launches are intercepted by the process monitor above.
@@ -83,10 +110,33 @@ Everything Argus ships is judged against four pillars:
       (bad config → defaults + loud warnings, never a crash);
       exclusions by path and by SHA-256, honoured in real-time AND
       on-demand scans.
+- [x] Self-exclusion (v1.1.0) — Argus never scans its own data tree
+      (vault blobs are neutralised samples; the signature DB is
+      bookkeeping) or its own program. Consulted inside `scan_file`
+      — the one seam shared by on-demand, real-time, and the
+      service — before any read. ABUSE-RESISTANT BY DESIGN: the
+      program file is exempt only with an identity proof (it is the
+      running exe, or the SCM-registered ImagePath, or its SHA-256
+      matches the fingerprint setup records in the trusted root);
+      a file merely NAMED `Argus.exe` is scanned normally, and a
+      stranger at the program's own address is scanned in full and
+      flagged with a tamper signal. Results say "skipped: Argus's
+      own file" honestly (`exclusion_source`) rather than pretending
+      a scan happened.
 
 ## Detection-depth backlog (future)
 Depth Argus grows into after the core product ships — pillar 1
 (maximum detection power) made concrete:
+
+- [ ] **Filesystem minifilter driver** — the real fix for the
+      hit-and-run window documented in Phase 3 (a file created,
+      executed, and deleted inside one poll interval is invisible
+      to any polling watcher). A signed minifilter receives
+      create/execute callbacks from the kernel synchronously, so
+      nothing runs unscanned and nothing vanishes unseen. Needs
+      Microsoft's driver signing/attestation pipeline and a
+      kernel-code maintenance commitment — scheduled as its own
+      program of work, not a patch.
 
 - [ ] **Fuzzy hashing** (ssdeep/TLSH-style) — catch *variants* of
       known malware, not just byte-identical copies
@@ -101,6 +151,17 @@ Depth Argus grows into after the core product ships — pillar 1
 - [ ] **Community signature feeds** — import public hash feeds
       (e.g. abuse.ch MalwareBazaar) into the signature DB builder,
       with the same integrity checks as local builds
+- [x] **Full Authenticode verification (Windows-live)** — chain-of-
+      trust + signed digest verification for the system-file
+      recognition, via the operating system's own WinVerifyTrust
+      (`argus/platform_authenticode.py`, fix round 2): on Windows a
+      "trusted system file" verdict now requires Windows itself to
+      vouch for the signature; stdlib structural parsing remains
+      the gate for reading the claim, never the proof. Off Windows
+      (dev machines, the test suite) recognition stays
+      structural/claim-based — that fallback is a development
+      convenience, not the shipped security posture, and it is
+      labelled as such wherever it applies.
 
 ## Phase 4 — Quarantine, actions & reporting ✅ (v0.5.0)
 - [x] Per-severity **actions** on malicious files, matched to the
@@ -173,6 +234,24 @@ Depth Argus grows into after the core product ships — pillar 1
 - [x] Proper Windows installer: Program Files layout, Start Menu,
       clean uninstaller (Inno Setup; uninstall keeps the vault +
       history unless "remove all data" is checked)
+      → **Superseded in v1.1.0** by the single self-installing
+      `Argus.exe` (below): the Inno installer and the separate
+      service exe are retired.
+- [x] **One self-installing executable (v1.1.0)**: the GUI, the
+      protection service host, and the setup engine in a single
+      `Argus.exe` (`argus/entry.py` routes by launch; install runs
+      elevated via `--run-setup`). Setup self-places the exe,
+      applies the trust-split ACLs, installs the service (ImagePath
+      carries the `--service` marker; hosting goes through the
+      servicemanager dispatcher), registers with Security Center,
+      writes the Add/Remove Programs entry, starts the service,
+      and VERIFIES (SCM running + fresh heartbeat) before calling
+      itself done. No step may fail silently — the design answer
+      to the v1.0.5 hidden-installer-step failure (service never
+      installed; proven root causes: pywin32 getopt option order
+      + the SCM launch routed to a command the handler lacks).
+      Release assets: `Argus.exe`, `ArgusPortable.zip` (the same
+      exe in portable mode), `SHA256SUMS.txt`.
 - [x] Background service: auto-starts at boot (the Phase 3 watcher
       graduates into it), tray-resident supervision (pywin32
       `ArgusProtection` service via `argus/winservice.py`)
@@ -186,5 +265,126 @@ Depth Argus grows into after the core product ships — pillar 1
 - [ ] Signature auto-updates running as a service task — deferred:
       needs a signed update-feed design (where updates live, how
       they are signed and verified) before it can be built honestly.
-      The packaging/release pipeline (PyInstaller + Inno Setup via
-      GitHub Actions on release publish) shipped in this phase.
+      The packaging/release pipeline (PyInstaller via GitHub
+      Actions on release publish) shipped in this phase.
+
+## Fix round 2 (v1.1.0) — who is asking, provenance, honest limits
+
+The fresh-eyes re-audit of the ten-layer hunt fixes found that the
+service's action channel authenticated *data* (entry ids,
+fingerprints — all published in the service's own snapshots) but
+never *the caller*. Round 2 closes that and records the trust
+model plainly:
+
+- **Privileged actions are caller-verified in the installed
+  Windows layout.** Restore / allow / delete / approve / reject
+  execute ONLY when they arrive over the local named pipe in
+  `argus/pipe_channel.py`, and only after the service verifies
+  the calling PROCESS: the pipe reports the client's PID, whose
+  image must resolve to the canonical installed `Argus.exe` AND
+  hash to the fingerprint setup recorded in the trusted root.
+  File-channel drops of privileged kinds are refused in that
+  layout. Confirmation dialogs (GUI and CLI prompts) are built
+  from the service's OWN rows, fetched over the same pipe
+  ("The protection service reports: …") — the snapshot view
+  files are list hints only.
+- **The file channel's trust domain is same-user.** In portable,
+  dev, and non-Windows layouts the request files remain the
+  transport: there, writer and service run as the same user, so
+  a process that can write the request can already do anything
+  the service's answer would let it do — there is no privilege
+  boundary for the pipe to guard. The pipe guards exactly the
+  boundary that exists: standard user → LocalSystem, installed
+  layout, Windows.
+- **Legacy pending migration is provenance-only and one-time.**
+  A pre-trust-split queue row migrates only when it references a
+  vault entry whose encrypted blob decrypts to the row's exact
+  fingerprint — records only the service could have written.
+  Everything else is dropped, counted in the service status, and
+  announced once in the GUI. A marker file in the trusted root
+  makes the pass run exactly once; the earlier "the live file
+  hashes to the row" test was removed because a hash is public
+  data and proved nothing (a fabricated row naming an arbitrary
+  victim file plus its real hash rode it into the trusted queue).
+- **BOM-less UTF-16BE scripts — documented and accepted.** A
+  script file encoded UTF-16BE *without* a byte-order mark is
+  not routed to script content analysis. No mainstream
+  interpreter (PowerShell included) executes a BOM-less BE file
+  as script — the encodings real droppers use (UTF-16LE with or
+  without BOM, UTF-8) are all covered, LE/BE *with* a BOM are
+  decoded correctly, and chasing BOM-less BE would mean
+  heuristic-guessing an encoding no executor honours. Accepted
+  as matching interpreter reality; revisit only if an executor
+  that honours BOM-less BE matters.
+
+## Fix round 3 (v1.1.0) — placement independence, pipe hardening
+
+The focused re-audit verified round 2's blockers closed but
+found one evasion and six lesser items; all are closed here:
+
+- **UTF-16 routing is placement-independent.** Round 2 routed
+  by sampling (head / middle / tail windows); a cradle parked
+  BETWEEN the windows of a multi-MB disguised file still scored
+  Clean. Routing no longer samples: the scanner tests EVERY
+  chunk of its streaming pass for a UTF-16 segment (a fast
+  parity-lane test, a few ms per MiB on negative data) and a
+  positive at ANY offset triggers a bounded folded second pass
+  over the whole file; heuristic routing streams the whole file
+  the same way, and the script decoder reads windows around
+  located passages parked beyond its head cap. A payload's
+  position no longer matters — only its presence.
+- **The pipe refuses squatters and sheds silent clients.** It
+  is created with FILE_FLAG_FIRST_PIPE_INSTANCE: if another
+  process already owns the name, the listener logs loudly and
+  does not serve (protection is unaffected; privileged actions
+  surface the designed unreachable error). Sessions run on
+  their own threads under a 10-second watchdog, so one silent
+  client can't starve the channel.
+- **Migration rows must also match the entry's own path.** A
+  legacy row now migrates only when its path IS the bound
+  vault entry's recorded original path, in addition to the
+  entry/content binding — fabricated queue items borrowed
+  against a real entry are dropped and counted like the rest.
+- **Authenticode verdicts are content-keyed.** The verdict
+  cache key gained the watcher's sampled content hash, so a
+  same-size, mtime-restored replacement re-verifies instead of
+  inheriting trust.
+- **Prose is not a payload line.** The long-line script signal
+  measures the longest whitespace-free run (the encoded-blob
+  shape it hunts), and the segment-wise decoder treats an
+  encoding seam as a line boundary — a mixed-encoding prose
+  document no longer scores Suspicious on its paragraphs.
+- **The release smoke covers the first run.** `--self-check`
+  now imports the pipe/Authenticode modules and the GUI app /
+  onboarding modules, and `--self-check-qt` also constructs
+  the onboarding wizard.
+- **The oversize script floor no longer flags plain text.**
+  The spot audit found the P0-5 floor's false positive: any
+  benign UTF-16LE text file over the 4 MB script decode cap
+  scored Suspicious 40 on size alone (mismatch 15 + floor 25),
+  because all UTF-16 text routes as script. The floor is now
+  waived for exactly one shape — content-only routing (no
+  script extension; the file never claimed to be code), zero
+  rule detections across the full raw + folded streaming
+  passes, AND zero heuristic script signals in every decoded
+  window actually read. Any rule hit or any script signal
+  anywhere keeps the floor; a script extension keeps it
+  unconditionally.
+- **Known limit — UTF-16 parity flips (documented and
+  accepted).** The folded rule views are two streams: bytes at
+  even offsets and bytes at odd offsets. A payload whose
+  UTF-16LE parity flips MID-NEEDLE — the first half of a
+  pattern encoded on even parity, the rest on odd — is whole in
+  NEITHER view, so no folded rule can match it. This limit is
+  shared with native .ps1 handling (the folded views are the
+  UTF-16 mechanism there too) and is accepted, for a precise
+  reason: the constructed byte layout is not a valid UTF-16LE
+  stream. The flip is a byte inserted or dropped mid-text, so
+  an interpreter decoding the file as UTF-16LE reads garbled
+  characters at the seam — the needle does not exist as text
+  for PowerShell either, and the "payload" cannot execute as
+  the script it spells. Argus's decoded-text heuristic signals
+  see the same garbled seam an interpreter would. A
+  parity-consistent payload at ANY offset is caught (placement
+  independence above); only the self-corrupting layout escapes
+  the folded views, and it escapes execution the same way.
