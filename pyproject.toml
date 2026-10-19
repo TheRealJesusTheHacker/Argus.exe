@@ -4,17 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "argus-exe"
-version = "0.5.0"
+version = "1.0.0"
 description = "ARGUS.EXE — antivirus & malware detection by Sentinel Safeguard LLC. All eyes. All detection."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary — Sentinel Safeguard LLC" }
 authors = [{ name = "Sentinel Safeguard LLC" }]
 keywords = ["antivirus", "malware", "security", "scanner"]
-# Phase 1 is pure standard library — no runtime dependencies.
+# The engine core is pure standard library — no runtime
+# dependencies. PySide6 (the GUI) and pywin32 (Windows service /
+# Security Center registration) are optional layers, installed via
+# extras; the packaged Windows builds use [gui,windows].
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+windows = ["pywin32>=306; sys_platform == 'win32'"]
 
 [project.scripts]
 argus = "argus.cli:main"
+argus-gui = "argus.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["argus*"]

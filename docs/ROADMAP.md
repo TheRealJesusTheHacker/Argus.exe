@@ -138,34 +138,53 @@ Depth Argus grows into after the core product ships — pillar 1
 
 ## Phase 5 — Product: premium GUI, Dev Toolkit, install & default security app
 ### Premium GUI
-- [ ] Sentinel green/black, premium standard — a modern product
-      interface, not a dated toolkit look
-- [ ] **The bar is premium AND approachable:** first-run onboarding
+- [x] Sentinel green/black, premium standard — a modern product
+      interface, not a dated toolkit look (custom QSS theme +
+      drawn widgets: severity badges, score ring, toggle switches;
+      `argus/gui/`)
+- [x] **The bar is premium AND approachable:** first-run onboarding
       that gets a new user protected in minutes, a clean dashboard
       that answers "am I safe?" at a glance, and **zero jargon
       walls** — every term explained in plain language or not shown
-      at all. Premium must never mean intimidating.
-- [ ] Dashboard: protection status, last scan, detections by severity
-- [ ] Scan controls, quarantine manager, reports
+      at all. Premium must never mean intimidating. (Onboarding
+      wizard shows once, gated by a config flag.)
+- [x] Dashboard: protection status, last scan, detections by severity
+- [x] Scan controls, quarantine manager, reports (plus Pending
+      Actions and History pages; every destructive button goes
+      through the action engine's confirmation flow — GUI dialogs,
+      no bypass)
 
 ### Dev Toolkit panel
-- [ ] Heuristic sensitivity control
-- [ ] Per-signal enable/disable and weight tuning
-- [ ] Exclusions manager
-- [ ] Rule test bench — run a file against rules/signals and see the
-      full scoring breakdown
-- [ ] Verbose logging toggle
-- [ ] Simulation mode — detect-only, no actions taken
-- [ ] Self-test (EICAR) — verify the whole pipeline on demand
+- [x] Heuristic sensitivity control (slider → scoring thresholds)
+- [x] Per-signal enable/disable and weight tuning (all 30 signals;
+      a drift-guard test keeps the editor's catalog identical to
+      the engine's signal library)
+- [x] Exclusions manager (paths + SHA-256 fingerprints, in Settings)
+- [x] Rule test bench — run a file against rules/signals and see the
+      full scoring breakdown (fingerprint, rules, every signal with
+      points, entropy, PE facts, final score/verdict)
+- [x] Verbose logging toggle (+ in-app log view)
+- [x] Simulation mode — detect-only, no actions taken (actions are
+      recorded as intent through a simulated engine that cannot
+      reach the files; covered by tests)
+- [x] Self-test (EICAR) — verify the whole pipeline on demand
 
 ### Install & default security app
-- [ ] Proper Windows installer: Program Files layout, Start Menu,
-      clean uninstaller
-- [ ] Background service: auto-starts at boot (the Phase 3 watcher
-      graduates into it), tray-resident supervision
-- [ ] System tray presence: live status + quick actions (scan now,
+- [x] Proper Windows installer: Program Files layout, Start Menu,
+      clean uninstaller (Inno Setup; uninstall keeps the vault +
+      history unless "remove all data" is checked)
+- [x] Background service: auto-starts at boot (the Phase 3 watcher
+      graduates into it), tray-resident supervision (pywin32
+      `ArgusProtection` service via `argus/winservice.py`)
+- [x] System tray presence: live status + quick actions (scan now,
       open quarantine, pause/resume)
-- [ ] **Windows Security Center registration**
+- [x] **Windows Security Center registration**
       (`root\SecurityCenter2` AntiVirusProduct) so Windows
       recognizes Argus as the system's antivirus provider
-- [ ] Signature auto-updates running as a service task
+      (`argus/winregister.py`, mock-tested; exact productState
+      semantics to be confirmed on a real machine)
+- [ ] Signature auto-updates running as a service task — deferred:
+      needs a signed update-feed design (where updates live, how
+      they are signed and verified) before it can be built honestly.
+      The packaging/release pipeline (PyInstaller + Inno Setup via
+      GitHub Actions on release publish) shipped in this phase.

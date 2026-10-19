@@ -40,7 +40,24 @@ Argus is Sentinel Safeguard LLC's antivirus and malware detector for Windows. It
 
 ## Status
 
-**Phase 4 complete (v0.5.0) — quarantine, actions & reporting are live.** What Argus catches can now be *handled*, under the rule the whole product is built on: **nothing happens to your files behind your back**. Malicious files from a scan can be quarantined or deleted (your flags, or an interactive prompt) into an **encrypted quarantine vault** — streamed, authenticated, tamper-evident storage with opaque file names, where the encrypted copy is verified end-to-end *before* the original is ever removed, and a tampered vault copy refuses to restore. From the vault you can **restore** a file (never overwriting anything that took its place), **delete** it for good (through the vault, so the audit record survives), or **allow** it — restored, fingerprinted, and added to your exclusions so Argus leaves that exact file alone. Real-time protection routes its requests through a **pending-actions queue** by default (`argus pending list / approve / reject`): Argus asks, you decide. If you'd rather it act on the worst of the worst, the `realtime_default` policy can auto-quarantine Critical findings — but **deletion is never automatic, under any setting**. Every scan and detection is written into a persistent **history** with plain-language reasons and outcomes, rendered by `argus report` and `argus history`. What remains is honest and unchanged: the process monitor scans a program *as* it starts (pre-execution blocking arrives with the Phase 5 service/driver work), and the vault's encryption is there to neutralize threats, not to store secrets. Next: Phase 5 — the premium GUI, Dev Toolkit, and the install that makes Argus the machine's default security app.
+**v1.0.0 — the full product.** Phase 5 completes the build plan: the premium Sentinel green/black **GUI** (Dashboard, Scan, Quarantine, Pending Actions, History, Settings, and a **Dev Toolkit**), a real **Windows service** (`ArgusProtection`, starts at boot), **Windows Security Center registration** so Argus is listed as the machine's antivirus in Windows Security, a **system tray** presence, a first-run **onboarding wizard** with an EICAR self-test, and an **Inno Setup installer** that puts it all in Program Files and sets Argus up as the machine's default security app. The Dev Toolkit is the workbench: detection-sensitivity slider, per-signal enable/weight steering, a rule test bench that dissects any file down to every point of its score, **simulation mode** (detect-only — actions are recorded as intent and nothing is ever touched), verbose logging, and the EICAR self-test. The rules from day one still hold in every layer, GUI included: **nothing happens to your files behind your back** — destructive actions always ask first, and deletion is never automatic under any setting. Honest remainders: the process monitor scans a program *as* it starts (pre-execution blocking and kernel tamper protection need Microsoft's driver signing programs — future work), and the vault's encryption exists to neutralize threats, not to store secrets.
+
+## Install
+
+**From a release (Windows):** download `ArgusSetup.exe` from the latest GitHub release and run it. It installs to `Program Files\Sentinel Safeguard\Argus`, installs and starts the protection service, and registers Argus with Windows Security. Uninstalling removes the program and service but **keeps your quarantine vault and history** unless you check "remove all data" in the uninstaller. Portable `Argus.exe` / `ArgusService.exe` builds are attached to the same release.
+
+**From source:**
+
+```
+pip install ".[gui,windows]"     # engine + GUI + Windows service layers
+python -m argus.gui               # the GUI (or: argus-gui)
+python -m argus sigdb init        # build a signature database
+python -m argus scan <path>       # scan from the command line
+python -m argus watch             # real-time protection in the foreground
+python -m argus service install   # (Windows, admin) install the service
+```
+
+The engine core is pure Python standard library; PySide6 and pywin32 are optional layers used only by the GUI and the Windows service/registration modules.
 
 ## The family
 
