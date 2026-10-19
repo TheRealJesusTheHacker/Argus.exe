@@ -95,6 +95,7 @@ class ArgusService:
         pipe_recorded_sha256: str | None = None,
         pipe_required: bool | None = None,
         serve_pipe: bool | None = None,
+        socket_allow_root: bool = True,
     ) -> None:
         self.config_path = Path(config_path) if config_path else None
         self._config_override = config
@@ -110,7 +111,14 @@ class ArgusService:
         self._pipe_recorded_sha256 = pipe_recorded_sha256
         self._pipe_required = pipe_required
         self._serve_pipe = serve_pipe
-        self._pipe_server: pipe_channel.WindowsPipeServer | None = None
+        #: The Linux socket channel's root rule (v1.2.0): a peer
+        #: the kernel vouches for as uid 0 is admitted on that
+        #: credential alone. A constructor seam so tests can force
+        #: the full identity proof even when they run as root.
+        self._socket_allow_root = socket_allow_root
+        #: The verified-channel listener: a WindowsPipeServer on
+        #: Windows, a UnixSocketServer on Linux, else None.
+        self._pipe_server = None
         #: Pending rows the one-time legacy migration dropped as
         #: unverifiable (fix round 2, FIX 2) — published in status
         #: so the GUI can show its one-time notice.
@@ -171,6 +179,7 @@ class ArgusService:
         for warning in self.config.load_warnings:
             log.warning("config: %s", warning)
         self._apply_system_watch_dirs()
+        self._apply_root_watch_dirs()
 
         try:
             stack = self._open_stack()
@@ -444,6 +453,7 @@ class ArgusService:
             "watch_dirs": [str(d) for d in self.config.watch_dirs],
             "process_monitor_enabled": self.config.process_monitor_enabled,
             "realtime_default": self.config.realtime_default,
+            "watcher_backend": engine_stats.get("watcher_backend", "polling"),
             "files_watched": engine_stats.get("files_watched", 0),
             "quarantined_files": (
                 self.vault.count("quarantined") if self.vault is not None else 0
@@ -607,6 +617,52 @@ class ArgusService:
             self.config.watch_dirs = dirs
             log.info(
                 "running as SYSTEM: watching user profile folders %s",
+                [str(d) for d in dirs],
+            )
+
+    def _apply_root_watch_dirs(self) -> None:
+        """The Linux twin of :meth:`_apply_system_watch_dirs`:
+        when the service runs as root (the systemd unit), the
+        process "home" is /root — the default watch list (root's
+        Downloads/Desktop/Documents) would watch folders no user
+        ever touches. Substitute every real user profile's
+        Downloads/Desktop/Documents plus ``/tmp``. Only applies
+        on Linux, only as root, and only when the configured
+        watch list IS the untouched default; an explicit list in
+        the config always wins."""
+        if not sys.platform.startswith("linux"):
+            return
+        try:
+            if os.geteuid() != 0:
+                return
+        except OSError:
+            return
+        if str(Path.home()) != "/root":
+            return
+        if [str(d) for d in self.config.watch_dirs] != [
+            str(d) for d in default_watch_dirs()
+        ]:
+            return
+        dirs: list[Path] = []
+        homes_root = Path("/home")
+        try:
+            profiles = sorted(homes_root.iterdir())
+        except OSError:
+            profiles = []
+        for profile in profiles:
+            if not profile.is_dir():
+                continue
+            for sub in ("Downloads", "Desktop", "Documents"):
+                candidate = profile / sub
+                if candidate.is_dir():
+                    dirs.append(candidate)
+        tmp = Path("/tmp")
+        if tmp.is_dir():
+            dirs.append(tmp)
+        if dirs:
+            self.config.watch_dirs = dirs
+            log.info(
+                "running as root: watching user profile folders %s",
                 [str(d) for d in dirs],
             )
 
@@ -1223,21 +1279,37 @@ class ArgusService:
 
         return pipe_channel_required()
 
-    def _pipe_session(self, stream, client_pid: int):
-        """One pipe session: verification inputs resolved fresh
-        (the recorded fingerprint can change across an upgrade),
-        then the shared session core."""
+    def _verified_channel_inputs(self):
+        """The (identity provider, canonical exe, recorded
+        fingerprint) a verified-channel session verifies against,
+        resolved fresh for every session (the recorded fingerprint
+        can change across an upgrade). Platform-shaped: the
+        Windows pipe proves identity the pywin32 way against the
+        Program Files address; the Linux socket proves it the
+        /proc way against the FHS address. Injected seams win on
+        both platforms."""
         from . import selftrust
-        from .setup_engine import canonical_exe_path
 
-        provider = (
-            self._pipe_identity_provider
-            or pipe_channel.WindowsClientIdentityProvider()
-        )
+        if sys.platform.startswith("linux"):
+            from . import linuxservice, socket_channel
+
+            provider = (
+                self._pipe_identity_provider
+                or socket_channel.LinuxClientIdentityProvider()
+            )
+            canonical_default = linuxservice.canonical_exe_path()
+        else:
+            from .setup_engine import canonical_exe_path
+
+            provider = (
+                self._pipe_identity_provider
+                or pipe_channel.WindowsClientIdentityProvider()
+            )
+            canonical_default = canonical_exe_path()
         canonical = (
             Path(self._pipe_canonical_exe)
             if self._pipe_canonical_exe is not None
-            else canonical_exe_path()
+            else canonical_default
         )
         recorded = self._pipe_recorded_sha256
         if recorded is None:
@@ -1245,6 +1317,12 @@ class ArgusService:
                 recorded = selftrust.load_recorded_exe_sha256()
             except Exception:
                 recorded = None
+        return provider, canonical, recorded
+
+    def _pipe_session(self, stream, client_pid: int):
+        """One pipe session: verification inputs resolved fresh,
+        then the shared session core."""
+        provider, canonical, recorded = self._verified_channel_inputs()
         return pipe_channel.serve_pipe_stream(
             stream,
             client_pid=client_pid,
@@ -1252,6 +1330,31 @@ class ArgusService:
             canonical_exe=canonical,
             recorded_sha256=recorded,
             execute=self._dispatch_pipe_request,
+        )
+
+    def _socket_session(self, stream, creds):
+        """One Unix-socket session (Linux, v1.2.0): the verdict
+        is computed from the kernel credentials (pid AND uid —
+        the root rule only a uid can express), then the SAME
+        shared session core the pipe uses runs the exchange."""
+        from . import socket_channel
+
+        provider, canonical, recorded = self._verified_channel_inputs()
+        verdict = socket_channel.verify_socket_client(
+            creds,
+            identity_provider=provider,
+            canonical_exe=canonical,
+            recorded_sha256=recorded,
+            allow_root=self._socket_allow_root,
+        )
+        return pipe_channel.serve_pipe_stream(
+            stream,
+            client_pid=creds.pid,
+            identity_provider=provider,
+            canonical_exe=canonical,
+            recorded_sha256=recorded,
+            execute=self._dispatch_pipe_request,
+            caller_verdict=verdict,
         )
 
     def _dispatch_pipe_request(self, request: dict) -> dict:
@@ -1355,20 +1458,29 @@ class ArgusService:
     def _start_pipe_server(self) -> None:
         serve = self._serve_pipe
         if serve is None:
-            serve = sys.platform == "win32"
+            serve = sys.platform == "win32" or sys.platform.startswith(
+                "linux"
+            )
         if not serve:
             return
         try:
-            server = pipe_channel.WindowsPipeServer(self._pipe_session)
+            if sys.platform.startswith("linux"):
+                from . import socket_channel
+
+                server = socket_channel.UnixSocketServer(
+                    self._socket_session
+                )
+            else:
+                server = pipe_channel.WindowsPipeServer(self._pipe_session)
             server.start()
             self._pipe_server = server
         except Exception:
             # Loud, never fatal: protection continues, but
             # privileged actions from the Argus window will be
             # refused (by design) until the service starts cleanly
-            # with its pipe.
+            # with its verified channel.
             log.exception(
-                "could not start the verified-action pipe — "
+                "could not start the verified-action channel — "
                 "privileged actions from the Argus window will be "
                 "refused until the service restarts cleanly"
             )
