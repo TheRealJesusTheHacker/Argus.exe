@@ -112,11 +112,14 @@ class MainWindow(QMainWindow):
         self.tray.toggle_pause_requested.connect(self._tray_toggle_pause)
         self.tray.quit_requested.connect(self.close)
         self.protection.status_changed.connect(self.tray.set_protection_state)
+        self.protection.status_changed.connect(self._sync_tray_mode)
+        self.tray.open_requested.connect(self.tray.acknowledge_alerts)
         self.protection.detection.connect(self.tray.notify_detection)
         self.protection.detection.connect(lambda _e: self._refresh_pages())
         # Initial tray state: reflect protection as it is right now,
         # not just after the first status change arrives.
         self.tray.set_protection_state(self.protection.status())
+        self._sync_tray_mode(self.protection.status())
 
         self.statusBar().showMessage(
             "Real-time protection runs in this window, or as the "
@@ -150,6 +153,16 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def _sync_tray_mode(self, status: dict) -> None:
+        """Keep the tray's Pause/Resume mirroring the dashboard:
+        in service-managed mode (fresh heartbeat OR the P1-12
+        SCM-running/stale-heartbeat branch) the tray pause is
+        disabled with the managed tooltip."""
+        managed = self.protection.service_managed(
+            status
+        ) or self.protection.service_managed_stale(status)
+        self.tray.set_service_managed(managed)
 
     def _tray_toggle_pause(self) -> None:
         status = self.protection.status()
