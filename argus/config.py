@@ -29,7 +29,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .paths import data_dir
+from .paths import data_dir, shared_dir, write_text_atomic
 from .signatures import DEFAULT_DB_NAME, SEVERITIES
 
 log = logging.getLogger("argus.config")
@@ -147,8 +147,11 @@ class ArgusConfig:
     heuristics: bool = True
     #: Absolute for the same reason: the service, the GUI, and
     #: ``argus watch-status`` must all read the SAME heartbeat file.
+    #: It lives in the SHARED subdirectory (v1.0.4 trust split):
+    #: the heartbeat is written by the service and read by user
+    #: processes, and the trusted data root is read-only for users.
     status_file: str = field(
-        default_factory=lambda: str(data_dir() / DEFAULT_STATUS_FILE)
+        default_factory=lambda: str(shared_dir() / DEFAULT_STATUS_FILE)
     )
     event_log_file: str | None = None
     heartbeat_interval: float = 5.0
@@ -158,6 +161,12 @@ class ArgusConfig:
     vault_dir: str | None = None
     #: Scan history database location (None = standard app-data home).
     history_db: str | None = None
+    #: Pending-actions database location (None = shared app-data home).
+    pending_db: str | None = None
+    #: Watcher dwell deadline: a file that keeps changing is scanned
+    #: anyway once it has been tracked this long (seconds), instead
+    #: of waiting forever for it to sit still.
+    max_dwell_seconds: float = 30.0
     #: True once the user has finished the first-run welcome wizard
     #: (Phase 5 GUI). Stored in config so the wizard shows exactly once.
     onboarding_completed: bool = False
@@ -189,6 +198,26 @@ class ArgusConfig:
                 hashes=self.exclusions.hashes | {digest},
             )
 
+    def absorb_disk_exclusions(self, path: Path | str) -> None:
+        """Merge the exclusions currently ON DISK at *path* into this
+        config (union of paths and hashes).
+
+        The service and the GUI each hold their own in-memory copy of
+        the config. If one of them vouches for a file (Allow) and the
+        other later saves its own stale copy, the vouch would be
+        silently erased — a lost update. Callers that save on the
+        user's behalf absorb the on-disk exclusions first, so a save
+        can add exclusions but never quietly remove someone else's.
+        """
+        if not Path(path).is_file():
+            return
+        disk = ArgusConfig.load(path)
+        merged_paths = tuple(
+            dict.fromkeys([*self.exclusions.paths, *disk.exclusions.paths])
+        )
+        merged_hashes = self.exclusions.hashes | disk.exclusions.hashes
+        self.exclusions = Exclusions(paths=merged_paths, hashes=merged_hashes)
+
     def save(self, path: Path | str) -> None:
         """Write this config back to *path* as JSON (the same shape
         :meth:`load` reads). Used when Argus itself changes a setting
@@ -216,17 +245,16 @@ class ArgusConfig:
             "event_log_file": self.event_log_file,
             "vault_dir": self.vault_dir,
             "history_db": self.history_db,
+            "pending_db": self.pending_db,
+            "max_dwell_seconds": self.max_dwell_seconds,
             "onboarding_completed": self.onboarding_completed,
         }
         target = Path(path)
-        if target.parent and not target.parent.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write (tmp file + rename, the same pattern the
-        # service heartbeat uses): a crash mid-write must never leave
-        # a half-written config behind for the next start to choke on.
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, target)
+        # Atomic, crash-safe write (unique temp file in the same
+        # directory + fsync + permission-preserving rename): a crash
+        # mid-write must never leave a half-written config behind
+        # for the next start to choke on.
+        write_text_atomic(target, json.dumps(data, indent=2) + "\n")
         self.source_path = target
 
     # ------------------------------------------------------------------
@@ -293,6 +321,9 @@ class ArgusConfig:
         )
         self.heartbeat_interval = self._float(
             raw, "heartbeat_interval_seconds", 5.0, minimum=0.5
+        )
+        self.max_dwell_seconds = self._float(
+            raw, "max_dwell_seconds", 30.0, minimum=1.0
         )
 
         pm = raw.get("process_monitor_enabled")
@@ -378,7 +409,8 @@ class ArgusConfig:
         for key, attr in (("rules_file", "rules_file"),
                           ("event_log_file", "event_log_file"),
                           ("vault_dir", "vault_dir"),
-                          ("history_db", "history_db")):
+                          ("history_db", "history_db"),
+                          ("pending_db", "pending_db")):
             value = raw.get(key)
             if isinstance(value, str) and value:
                 setattr(self, attr, value)
