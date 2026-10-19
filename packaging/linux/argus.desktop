@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=ARGUS.EXE
+GenericName=Antivirus
+Comment=Antivirus and malware detector by Sentinel Safeguard LLC — all eyes, all detection.
+Exec=/usr/bin/argus
+Icon=argus
+Terminal=false
+Categories=System;Security;
+Keywords=antivirus;malware;security;scan;quarantine;
+StartupNotify=true
