@@ -31,8 +31,17 @@ def qapp():
 @pytest.fixture()
 def backend(tmp_path, monkeypatch):
     """A GuiBackend rooted entirely in tmp_path, with a seeded
-    signature database wired into its config."""
-    monkeypatch.setenv("ARGUS_DATA_DIR", str(tmp_path))
+    signature database wired into its config.
+
+    The data root is a DEDICATED subfolder, not tmp_path itself:
+    Argus never scans its own data tree (see argus.selftrust),
+    and the scan targets in these tests live elsewhere under
+    tmp_path — on a real machine the data root
+    (C:\\ProgramData\\Argus) is likewise disjoint from anything
+    a user would scan."""
+    data_root = tmp_path / "argus-data"
+    data_root.mkdir()
+    monkeypatch.setenv("ARGUS_DATA_DIR", str(data_root))
     from argus.gui.backend import GuiBackend
 
     config_path = tmp_path / "argus-config.json"
@@ -154,14 +163,21 @@ def test_quarantine_and_pending_pages_render_real_data(qapp, backend, tmp_path, 
     """Exercise the vault pages against a real quarantined file —
     catches field drift between the engine dataclasses and the GUI.
     Pages are used through the main window, as in the real app."""
+    import hashlib
+
     from argus.actions import DetectionInfo
 
     suspect = tmp_path / "suspect.exe"
-    suspect.write_bytes(b"MZ pretend malware")
+    payload = b"MZ pretend malware"
+    suspect.write_bytes(payload)
     info = DetectionInfo(
-        name="Test.Threat", severity="high", verdict="Malicious"
+        name="Test.Threat", severity="high", verdict="Malicious",
+        # The action engine refuses to quarantine without the
+        # file's real fingerprint (it verifies the quarantined
+        # copy against it) — supply the hash, as a scan does.
+        sha256=hashlib.sha256(payload).hexdigest(),
     )
-    outcome = backend.real_actions().quarantine(suspect, info, confirmed=True)
+    outcome = backend.actions().quarantine(suspect, info, confirmed=True)
     assert outcome.done and outcome.entry_id
 
     window.show_page("Quarantine")  # navigation refreshes the page
@@ -179,10 +195,15 @@ def test_devkit_simulation_toggle_saves(qapp, backend, window):
     page.sim_toggle.set_checked(True, emit=True)
     assert backend.dev.simulation_mode is True
     assert backend.simulation_mode is True
-    # The backend now hands out the simulated engine.
+    # Collapsed seam (v1.1.0): there is no parallel simulated
+    # engine to hand out — actions() always returns the real
+    # ActionEngine, which consults the persisted simulation flag
+    # itself at act time.
+    from argus.actions import ActionEngine
     from argus.devtools import SimulatedActionEngine
 
-    assert isinstance(backend.actions(), SimulatedActionEngine)
+    assert isinstance(backend.actions(), ActionEngine)
+    assert not isinstance(backend.actions(), SimulatedActionEngine)
 
 
 def _fresh_gui_backend(tmp_path):
@@ -360,9 +381,11 @@ def test_pending_reject_does_not_crash(qapp, backend, tmp_path, window, monkeypa
 def test_quarantine_page_simulation_records_intent_only(
     qapp, backend, tmp_path, window, monkeypatch
 ):
-    """Fix #7: with Dev Toolkit simulation mode on, the Quarantine
-    page's restore/delete go through the simulated engine — intent
-    is recorded, the vault is never touched."""
+    """Fix #7, collapsed-seam edition: with Dev Toolkit simulation
+    mode on, the Quarantine page's restore/delete go through the
+    real ActionEngine, which consults the persisted flag itself at
+    act time and records the intent as a simulated outcome — the
+    vault is never touched."""
     vault = backend.vault()
     target = tmp_path / "evil.exe"
     target.write_bytes(b"MZ" + b"x" * 64)
@@ -370,6 +393,15 @@ def test_quarantine_page_simulation_records_intent_only(
         target, detection_name="Test.Detection", severity="high"
     )
     backend.dev.simulation_mode = True
+    # The engine reads the flag from the DEFAULT devtools file at
+    # act time — persist it there too, exactly as the Dev Toolkit
+    # page's save does in the standard layout (where the backend's
+    # devtools_path IS that default file).
+    default_settings = devtools.DevSettings.load(
+        devtools.default_devtools_path()
+    )
+    default_settings.simulation_mode = True
+    default_settings.save(devtools.default_devtools_path())
     page = window.quarantine_page
     page.refresh()
     page.table.selectRow(0)
@@ -377,14 +409,9 @@ def test_quarantine_page_simulation_records_intent_only(
     page._act("restore")
     assert "Simulation mode is on" in page.status_label.text()
     assert vault.get_entry(entry.id).status == "quarantined"
-    sim = backend.actions()  # the same simulated engine the page used
-    assert [r.action for r in sim.records] == ["restore"]
     page._act("delete")
+    assert "Simulation mode is on" in page.status_label.text()
     assert vault.get_entry(entry.id).status == "quarantined"
-    assert [r.action for r in sim.records] == [
-        "restore",
-        "delete",
-    ]
 
 
 def test_protection_start_refused_in_simulation(qapp, backend, window):
