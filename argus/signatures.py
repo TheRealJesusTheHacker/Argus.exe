@@ -29,6 +29,7 @@ test file, used so detection can be verified end-to-end safely.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,6 +146,10 @@ class SignatureDB:
     def __init__(self, conn: sqlite3.Connection, info: SignatureInfo) -> None:
         self._conn = conn
         self.info = info
+        # Real-time protection looks signatures up from its worker
+        # thread while the connection was opened on the caller's
+        # thread — serialize lookups so the connection stays sound.
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Loading + integrity
@@ -163,7 +168,9 @@ class SignatureDB:
             raise SignatureError(f"signature database not found: {db_path}")
 
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, check_same_thread=False
+            )
         except sqlite3.Error as exc:
             raise SignatureError(f"could not open signature database: {exc}") from exc
 
@@ -232,10 +239,11 @@ class SignatureDB:
     # ------------------------------------------------------------------
     def lookup(self, sha256: str) -> SignatureHit | None:
         """Return the signature matching *sha256*, or None if clean."""
-        row = self._conn.execute(
-            "SELECT sha256, name, family, severity FROM hashes WHERE sha256 = ?",
-            (sha256.lower(),),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT sha256, name, family, severity FROM hashes WHERE sha256 = ?",
+                (sha256.lower(),),
+            ).fetchone()
         if row is None:
             return None
         return SignatureHit(sha256=row[0], name=row[1], family=row[2], severity=row[3])
