@@ -144,6 +144,29 @@ def test_register_rejects_incomplete_properties():
         register_antivirus({"displayName": "x"}, wmi_factory=lambda: FakeWMI())
 
 
+def test_register_require_existing_exe(tmp_path):
+    # Regression (fix #27): with require_existing_exe=True the
+    # product exe named in the properties must exist on disk —
+    # Windows Security is never told a missing program is the
+    # machine's antivirus. Without the flag (fake-WMI unit tests,
+    # path arithmetic) behaviour is unchanged.
+    props = _props()  # paths under C:\Program Files\... do not exist here
+    wmi = FakeWMI()
+    with pytest.raises(RegistrationUnavailable, match="does not exist"):
+        register_antivirus(
+            props, wmi_factory=lambda: wmi, require_existing_exe=True
+        )
+    assert wmi.store == []  # nothing was written
+    real_exe = tmp_path / "Argus.exe"
+    real_exe.write_bytes(b"MZ")
+    props = _props()
+    props["pathToSignedProductExe"] = str(real_exe)
+    register_antivirus(
+        props, wmi_factory=lambda: wmi, require_existing_exe=True
+    )
+    assert len(wmi.store) == 1
+
+
 def test_registration_unavailable_off_windows(monkeypatch):
     monkeypatch.setattr("argus.winregister.sys.platform", "linux")
     with pytest.raises(RegistrationUnavailable):
