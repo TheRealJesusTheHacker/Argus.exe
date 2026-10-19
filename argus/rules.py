@@ -28,13 +28,23 @@ rule-scanned — the caller notes the skip; executable content is
 matched at any size (see :mod:`argus.scanner`), and hash-based
 detection applies regardless.
 
-Abuse caps (v1.0.4): rules are data, and data can be hostile or just
-broken. Loading caps the rule count, each pattern's length, and each
-pattern's wildcard density — a rule that breaks a cap is rejected
-with a warning and the rest still load. Matching runs under a
-per-file time budget: when it expires, matching stops and the
-matcher says so (``budget_exceeded``) instead of grinding a CPU core
-on an adversarial file.
+Abuse caps (v1.0.4, hardened v1.1.0): rules are data, and data can
+be hostile or just broken. Loading caps the rule count, the total
+rules-file size (4 MiB — a larger file is refused outright with
+:class:`RuleError`), the patterns per rule (256), each pattern's
+length, and each pattern's wildcard density — a rule that breaks
+a cap is rejected with a warning and the rest still load.
+Matching runs under a per-file time budget: the budget is polled
+INSIDE pattern matching (every 64 KiB segment of a literal scan,
+periodically through a wildcard scan, between patterns and
+between rules), so even a single huge pattern in a single-rule
+matcher cannot overrun unboundedly; when the budget expires,
+matching stops and the matcher says so (``budget_exceeded``,
+surfaced honestly by :meth:`RuleMatcher.finish`) instead of
+grinding a CPU core on an adversarial file. If the budget dies
+before EOF, :meth:`RuleMatcher.finish` runs a tail pass over
+the last 8 MiB of the stream with the full matcher under a
+fresh budget, and the coverage note says both passes ran.
 """
 
 from __future__ import annotations
@@ -56,9 +66,23 @@ MAX_RULE_SCAN_SIZE = 64 * 1024 * 1024  # 64 MB
 MAX_RULES = 512
 MAX_PATTERN_LENGTH = 4096
 MAX_WILDCARD_RATIO = 0.5
+#: Cap on patterns in a single rule (v1.1.0 P1-14).
+MAX_PATTERNS_PER_RULE = 256
+#: Cap on the total size of a rules file, in bytes (v1.1.0 P1-14).
+#: Rules are small text; 4 MiB is generous for legitimate files
+#: and refuses a hostile/bloated one before it is even parsed.
+MAX_RULES_FILE_SIZE = 4 * 1024 * 1024  # 4 MiB
 
 #: Per-file wall-clock budget for pattern matching, in seconds.
 MATCH_TIME_BUDGET_SECONDS = 2.0
+
+#: The time budget is polled at least once per this many bytes
+#: scanned inside a single pattern search (v1.1.0 P1-14).
+BUDGET_POLL_BYTES = 64 * 1024  # 64 KiB
+
+#: How much of the stream's tail the budget tail pass re-matches
+#: when the primary pass dies before EOF (v1.1.0 P1-21).
+TAIL_PASS_SIZE = 8 * 1024 * 1024  # 8 MiB
 
 
 class RuleError(Exception):
@@ -119,17 +143,49 @@ class Pattern:
         return cls(data=bytes(data), mask=bytes(mask))
 
 
-def _find_pattern(haystack: bytes, pattern: Pattern) -> int:
-    """Return the offset of the first match of *pattern*, or -1."""
+def _find_pattern(haystack: bytes, pattern: Pattern, budget_check=None) -> int:
+    """Return the offset of the first match of *pattern*, or -1.
+
+    ``budget_check`` (v1.1.0 P1-14), when given, is polled INSIDE
+    the search — once per :data:`BUDGET_POLL_BYTES` (64 KiB)
+    segment of a literal scan, and every 1024 start positions of
+    a wildcard scan — and the search aborts with -1 as soon as it
+    reports the budget spent. Without it a single huge pattern
+    could run unboundedly far past the per-file budget before
+    any between-rules poll got a chance to notice.
+    """
     data = haystack.lower() if pattern.nocase else haystack
     if not pattern.has_wildcards:
-        return data.find(pattern.data)
+        needle = pattern.data
+        n, m = len(data), len(needle)
+        if m > n:
+            return -1
+        pos = 0
+        last_start = n - m
+        while pos <= last_start:
+            if pos > 0 and budget_check is not None and budget_check():
+                return -1
+            end = min(n, pos + BUDGET_POLL_BYTES + m - 1)
+            idx = data.find(needle, pos, end)
+            if idx >= 0:
+                return idx
+            if end >= n:
+                break
+            pos += BUDGET_POLL_BYTES
+        return -1
     # Wildcard search: anchor on the longest exact run, then verify.
     needle, mask = pattern.data, pattern.mask
     n, m = len(data), len(needle)
     if m > n:
         return -1
     for start in range(n - m + 1):
+        if (
+            start > 0
+            and start % 1024 == 0
+            and budget_check is not None
+            and budget_check()
+        ):
+            return -1
         for j in range(m):
             if mask[j] and data[start + j] != needle[j]:
                 break
@@ -166,6 +222,12 @@ class Rule:
             )
         if not self.patterns:
             raise RuleError(f"rule {self.name!r}: at least one pattern is required")
+        if len(self.patterns) > MAX_PATTERNS_PER_RULE:
+            raise RuleError(
+                f"rule {self.name!r}: {len(self.patterns)} patterns "
+                f"(cap is {MAX_PATTERNS_PER_RULE}) — a rule with an "
+                "unbounded pattern list makes matching cost unbounded too"
+            )
         for pattern in self.patterns:
             if pattern.length > MAX_PATTERN_LENGTH:
                 raise RuleError(
@@ -235,18 +297,37 @@ class RuleHit:
 class RuleMatcher:
     """Streaming matcher: feed file chunks, then call :meth:`finish`.
 
-    Memory use is bounded by the longest pattern, not the file size:
-    only a tail of ``max_pattern_length - 1`` bytes is carried between
-    chunks so patterns straddling a chunk boundary still match.
+    Memory use is bounded: a tail of ``max_pattern_length - 1``
+    bytes is carried between chunks so patterns straddling a
+    chunk boundary still match, plus (v1.1.0 P1-21) a rolling
+    copy of the last :data:`TAIL_PASS_SIZE` (8 MiB) of the stream,
+    kept so the tail pass below can re-match the end of the file
+    even when the primary pass died long before EOF.
 
     Matching runs under a per-file time budget
     (:data:`MATCH_TIME_BUDGET_SECONDS`): once it expires, feed()
-    becomes a no-op and :attr:`budget_exceeded` is set — the caller
-    notes the partial coverage instead of pretending the file was
-    fully matched. The budget is polled between rules inside a
-    feed as well as between feeds, so one huge chunk cannot run
-    unboundedly far past it; the worst overshoot is a single
-    pattern scan over the current window.
+    stops MATCHING (it still records the stream tail) and
+    :attr:`budget_exceeded` is set — the caller notes the partial
+    coverage instead of pretending the file was fully matched.
+    The budget is polled between feeds, between rules, between
+    patterns, and INSIDE a pattern search every
+    :data:`BUDGET_POLL_BYTES` (v1.1.0 P1-14), so not even one
+    huge pattern in a one-rule matcher can run unboundedly far
+    past it — and :meth:`finish` polls the budget one last time,
+    so a budget that died inside that single rule's scan is
+    still reported honestly instead of being hidden by the lack
+    of a "next rule" to poll at.
+
+    Tail pass (v1.1.0 P1-21): when :meth:`finish` finds the
+    primary budget was exceeded, it re-runs the FULL matcher
+    over the retained last-8-MiB tail under a FRESH budget and
+    merges any hits, sets :attr:`tail_pass_ran`, and writes
+    :attr:`coverage_note` stating that both passes ran (coverage
+    is still partial — the middle may be unmatched).
+    ``argus.scanner.scan_file`` prefers this matcher's
+    ``coverage_note`` when present (fix round 2, FIX 6) and only
+    falls back to its plain budget note when no matcher produced
+    one.
 
     Time is read through the instance's ``_clock`` attribute
     (``time.monotonic`` in production). Tests substitute a
@@ -266,6 +347,18 @@ class RuleMatcher:
         self._started: float | None = None
         self._clock = time.monotonic
         self.budget_exceeded = False
+        #: True once the budget death is attributed to the primary
+        #: (streaming) pass — the tail pass runs under its own.
+        self.primary_budget_exceeded = False
+        #: Tail pass state (see the class docstring).
+        self.tail_pass_ran = False
+        self.tail_pass_budget_exceeded = False
+        #: Human-readable partial-coverage note, set when the
+        #: budget was exceeded; states both passes when both ran.
+        self.coverage_note: str | None = None
+        self.bytes_fed = 0
+        self._stream_tail = bytearray()
+        self._tail_pass_done = False
 
     def _budget_spent(self) -> bool:
         """True when the per-file matching budget has expired."""
@@ -275,15 +368,30 @@ class RuleMatcher:
         )
 
     def _note_budget_exceeded(self) -> None:
+        if not self.budget_exceeded:
+            log.warning(
+                "rule matching stopped: per-file time budget "
+                "(%.1fs) exhausted — coverage is partial",
+                self._time_budget,
+            )
         self.budget_exceeded = True
-        log.warning(
-            "rule matching stopped: per-file time budget "
-            "(%.1fs) exhausted — coverage is partial",
-            self._time_budget,
-        )
+        self.primary_budget_exceeded = True
+
+    def _capture_tail(self, chunk: bytes) -> None:
+        """Retain the last :data:`TAIL_PASS_SIZE` bytes fed, even
+        after matching has stopped — the tail pass needs the true
+        end of the stream, not the end of the budget."""
+        self.bytes_fed += len(chunk)
+        self._stream_tail.extend(chunk)
+        excess = len(self._stream_tail) - TAIL_PASS_SIZE
+        if excess > 0:
+            del self._stream_tail[:excess]
 
     def feed(self, chunk: bytes) -> None:
-        if not chunk or not self._rules or self.budget_exceeded:
+        if not chunk or not self._rules:
+            return
+        self._capture_tail(chunk)
+        if self.budget_exceeded:
             return
         if self._started is None:
             self._started = self._clock()
@@ -291,7 +399,10 @@ class RuleMatcher:
             self._note_budget_exceeded()
             return
         window = self._tail + chunk
+        stop = False
         for idx, rule in enumerate(self._rules):
+            if stop:
+                break
             if idx > 0 and self._budget_spent():
                 self._note_budget_exceeded()
                 break
@@ -301,11 +412,71 @@ class RuleMatcher:
             for p_idx, pattern in enumerate(rule.patterns):
                 if p_idx in already:
                     continue
-                if _find_pattern(window, pattern) >= 0:
+                if self._budget_spent():
+                    self._note_budget_exceeded()
+                    stop = True
+                    break
+                if (
+                    _find_pattern(
+                        window, pattern, budget_check=self._budget_spent
+                    )
+                    >= 0
+                ):
                     already.add(p_idx)
+                if self._budget_spent():
+                    # The budget died inside (or just after) this
+                    # one pattern scan — true even for a matcher
+                    # with a single rule and a single pattern.
+                    self._note_budget_exceeded()
+                    stop = True
+                    break
         self._tail = window[-self._keep :] if self._keep else b""
 
+    def _run_tail_pass(self) -> None:
+        """Re-match the retained tail under a fresh budget and
+        merge the hits into this matcher's results."""
+        tail = bytes(self._stream_tail)
+        fresh = RuleMatcher(self._rules, time_budget=self._time_budget)
+        fresh._clock = self._clock
+        fresh._tail_pass_done = True  # a tail pass never recurses
+        fresh.feed(tail)
+        if fresh._started is not None and fresh._budget_spent():
+            fresh._note_budget_exceeded()
+        for idx, pats in fresh._matched.items():
+            self._matched.setdefault(idx, set()).update(pats)
+        self.tail_pass_ran = True
+        self.tail_pass_budget_exceeded = bool(fresh.budget_exceeded)
+        self.coverage_note = (
+            "pattern matching stopped early: the per-file rule time "
+            "budget was exhausted during the primary (streaming) "
+            f"pass; a tail pass over the last {len(tail)} bytes "
+            "(up to 8 MB) then ran with the full matcher under a "
+            "fresh budget — both passes ran, but coverage is still "
+            "partial: content between the primary-pass cutoff and "
+            "the tail window may not have been rule-matched (the "
+            "file was still hashed and checked against signatures)"
+        )
+
     def finish(self) -> list[RuleHit]:
+        if (
+            self._started is not None
+            and not self.budget_exceeded
+            and self._budget_spent()
+        ):
+            # Honest surface for the single-rule case: the budget
+            # died during matching and no later poll noticed.
+            self._note_budget_exceeded()
+        if self.budget_exceeded and not self._tail_pass_done:
+            self._tail_pass_done = True
+            if self._stream_tail:
+                self._run_tail_pass()
+            else:
+                self.coverage_note = (
+                    "pattern matching stopped early: the per-file "
+                    "rule time budget was exhausted during the "
+                    "primary (streaming) pass and no stream data "
+                    "was retained for a tail pass — coverage is partial"
+                )
         hits: list[RuleHit] = []
         for idx, rule in enumerate(self._rules):
             matched = self._matched.get(idx, set())
@@ -316,12 +487,35 @@ class RuleMatcher:
             hits.append(RuleHit(rule=rule, matched=sorted(matched)))
         return hits
 
+    @property
+    def partial_coverage(self) -> bool:
+        """True when matching stopped early (budget) — with or
+        without the tail pass, the whole stream was not matched
+        by a single complete pass."""
+        return self.budget_exceeded
+
 
 def evaluate_rules(rules: list[Rule], data: bytes) -> list[RuleHit]:
     """One-shot convenience: evaluate *rules* against an in-memory buffer."""
     matcher = RuleMatcher(rules)
     matcher.feed(data)
     return matcher.finish()
+
+
+def evaluate_stream(
+    chunks, rules: list[Rule], *, time_budget: float = MATCH_TIME_BUDGET_SECONDS
+) -> tuple[list[RuleHit], RuleMatcher]:
+    """Streaming convenience: feed *chunks* through a matcher and
+    finish it, returning ``(hits, matcher)`` so callers can read
+    the honest result surface (``budget_exceeded``,
+    ``tail_pass_ran``, ``coverage_note``). This is the streaming
+    API the tail pass (P1-21) lives behind: when the primary
+    budget dies before EOF, ``finish()`` has already run the
+    last-8-MiB tail pass by the time this returns."""
+    matcher = RuleMatcher(rules, time_budget=time_budget)
+    for chunk in chunks:
+        matcher.feed(chunk)
+    return matcher.finish(), matcher
 
 
 def load_rules(path: Path | str) -> list[Rule]:
@@ -331,9 +525,27 @@ def load_rules(path: Path | str) -> list[Rule]:
     :class:`RuleError`. Individual broken or over-cap rules are
     rejected with a logged warning while the rest still load — one
     bad rule must not disarm all the others. At most
-    :data:`MAX_RULES` rules are loaded.
+    :data:`MAX_RULES` rules are loaded. A file larger than
+    :data:`MAX_RULES_FILE_SIZE` (4 MiB) is refused outright with
+    :class:`RuleError` before it is parsed (v1.1.0 P1-14).
     """
-    text = Path(path).read_text(encoding="utf-8")
+    rules_path = Path(path)
+    try:
+        file_size = rules_path.stat().st_size
+    except OSError:
+        file_size = None  # read_text below raises the honest error
+    if file_size is not None and file_size > MAX_RULES_FILE_SIZE:
+        raise RuleError(
+            f"rules file is {file_size} bytes, exceeding the "
+            f"{MAX_RULES_FILE_SIZE}-byte (4 MiB) cap — refusing to "
+            "load it; split or trim the rules file"
+        )
+    text = rules_path.read_text(encoding="utf-8")
+    if len(text.encode("utf-8")) > MAX_RULES_FILE_SIZE:
+        raise RuleError(
+            f"rules file exceeds the {MAX_RULES_FILE_SIZE}-byte "
+            "(4 MiB) cap — refusing to load it"
+        )
     try:
         specs = json.loads(text)
     except json.JSONDecodeError as exc:
