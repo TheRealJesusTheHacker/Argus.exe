@@ -130,7 +130,13 @@ def test_signed_pe_loses_points_but_not_its_verdict(tmp_path, db):
 def test_malformed_exe_fails_safe(tmp_path, db):
     (tmp_path / "broken.exe").write_bytes(b"MZ" + b"\x99" * 500)
     report = scan_path(tmp_path, db, BUILTIN_RULES)
-    scanned = report.files[0]
+    # By path, not files[0]: the db fixture's files share this
+    # directory and enumeration order is filesystem-dependent —
+    # on the Linux CI filesystem files[0] was the signature DB,
+    # not broken.exe (v1.2.0 build; see test_scanner.py).
+    scanned = next(
+        f for f in report.files if f.result.path.name == "broken.exe"
+    )
     assert scanned.result.ok  # the scan itself completed
     assert any("could not be parsed" in n for n in scanned.assessment.notes)
 
