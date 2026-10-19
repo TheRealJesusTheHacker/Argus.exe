@@ -1,14 +1,20 @@
 """Heuristic analysis orchestration for ARGUS.EXE.
 
-Given a file, decide what kind of analysis applies and run it:
+Given a file, decide what kind of analysis applies and run it.
+**Content decides, not the file name** (v1.0.4): the first bytes are
+sniffed — MZ magic means PE analysis whatever the extension says,
+script markers mean script analysis — and a name that disagrees
+with the content is itself a signal. Extension-only routing let a
+``payload.txt`` that is really an executable sail past every check.
 
-- **Windows executables** (.exe/.dll/.sys/.scr and kin): parse the PE
-  structure, then make one streamed content pass computing entropy
-  (whole file, sliding windows, per section) and extracting strings.
-  Structure + content become signals via
-  :mod:`argus.heuristics.signals`.
-- **Scripts** (.ps1/.bat/.cmd/.vbs/.js/.jse/.wsf/.hta): decode the text
-  and run the script signal library.
+- **Windows executables**: parse the PE structure, then make one
+  streamed content pass computing entropy (whole file, sliding
+  windows, per section), extracting strings, and running the
+  cap-independent high-value needle search. Structure + content
+  become signals via :mod:`argus.heuristics.signals`.
+- **Scripts**: decode the text (BOM-aware, plus BOM-less UTF-16)
+  and run the script signal library on what the interpreter would
+  actually see.
 - **Any file**: filename signals (double extensions, invisible
   right-to-left override characters, system-binary masquerades) need
   no content at all.
@@ -59,6 +65,58 @@ SCRIPT_EXTENSIONS = {
     ".ps1", ".bat", ".cmd", ".vbs", ".js", ".jse", ".wsf", ".hta",
     ".psm1", ".btm",
 }
+
+#: How many head bytes are sniffed to decide the content kind.
+_SNIFF_BYTES = 8192
+
+#: Byte markers that give a script away whatever its extension.
+_SCRIPT_MARKERS = (
+    b"powershell", b"invoke-expression", b"invoke-command",
+    b"wscript.shell", b"@echo off", b"cscript", b"mshta", b"#!/",
+)
+
+#: The high-value needles the streaming search hunts for (see
+#: :class:`_NeedleSearcher`) — exactly the strings the signal
+#: library looks up via ``StringIndex.contains``.
+_HIGH_VALUE_NEEDLES = (
+    "lsass", "sekurlsa",
+    "currentversion\\run", "currentversion/run",
+    "schedule.service", "itaskservice",
+    "amsiinitfailed", "amsiscanbuffer",
+    "requireadministrator", "highestavailable",
+    "vmware", "virtualbox", "vbox", "vmtoolsd", "vmmouse", "qemu",
+    "sandboxie", "sbie", "virtual pc", "hyper-v", "xen",
+)
+
+
+class _NeedleSearcher:
+    """Streaming search for the high-value needle set.
+
+    Independent of string EXTRACTION: it runs on the raw stream
+    (ASCII and UTF-16LE forms) with a rolling tail, so it keeps
+    working after the extraction cap truncates — flooding a file
+    with junk strings cannot hide the needles that matter.
+    """
+
+    def __init__(self, needles: tuple[str, ...] = _HIGH_VALUE_NEEDLES) -> None:
+        self._ascii = [(n, n.encode("ascii")) for n in needles]
+        self._u16 = [(n, n.encode("utf-16-le")) for n in needles]
+        self._keep = max(len(n) for _, n in self._u16) - 1
+        self._tail = b""
+        self.hits: set[str] = set()
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        window = self._tail + chunk
+        lowered = window.lower()
+        for name, needle in self._ascii:
+            if name not in self.hits and needle in lowered:
+                self.hits.add(name)
+        for name, needle in self._u16:
+            if name not in self.hits and needle in lowered:
+                self.hits.add(name)
+        self._tail = window[-self._keep:] if self._keep else b""
 
 
 @dataclass
@@ -248,8 +306,27 @@ def extract_strings(path: Path, cap: int = MAX_HEURISTIC_SCAN_SIZE) -> StringInd
 # ----------------------------------------------------------------------
 # Analysis entry point
 # ----------------------------------------------------------------------
+def _read_head(path: Path, count: int = _SNIFF_BYTES) -> bytes:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(count)
+    except OSError:
+        return b""
+
+
+def _looks_like_script(head: bytes) -> bool:
+    lowered = head.lower()
+    return any(marker in lowered for marker in _SCRIPT_MARKERS)
+
+
 def analyze_file(path: Path, size: int | None = None) -> HeuristicReport:
     """Run the heuristic analysis appropriate for *path*.
+
+    Routing is content-first: MZ magic → PE analysis whatever the
+    extension; script markers → script analysis; the extension is
+    the fallback hint. A name that disagrees with the content earns
+    a ``content_extension_mismatch`` signal — masquerading is the
+    point of the disagreement.
 
     Never raises for file-content problems: unreadable or malformed
     content yields notes on the report, not exceptions. (Filesystem
@@ -269,6 +346,56 @@ def analyze_file(path: Path, size: int | None = None) -> HeuristicReport:
                 notes=[f"heuristics could not stat file: {exc.strerror or exc}"],
             )
 
+    head = _read_head(path) if size > 0 else b""
+    pe_content = head.startswith(b"MZ")
+    script_content = _looks_like_script(head)
+
+    # Content outranks extension in BOTH directions: an MZ file is
+    # a program whatever it is named, and a file whose contents are
+    # script commands gets script analysis even when it wears an
+    # executable's name (the disguise is itself the signal below).
+    if pe_content:
+        report = HeuristicReport(kind="pe", signals=signals, notes=notes)
+        if ext not in PE_EXTENSIONS:
+            report.signals.append(
+                Signal(
+                    name="content_extension_mismatch",
+                    severity="high",
+                    points=30,
+                    explanation=(
+                        "This file IS a Windows program (its contents "
+                        f"start with the MZ executable signature) but "
+                        f"its name ends in '{ext or '(no extension)'}', "
+                        "which does not say 'program'. Disguising an "
+                        "executable as a document or data file is a "
+                        "classic masquerade."
+                    ),
+                )
+            )
+        _analyze_pe(path, size, report)
+        return report
+
+    if script_content:
+        report = HeuristicReport(kind="script", signals=signals, notes=notes)
+        if ext not in SCRIPT_EXTENSIONS and ext:
+            report.signals.append(
+                Signal(
+                    name="script_extension_mismatch",
+                    severity="medium",
+                    points=15,
+                    explanation=(
+                        "This file's contents are a script (they "
+                        f"contain script commands) but its name ends "
+                        f"in '{ext}', which does not say 'script'. "
+                        "Scripts wearing innocent extensions are a "
+                        "common delivery disguise."
+                    ),
+                )
+            )
+        _analyze_script(path, size, report)
+        return report
+
+    # No decisive content: the extension is the fallback hint.
     if ext in PE_EXTENSIONS:
         report = HeuristicReport(kind="pe", signals=signals, notes=notes)
         _analyze_pe(path, size, report)
@@ -288,7 +415,7 @@ def _analyze_pe(path: Path, size: int, report: HeuristicReport) -> None:
         pe = parse_pe(path)
     except PEError as exc:
         report.notes.append(
-            f"file has a Windows-executable extension but could not be "
+            f"file presents as a Windows executable but could not be "
             f"parsed as one: {exc}"
         )
     except OSError as exc:
@@ -308,10 +435,27 @@ def _analyze_pe(path: Path, size: int, report: HeuristicReport) -> None:
         )
         if pe is not None:
             report.signals.extend(pe_signals(pe, StringIndex(), EntropySummary()))
+        # Verdict floor: an executable too large for full analysis
+        # is never waved through as Clean on structure alone.
+        report.signals.append(
+            Signal(
+                name="oversize_not_fully_analyzed",
+                severity="medium",
+                points=25,
+                explanation=(
+                    "This executable is too large for Argus's full "
+                    "content analysis, so only its structure, "
+                    "signatures, and pattern rules were checked. "
+                    "Argus rates it at least Suspicious rather than "
+                    "calling a file it could not fully read 'clean'."
+                ),
+            )
+        )
         return
 
     # One streamed content pass: entropy (whole + windows + per
-    # section) and string extraction share the read.
+    # section), string extraction, and the cap-independent needle
+    # search share the read.
     entropy = EntropyAnalyzer()
     sections = SectionEntropyTracker(
         [(s.raw_offset, s.raw_offset + s.raw_size) for s in pe.sections]
@@ -319,6 +463,7 @@ def _analyze_pe(path: Path, size: int, report: HeuristicReport) -> None:
         else []
     )
     extractor = _StringExtractor()
+    needles = _NeedleSearcher()
     try:
         offset = 0
         with open(path, "rb") as fh:
@@ -329,6 +474,7 @@ def _analyze_pe(path: Path, size: int, report: HeuristicReport) -> None:
                 entropy.feed(chunk)
                 sections.feed(offset, chunk)
                 extractor.feed(chunk)
+                needles.feed(chunk)
                 offset += len(chunk)
     except OSError as exc:
         report.notes.append(f"heuristics could not read file: {exc.strerror or exc}")
@@ -337,27 +483,47 @@ def _analyze_pe(path: Path, size: int, report: HeuristicReport) -> None:
     summary = entropy.finish()
     report.entropy = summary
     strings = extractor.finish()
+    strings.needle_hits = needles.hits
 
     if pe is not None:
         for idx, section in enumerate(pe.sections):
             section.entropy = sections.entropy_for(idx)
         report.signals.extend(pe_signals(pe, strings, summary))
-    elif summary.whole_entropy >= HIGH_ENTROPY_THRESHOLD:
+    else:
+        # Unparseable executable: a modest signal on its own, and
+        # together with high entropy it crosses into Suspicious —
+        # a "program" whose structure cannot be read AND whose
+        # contents look random is not entitled to a Clean verdict.
         report.signals.append(
             Signal(
-                name="high_entropy_unparsed_executable",
-                severity="medium",
-                points=15,
+                name="unparseable_executable",
+                severity="low",
+                points=10,
                 explanation=(
-                    "This file claims to be a Windows program but cannot "
-                    "be parsed as one, and its contents measure "
-                    f"{summary.whole_entropy:.1f} bits of entropy — nearly "
-                    "random, like packed or encrypted data. A program "
-                    "whose structure cannot even be read deserves "
-                    "suspicion."
+                    "This file presents as a Windows program but its "
+                    "structure could not be parsed, so Argus could "
+                    "not inspect its sections or imports. Corruption "
+                    "happens — but so does deliberate malformation to "
+                    "blind analyzers."
                 ),
             )
         )
+        if summary.whole_entropy >= HIGH_ENTROPY_THRESHOLD:
+            report.signals.append(
+                Signal(
+                    name="high_entropy_unparsed_executable",
+                    severity="medium",
+                    points=15,
+                    explanation=(
+                        "This file claims to be a Windows program but cannot "
+                        "be parsed as one, and its contents measure "
+                        f"{summary.whole_entropy:.1f} bits of entropy — nearly "
+                        "random, like packed or encrypted data. A program "
+                        "whose structure cannot even be read deserves "
+                        "suspicion."
+                    ),
+                )
+            )
 
 
 def _analyze_script(path: Path, size: int, report: HeuristicReport) -> None:
@@ -379,11 +545,21 @@ def _analyze_script(path: Path, size: int, report: HeuristicReport) -> None:
 
 
 def _decode_script(raw: bytes) -> str:
-    """Decode script bytes: BOM-aware UTF-16/UTF-8, else latin-1."""
+    """Decode script bytes: BOM-aware UTF-16/UTF-8, BOM-less
+    UTF-16LE detected by NUL density, else latin-1.
+
+    PowerShell writes UTF-16LE; plenty of droppers ship it WITHOUT
+    the BOM. Without the NUL-density check such a file "decodes" as
+    UTF-8 with a NUL between every character and every text check
+    silently misses — the exact hole the UTF-16 cradle audit found.
+    """
     if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
         return raw.decode("utf-16", errors="replace")
     if raw.startswith(b"\xef\xbb\xbf"):
         return raw.decode("utf-8-sig", errors="replace")
+    sample = raw[:8192]
+    if sample and sample.count(b"\x00") * 4 > len(sample):
+        return raw.decode("utf-16-le", errors="replace")
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
