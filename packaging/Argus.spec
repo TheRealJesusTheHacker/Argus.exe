@@ -16,16 +16,30 @@
 
 from pathlib import Path
 
+# PyInstaller 6 does NOT inject the Windows version-info classes
+# into the spec namespace — they must be imported explicitly, or
+# the build dies with NameError the first time the spec runs
+# (v1.1.1 build, step 7). Import exactly the classes used below.
+from PyInstaller.utils.win32.versioninfo import (
+    FixedFileInfo,
+    StringFileInfo,
+    StringStruct,
+    StringTable,
+    VSVersionInfo,
+    VarFileInfo,
+    VarStruct,
+)
+
 ROOT = Path(SPECPATH).parent
 
 # Windows version resource for the exe: File Explorer, the task
 # manager, and SmartScreen all read THIS — an exe with no version
-# info looks anonymous. Version 1.1.0 matches argus.__version__
+# info looks anonymous. Version 1.1.2 matches argus.__version__
 # (the release workflow's tag check keeps them from drifting).
 version_info = VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 1, 0, 0),
-        prodvers=(1, 1, 0, 0),
+        filevers=(1, 1, 2, 0),
+        prodvers=(1, 1, 2, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -46,7 +60,7 @@ version_info = VSVersionInfo(
                             "FileDescription",
                             "ARGUS.EXE — antivirus & malware detector",
                         ),
-                        StringStruct("FileVersion", "1.1.0.0"),
+                        StringStruct("FileVersion", "1.1.2.0"),
                         StringStruct("InternalName", "Argus"),
                         StringStruct(
                             "LegalCopyright",
@@ -54,7 +68,7 @@ version_info = VSVersionInfo(
                         ),
                         StringStruct("OriginalFilename", "Argus.exe"),
                         StringStruct("ProductName", "ARGUS.EXE"),
-                        StringStruct("ProductVersion", "1.1.1"),
+                        StringStruct("ProductVersion", "1.1.2"),
                     ],
                 )
             ]
