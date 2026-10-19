@@ -437,7 +437,14 @@ def test_trust_split_paths(data_env):
     root = data_env
     assert shared_dir() == root / "shared"
     assert default_history_db() == root / "shared" / "history.db"
-    assert default_pending_db() == root / "shared" / "pending.db"
+    # v1.1.0 (P0-1): the pending DB is service-owned in the TRUSTED
+    # root; the shared location is now only the legacy path, and
+    # user-side readers use the service-published pending view.
+    assert default_pending_db() == root / "quarantine" / "pending.db"
+    from argus.paths import legacy_shared_pending_db, pending_view_path
+
+    assert legacy_shared_pending_db() == root / "shared" / "pending.db"
+    assert pending_view_path() == root / "shared" / "pending-view.json"
     assert default_status_file() == root / "shared" / "argus-status.json"
     assert vault_view_path() == root / "shared" / "vault-view.json"
     assert requests_dir() == root / "shared" / "requests"
@@ -657,6 +664,9 @@ def test_approve_refuses_when_file_changed(tmp_path):
 
 
 def test_delete_direct_verifies_hash(tmp_path):
+    # v1.1.0 (P2): direct=True was removed — delete always routes
+    # through the vault, whose fingerprint check still refuses a
+    # swapped file.
     vault, engine = _engine(tmp_path)
     try:
         target = tmp_path / "evil.exe"
@@ -666,15 +676,20 @@ def test_delete_direct_verifies_hash(tmp_path):
             name="Test.Threat", severity="high", verdict="Malicious",
             reasons=["test"], sha256=digest,
         )
-        target.write_bytes(b"MZ different file entirely")
-        with pytest.raises(ActionError):
+        with pytest.raises(TypeError):
             engine.delete(target, info, confirmed=True, direct=True)
+        target.write_bytes(b"MZ different file entirely")
+        from argus.quarantine import QuarantineError
+
+        with pytest.raises(QuarantineError):
+            engine.delete(target, info, confirmed=True)
         assert target.exists()
-        # The matching file deletes fine.
+        # The matching file deletes fine (via the vault).
         target.write_bytes(b"MZ original")
-        outcome = engine.delete(target, info, confirmed=True, direct=True)
+        outcome = engine.delete(target, info, confirmed=True)
         assert outcome.done
         assert not target.exists()
+        assert vault.list_entries()[0].status == "deleted"
     finally:
         vault.close()
 
@@ -849,6 +864,7 @@ def test_request_channel_round_trip(data_env, tmp_path):
             DetectionInfo(
                 name="Test.Threat", severity="high",
                 verdict="Malicious", reasons=["round trip"],
+                sha256=hashlib.sha256(b"MZ pretend malware").hexdigest(),
             ),
             confirmed=True,
         )
@@ -878,6 +894,7 @@ def test_request_channel_round_trip(data_env, tmp_path):
             DetectionInfo(
                 name="Test.Threat", severity="high",
                 verdict="Malicious", reasons=["round trip 2"],
+                sha256=hashlib.sha256(b"MZ pretend malware").hexdigest(),
             ),
             confirmed=True,
         )
@@ -922,6 +939,7 @@ def test_vault_view_published_for_unprivileged_readers(data_env, tmp_path):
             DetectionInfo(
                 name="Test.Threat", severity="high",
                 verdict="Malicious", reasons=["view test"],
+                sha256=hashlib.sha256(b"MZ pretend malware").hexdigest(),
             ),
             confirmed=True,
         )
