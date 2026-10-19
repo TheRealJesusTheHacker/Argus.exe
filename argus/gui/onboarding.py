@@ -39,9 +39,24 @@ def needs_onboarding(config: ArgusConfig) -> bool:
 
 
 class OnboardingWizard(QWizard):
-    def __init__(self, backend: GuiBackend, parent=None):
+    def __init__(
+        self,
+        backend: GuiBackend,
+        parent=None,
+        *,
+        start_protection=None,
+    ):
         super().__init__(parent)
         self._backend = backend
+        # Invoked on an accepted finish (after apply()): the
+        # wizard's welcome page promises finishing turns protection
+        # on — this is the wire that makes the promise true. The
+        # app passes a starter that hands protection to the main
+        # window's controller (which routes by layout: service,
+        # setup, or in-process — honestly, in plain language).
+        self._start_protection = start_protection
+        #: True when the user finished (accepted), False on cancel.
+        self.completed_accepted = False
         self.setWindowTitle("Welcome to ARGUS.EXE")
         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
         self.setMinimumSize(560, 420)
@@ -69,7 +84,12 @@ class OnboardingWizard(QWizard):
             "in, so new files are checked the moment they appear.\n\n"
             "This short setup asks three things: where to watch, "
             "what to do when something is found, and proof that "
-            "detection works."
+            "detection works.\n\n"
+            "When you finish, Argus will ask your permission once "
+            "— the standard Windows prompt — to turn on always-on "
+            "protection, so it can watch even before you sign in. "
+            "There is nothing else to install and nothing else to "
+            "configure."
         )
         body.setWordWrap(True)
         layout.addWidget(body)
@@ -168,4 +188,7 @@ class OnboardingWizard(QWizard):
 
     def _on_finished(self, result_code: int) -> None:
         if result_code == QWizard.DialogCode.Accepted:
+            self.completed_accepted = True
             self.apply()
+            if self._start_protection is not None:
+                self._start_protection()
