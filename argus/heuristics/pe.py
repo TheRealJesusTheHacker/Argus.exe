@@ -70,6 +70,32 @@ _MAX_DLL_NAME_BYTES = 256
 #: WIN_CERTIFICATE type for PKCS#7 signed data (Authenticode).
 _CERT_TYPE_PKCS_SIGNED_DATA = 0x0002
 
+#: WIN_CERTIFICATE revision for Authenticode (WIN_CERT_REVISION_2_0).
+_CERT_REVISION = 0x0200
+
+#: Subject names Argus accepts as "Microsoft" for the system-file
+#: trust in :mod:`argus.heuristics.analyze`. Both spellings appear
+#: on genuine Windows code-signing certificates: operating-system
+#: components are signed "Microsoft Windows", other Microsoft
+#: binaries "Microsoft Corporation" (as Common Name and/or
+#: Organization). Pinned in ONE place so the field data from real
+#: machines only ever has to correct a single constant.
+MICROSOFT_SIGNER_NAMES = ("Microsoft Windows", "Microsoft Corporation")
+
+
+def signer_is_microsoft(info: "PEInfo") -> bool:
+    """True when *info*'s extracted signer identity is Microsoft —
+    the Common Name OR the Organization matches one of
+    :data:`MICROSOFT_SIGNER_NAMES` exactly — AND the identity is
+    backed by a structurally complete SignerInfo (see
+    :attr:`PEInfo.signer_info_complete`). Identity alone never
+    grants trust (see analyze.py): it must combine with a
+    structurally valid certificate AND a system location."""
+    return info.signer_info_complete and (
+        info.signer_name in MICROSOFT_SIGNER_NAMES
+        or info.signer_org in MICROSOFT_SIGNER_NAMES
+    )
+
 
 class PEError(Exception):
     """Raised when a file is not a parseable PE at all."""
@@ -129,6 +155,38 @@ class PEInfo:
     tls_callback_count: int | None = None
     signed: bool = False
     cert_size: int = 0
+    #: Signer identity from the certificate's signer certificate
+    #: (subject Common Name / Organization), extracted from the
+    #: PKCS#7 blob by a bounded DER walk. ``None`` when the file is
+    #: unsigned, the certificate is malformed, the blob does not
+    #: parse — OR the blob carries no structurally complete
+    #: SignerInfo for that certificate (see
+    #: ``signer_info_complete`` below): a name a certificate merely
+    #: *claims*, unbacked by a complete signer entry, yields NO
+    #: identity and therefore no identity-based trust. Chain /
+    #: digest verification remains future work, exactly as for the
+    #: "signed" credit above.
+    signer_name: str | None = None
+    signer_org: str | None = None
+    #: True when the PKCS#7 carries a structurally COMPLETE
+    #: SignerInfo for the signer certificate: an entry in the
+    #: SignedData ``signerInfos`` set that references that very
+    #: certificate by issuer + serial, declares a digest
+    #: algorithm, and carries a signature octet string of plausible
+    #: RSA length (>= 128 bytes). ``signer_name``/``signer_org``
+    #: are only populated when this is true — identity claimed by
+    #: a certificate alone ("first-cert-only"), with a missing,
+    #: dangling, or toy-length signature, earns NO identity and
+    #: therefore no identity-based trust (v1.1.0 hunt P0-3).
+    signer_info_complete: bool = False
+    #: True when a signer identity could be EXTRACTED from the
+    #: certificate (the PKCS#7 DER-parses as SignedData and a
+    #: signer certificate with a subject name is present) —
+    #: regardless of SignerInfo completeness or of WHO the signer
+    #: is. This is the (weaker, structural) bar for the signed
+    #: score trim (P1-20): structure, not identity, and never a
+    #: substitute for the completeness gate above.
+    has_extracted_signer: bool = False
     #: True when a certificate region was claimed but failed
     #: structural validation — it is overlay data, NOT a signature.
     cert_malformed: bool = False
@@ -320,20 +378,55 @@ def _parse(r: _Reader) -> PEInfo:
         sections=sections,
     )
 
+    # ---- overlay extent (needed before the certificate checks) --------
+    data_end = size_of_headers
+    for sec in sections:
+        if sec.raw_size:
+            data_end = max(data_end, sec.raw_offset + sec.raw_size)
+
     # ---- certificate table (Authenticode) ------------------------------
     # NOTE: for the certificate directory, the "RVA" field is a file
     # offset — the one exception in the PE format. The region only
     # counts as a signature if the WIN_CERTIFICATE chain inside it
     # is structurally sound (length-consistent, in bounds, PKCS
     # type) — malware can otherwise fake the "signed" trim by
-    # pointing the directory at junk bytes.
+    # pointing the directory at junk bytes. The certificate
+    # directory must also lie AT OR AFTER the end of the section
+    # data (``data_end``): a "certificate" overlapping real section
+    # bytes is not appended Authenticode data at all, it is a
+    # forgery planted inside the image (P1-20).
     cert_offset, cert_size = directories[DIR_CERTIFICATE]
     if cert_size >= 8 and 0 < cert_offset:
-        if cert_offset + cert_size <= r.size and _validate_certificate_table(
+        if cert_offset < data_end:
+            info.cert_malformed = True
+            info.cert_size = cert_size
+            info.warnings.append(
+                "certificate directory lies inside the section data "
+                "instead of after it — the claimed signature region "
+                "is treated as overlay data"
+            )
+        elif cert_offset + cert_size <= r.size and _validate_certificate_table(
             r, cert_offset, cert_size
         ):
             info.signed = True
             info.cert_size = cert_size
+            # Identity is a bonus on top of structural validity —
+            # and (P0-3) it is only granted when the blob carries
+            # a complete SignerInfo for the certificate. Any
+            # failure leaves the identity empty — never raises,
+            # never affects the "signed" fact itself.
+            try:
+                (
+                    info.signer_name,
+                    info.signer_org,
+                    info.signer_info_complete,
+                    info.has_extracted_signer,
+                ) = _extract_signer_identity(r, cert_offset)
+            except Exception:
+                info.signer_name = None
+                info.signer_org = None
+                info.signer_info_complete = False
+                info.has_extracted_signer = False
         else:
             info.cert_malformed = True
             info.cert_size = cert_size
@@ -343,10 +436,6 @@ def _parse(r: _Reader) -> PEInfo:
             )
 
     # ---- overlay --------------------------------------------------------
-    data_end = size_of_headers
-    for sec in sections:
-        if sec.raw_size:
-            data_end = max(data_end, sec.raw_offset + sec.raw_size)
     overlay_start = data_end
     if info.signed and cert_offset >= data_end:
         info.overlay_size = max(0, cert_offset - data_end)
@@ -396,13 +485,15 @@ def _validate_certificate_table(r: _Reader, offset: int, size: int) -> bool:
     ``offset``/``size`` (bounds are checked by the caller).
 
     Each entry: ``dwLength`` (u32, includes the 8-byte header),
-    ``wRevision`` (u16), ``wCertificateType`` (u16, must be
-    0x0002 for the first entry). Entries are 8-byte aligned; the
-    chain must exactly consume the table (final zero padding of
-    fewer than 8 bytes is tolerated). This is structural sanity —
-    it proves the region is a well-formed certificate table, NOT
-    that the signature is genuine (digest verification is future
-    work).
+    ``wRevision`` (u16, must be 0x0200 on EVERY entry),
+    ``wCertificateType`` (u16, must be 0x0002 on EVERY entry —
+    checking only the first let a valid-looking head vouch for
+    junk chained behind it, P1-20). Entries are 8-byte aligned;
+    the chain must exactly consume the table (final zero padding
+    of fewer than 8 bytes is tolerated). This is structural
+    sanity — it proves the region is a well-formed certificate
+    table, NOT that the signature is genuine (digest verification
+    is future work).
     """
     end = offset + size
     pos = offset
@@ -414,10 +505,13 @@ def _validate_certificate_table(r: _Reader, offset: int, size: int) -> bool:
             return not first and r.read_at(pos, remaining) == b"\x00" * remaining
         try:
             length = r.u32(pos)
+            revision = r.u16(pos + 4)
             cert_type = r.u16(pos + 6)
         except PEError:
             return False
-        if first and cert_type != _CERT_TYPE_PKCS_SIGNED_DATA:
+        if revision != _CERT_REVISION:
+            return False
+        if cert_type != _CERT_TYPE_PKCS_SIGNED_DATA:
             return False
         if length < 8 or length > remaining:
             return False
@@ -449,7 +543,15 @@ def _parse_imports(r: _Reader, rva_to_offset, imp_rva: int, is_64bit: bool) -> t
     work = 0
     for d in range(MAX_IMPORT_DESCRIPTORS):
         desc = base + d * 20
-        fields = struct.unpack("<IIIII", r.read_at(desc, 20))
+        try:
+            fields = struct.unpack("<IIIII", r.read_at(desc, 20))
+        except PEError:
+            # Descriptor loop ran into EOF (P1-19): keep every
+            # import parsed so far and flag the table truncated —
+            # the same fail-soft the thunk parser below uses —
+            # instead of raising and discarding the whole table.
+            truncated = True
+            break
         if fields == (0, 0, 0, 0, 0):
             break
         work += 1
@@ -460,7 +562,11 @@ def _parse_imports(r: _Reader, rva_to_offset, imp_rva: int, is_64bit: bool) -> t
         name_off = rva_to_offset(name_rva)
         if name_off is None:
             continue
-        dll_name = r.c_string(name_off, _MAX_DLL_NAME_BYTES)
+        try:
+            dll_name = r.c_string(name_off, _MAX_DLL_NAME_BYTES)
+        except PEError:
+            truncated = True  # name string runs off EOF: keep prior imports
+            break
 
         thunk_rva = original_first_thunk or first_thunk
         thunk_off = rva_to_offset(thunk_rva)
@@ -512,7 +618,14 @@ def _parse_imports(r: _Reader, rva_to_offset, imp_rva: int, is_64bit: bool) -> t
                     if name_entry is None:
                         continue
                     # 2-byte hint precedes the function name.
-                    functions.append(r.c_string(name_entry + 2, _MAX_NAME_BYTES))
+                    try:
+                        functions.append(
+                            r.c_string(name_entry + 2, _MAX_NAME_BYTES)
+                        )
+                    except PEError:
+                        truncated = True
+                        terminated = True
+                        break
             # (loop ends when terminated or truncated)
         if dll_name in imports:
             # The same DLL can appear in more than one descriptor
@@ -569,3 +682,316 @@ def _count_tls_callbacks(r: _Reader, rva_to_offset, tls_rva: int, image_base: in
             break
         count += 1
     return count
+
+
+# ----------------------------------------------------------------------
+# Signer identity extraction (bounded DER walk of the PKCS#7 blob)
+#
+# A real Authenticode blob is a PKCS#7 ContentInfo wrapping a
+# SignedData; the signer's certificate sits in SignedData's
+# certificate set, conventionally first, and its Subject name is
+# who the signature CLAIMS to speak for. Argus needs that claim to
+# recognise normal Windows system files ("Microsoft Windows").
+#
+# This is a structural walk, not a cryptographic verification:
+# every tag/length is bounds-checked, every deviation returns "no
+# identity", and nothing here can raise or loop (each step consumes
+# input or fails). Malformed DER therefore means "no identity,
+# no trust" — the fail-safe direction. Full chain + digest
+# verification stays future work, documented with the rest of the
+# signature model.
+# ----------------------------------------------------------------------
+
+#: DER content bytes of the OID 1.2.840.113549.1.7.2 (signedData).
+_OID_SIGNED_DATA = bytes.fromhex("2a864886f70d010702")
+#: DER content bytes of the attribute-type OIDs we read from a
+#: certificate Subject: 2.5.4.3 (commonName), 2.5.4.10 (organization).
+_OID_COMMON_NAME = bytes.fromhex("550403")
+_OID_ORGANIZATION = bytes.fromhex("55040a")
+
+_TAG_INTEGER = 0x02
+_TAG_OID = 0x06
+_TAG_SEQUENCE = 0x30
+_TAG_SET = 0x31
+_TAG_CONTEXT_0 = 0xA0  # [0] constructed: version (cert) / certs (SignedData)
+
+#: Cap on the PKCS#7 payload handed to the DER walker. Real
+#: Authenticode blobs are a few KB; the cap keeps a hostile cert
+#: table from making the parser chew a giant region.
+_MAX_PKCS7_BYTES = 1024 * 1024
+
+
+def _der_tlv(data: bytes, pos: int, end: int) -> tuple[int, int, int, int] | None:
+    """Read one DER TLV header at *pos* (bounded by *end*).
+
+    Returns ``(tag, content_start, content_end, next_pos)`` or None
+    for anything malformed: multi-byte tags, indefinite lengths,
+    over-long length fields, or a content span outside the buffer.
+    """
+    if pos + 2 > end:
+        return None
+    tag = data[pos]
+    if tag & 0x1F == 0x1F:
+        return None  # multi-byte tag numbers: not valid in this walk
+    first_len = data[pos + 1]
+    cursor = pos + 2
+    if first_len < 0x80:
+        length = first_len
+    elif first_len == 0x80:
+        return None  # indefinite length is not DER
+    else:
+        count = first_len & 0x7F
+        if count == 0 or count > 4 or cursor + count > end:
+            return None
+        length = int.from_bytes(data[cursor : cursor + count], "big")
+        cursor += count
+    content_end = cursor + length
+    if content_end > end:
+        return None
+    return tag, cursor, content_end, content_end
+
+
+def _der_children(data: bytes, start: int, end: int) -> list[tuple[int, int, int]] | None:
+    """Split the constructed value ``data[start:end]`` into child
+    TLVs as ``(tag, content_start, content_end)`` triples. None if
+    the children do not exactly tile the parent."""
+    children: list[tuple[int, int, int]] = []
+    pos = start
+    while pos < end:
+        parsed = _der_tlv(data, pos, end)
+        if parsed is None:
+            return None
+        tag, c_start, c_end, next_pos = parsed
+        children.append((tag, c_start, c_end))
+        pos = next_pos
+    if pos != end:
+        return None
+    return children
+
+
+def _der_string(data: bytes, tag: int, start: int, end: int) -> str | None:
+    """Decode a DER string value by its tag, or None when the tag
+    is a string type we do not read (or decoding fails)."""
+    raw = data[start:end]
+    try:
+        if tag in (0x0C, 0x13, 0x16, 0x1B):  # UTF8 / Printable / IA5 / Visible
+            return raw.decode("utf-8", errors="strict").strip()
+        if tag == 0x14:  # TeletexString: close enough as latin-1
+            return raw.decode("latin-1").strip()
+        if tag == 0x1E:  # BMPString: UTF-16BE
+            return raw.decode("utf-16-be").strip()
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return None
+
+
+def _parse_der_name(data: bytes, start: int, end: int) -> tuple[str | None, str | None]:
+    """Read an X.501 Name (SEQUENCE OF SET OF SEQUENCE {OID, value})
+    and return its ``(commonName, organization)`` — either may be
+    absent. Anything unexpected yields what was found so far."""
+    cn: str | None = None
+    org: str | None = None
+    rdns = _der_children(data, start, end)
+    if rdns is None:
+        return None, None
+    for tag, r_start, r_end in rdns:
+        if tag != _TAG_SET:
+            continue
+        attributes = _der_children(data, r_start, r_end)
+        if attributes is None:
+            continue
+        for a_tag, a_start, a_end in attributes:
+            if a_tag != _TAG_SEQUENCE:
+                continue
+            pair = _der_children(data, a_start, a_end)
+            if pair is None or len(pair) != 2:
+                continue
+            (oid_tag, o_start, o_end), (val_tag, v_start, v_end) = pair
+            if oid_tag != _TAG_OID:
+                continue
+            oid = data[o_start:o_end]
+            if oid == _OID_COMMON_NAME and cn is None:
+                cn = _der_string(data, val_tag, v_start, v_end)
+            elif oid == _OID_ORGANIZATION and org is None:
+                org = _der_string(data, val_tag, v_start, v_end)
+    return cn, org
+
+
+#: Minimum plausible length (bytes) for the RSA signature octet
+#: string on a SignerInfo: 1024-bit RSA signs at exactly 128.
+_MIN_SIGNATURE_OCTETS = 128
+_TAG_OCTET_STRING = 0x04
+_TAG_SET_OF = 0x31
+
+
+def _signer_info_is_complete(
+    blob: bytes,
+    signer_infos: tuple[int, int, int],
+    cert_issuer: tuple[str | None, str | None],
+    cert_serial: int,
+) -> bool:
+    """True when some SignerInfo in the SET at *signer_infos*
+    structurally completes the signature for the certificate
+    identified by *cert_issuer* + *cert_serial*:
+
+    - its ``issuerAndSerialNumber`` references that certificate
+      (issuer Name equal AND serial number equal),
+    - it declares a digest algorithm (an AlgorithmIdentifier
+      SEQUENCE whose first element is an OID),
+    - it carries a signature OCTET STRING of at least
+      :data:`_MIN_SIGNATURE_OCTETS` bytes (a plausible RSA length;
+      the known forgery's 2-byte signature fails here).
+
+    Any structural anomaly returns False — incomplete means no
+    identity, no trust."""
+    _tag, infos_start, infos_end = signer_infos
+    infos = _der_children(blob, infos_start, infos_end)
+    if not infos:
+        return False
+    for info_tag, info_start, info_end in infos:
+        if info_tag != _TAG_SEQUENCE:
+            continue
+        fields = _der_children(blob, info_start, info_end)
+        if fields is None or len(fields) < 4:
+            continue
+        # [0] version INTEGER, [1] issuerAndSerialNumber SEQUENCE.
+        if fields[0][0] != _TAG_INTEGER or fields[1][0] != _TAG_SEQUENCE:
+            continue
+        pair = _der_children(blob, fields[1][1], fields[1][2])
+        if pair is None or len(pair) != 2:
+            continue
+        (iss_tag, iss_start, iss_end), (ser_tag, ser_start, ser_end) = pair
+        if iss_tag != _TAG_SEQUENCE or ser_tag != _TAG_INTEGER:
+            continue
+        if _parse_der_name(blob, iss_start, iss_end) != cert_issuer:
+            continue
+        if int.from_bytes(blob[ser_start:ser_end], "big") != cert_serial:
+            continue
+        # [2] digestAlgorithm: SEQUENCE { OID, ... }.
+        if fields[2][0] != _TAG_SEQUENCE:
+            continue
+        alg = _der_children(blob, fields[2][1], fields[2][2])
+        if not alg or alg[0][0] != _TAG_OID:
+            continue
+        # A signature OCTET STRING of plausible RSA length among
+        # the remaining elements (after the optional [0]
+        # authenticated attributes and the digest-encryption
+        # algorithm SEQUENCE comes the encryptedDigest).
+        for f_tag, f_start, f_end in fields[3:]:
+            if f_tag == _TAG_OCTET_STRING and f_end - f_start >= _MIN_SIGNATURE_OCTETS:
+                return True
+    return False
+
+
+def _signer_from_pkcs7(
+    blob: bytes,
+) -> tuple[str | None, str | None, bool, bool]:
+    """Walk a PKCS#7 SignedData blob and return
+    ``(signer_cn, signer_org, signer_info_complete,
+    has_extracted_signer)``.
+
+    ``has_extracted_signer`` records that a signer certificate
+    with a subject name was extracted at all (the structural bar
+    for the signed score trim). The identity pair itself is only
+    returned when a structurally COMPLETE SignerInfo for that
+    certificate is present (see
+    :func:`_signer_info_is_complete`): a certificate that merely
+    *claims* a name — the first-cert-only forgery — yields
+    ``(None, None, False, True)``. Every step is verified against
+    the expected Authenticode shape; any deviation fails safe."""
+    none4: tuple[str | None, str | None, bool, bool] = (None, None, False, False)
+    top = _der_tlv(blob, 0, len(blob))
+    if top is None:
+        return none4
+    tag, start, end, _next = top
+    if tag != _TAG_SEQUENCE:
+        return none4
+    content_info = _der_children(blob, start, end)
+    if content_info is None or len(content_info) < 2:
+        return none4
+    oid_tag, o_start, o_end = content_info[0]
+    if oid_tag != _TAG_OID or blob[o_start:o_end] != _OID_SIGNED_DATA:
+        return none4
+    wrap_tag, w_start, w_end = content_info[1]
+    if wrap_tag != _TAG_CONTEXT_0:
+        return none4
+    signed_data = _der_children(blob, w_start, w_end)
+    if signed_data is None or len(signed_data) != 1:
+        return none4
+    sd_tag, sd_start, sd_end = signed_data[0]
+    if sd_tag != _TAG_SEQUENCE:
+        return none4
+    parts = _der_children(blob, sd_start, sd_end)
+    if parts is None:
+        return none4
+    # SignedData: version, digestAlgorithms, contentInfo come
+    # first; the certificate set ([0]) follows, before signerInfos.
+    certs: tuple[int, int, int] | None = None
+    certs_index = -1
+    for index in range(3, len(parts)):
+        if parts[index][0] == _TAG_CONTEXT_0:
+            certs = parts[index]
+            certs_index = index
+            break
+    if certs is None:
+        return none4
+    _c_tag, certs_start, certs_end = certs
+    certificates = _der_children(blob, certs_start, certs_end)
+    if not certificates:
+        return none4
+    cert_tag, cert_start, cert_end = certificates[0]
+    if cert_tag != _TAG_SEQUENCE:
+        return none4
+    cert_parts = _der_children(blob, cert_start, cert_end)
+    if not cert_parts:
+        return none4
+    tbs_tag, tbs_start, tbs_end = cert_parts[0]
+    if tbs_tag != _TAG_SEQUENCE:
+        return none4
+    fields = _der_children(blob, tbs_start, tbs_end)
+    if fields is None:
+        return none4
+    idx = 0
+    if idx < len(fields) and fields[idx][0] == _TAG_CONTEXT_0:
+        idx += 1  # [0] version
+    # serial (INTEGER), signature (SEQUENCE), issuer (Name),
+    # validity (SEQUENCE), subject (Name) — five fixed slots.
+    slots = fields[idx : idx + 5]
+    if len(slots) < 5:
+        return none4
+    if slots[0][0] != _TAG_INTEGER or slots[4][0] != _TAG_SEQUENCE:
+        return none4
+    cert_serial = int.from_bytes(blob[slots[0][1] : slots[0][2]], "big")
+    cert_issuer = _parse_der_name(blob, slots[2][1], slots[2][2])
+    subject = _parse_der_name(blob, slots[4][1], slots[4][2])
+    has_signer = subject[0] is not None or subject[1] is not None
+
+    # signerInfos: the SET that follows the certificate set.
+    signer_infos: tuple[int, int, int] | None = None
+    for part in parts[certs_index + 1 :]:
+        if part[0] == _TAG_SET_OF:
+            signer_infos = part
+            break
+    complete = (
+        signer_infos is not None
+        and _signer_info_is_complete(blob, signer_infos, cert_issuer, cert_serial)
+    )
+    if complete:
+        return subject[0], subject[1], True, has_signer
+    return None, None, False, has_signer
+
+
+def _extract_signer_identity(
+    r: _Reader, cert_offset: int
+) -> tuple[str | None, str | None, bool, bool]:
+    """Read the FIRST WIN_CERTIFICATE entry's PKCS#7 payload and
+    extract its signer's identity (see :func:`_signer_from_pkcs7`
+    for the four-tuple). The caller has already validated the
+    certificate table structurally, so the first entry's length
+    is sane; the payload read is still capped and the DER walk
+    itself fully defensive."""
+    length = r.u32(cert_offset)
+    if length < 8 or length > _MAX_PKCS7_BYTES + 8:
+        return None, None, False, False
+    payload = r.read_at(cert_offset + 8, length - 8)
+    return _signer_from_pkcs7(payload)
