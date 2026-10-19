@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import threading
@@ -42,12 +43,20 @@ from .actions import (
 from .config import DEFAULT_CONFIG_NAME, ArgusConfig
 from .detections import Verdict
 from .paths import (
+    data_dir,
     default_history_db,
     default_pending_db,
     default_vault_dir,
+    pending_view_path,
     vault_view_path,
 )
-from .quarantine import QuarantineEntry, QuarantineError, Vault, read_pending_db
+from .quarantine import (
+    QuarantineEntry,
+    QuarantineError,
+    Vault,
+    read_pending_db,
+    read_pending_view,
+)
 from .realtime import RealtimeEvent
 from .reporting import (
     DetectionRecord,
@@ -63,6 +72,7 @@ from .signatures import (
     SignatureDB,
     SignatureError,
     bootstrap_signature_db,
+    ensure_signature_db,
     init_db,
 )
 
@@ -176,9 +186,20 @@ def _report_to_dict(report: ScanReport) -> dict:
 # ----------------------------------------------------------------------
 # Subcommands
 # ----------------------------------------------------------------------
+def _resolve_sigdb_path(args: argparse.Namespace) -> Path:
+    """The signature database a sigdb command works on: the path
+    named on the command line, else the CONFIG's signature_db
+    (which itself defaults to the data folder — never a bare
+    CWD-relative filename)."""
+    if getattr(args, "path", None):
+        return Path(args.path)
+    return Path(load_config(args).signature_db)
+
+
 def _cmd_sigdb_init(args: argparse.Namespace) -> int:
-    info = init_db(args.path, seed=not args.no_seed)
-    print(f"Signature database created: {args.path}")
+    db_path = _resolve_sigdb_path(args)
+    info = init_db(db_path, seed=not args.no_seed)
+    print(f"Signature database created: {db_path}")
     print(f"  Version: {info.version} (schema {info.schema_version})")
     print(f"  Built:   {info.built_at}")
     print(f"  Signatures: {info.count}")
@@ -189,13 +210,14 @@ def _cmd_sigdb_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_sigdb_info(args: argparse.Namespace) -> int:
+    db_path = _resolve_sigdb_path(args)
     try:
-        with SignatureDB.open(args.path) as db:
+        with SignatureDB.open(db_path) as db:
             info = db.info
     except SignatureError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return EXIT_ERROR
-    print(f"Signature database: {args.path}")
+    print(f"Signature database: {db_path}")
     print(f"  Version: {info.version} (schema {info.schema_version})")
     print(f"  Built:   {info.built_at}")
     print(f"  Signatures: {info.count}")
@@ -205,6 +227,34 @@ def _cmd_sigdb_info(args: argparse.Namespace) -> int:
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def resolve_config_path(args: argparse.Namespace) -> Path:
+    """THE config resolver (P1-15): every subcommand resolves its
+    config the same way — an explicit ``--config`` wins; otherwise
+    the machine config at ``<data dir>/argus-config.json``. No
+    subcommand defaults to a bare CWD-relative filename anymore
+    (watch and quarantine-allow used to read ``argus-config.json``
+    from whatever directory the shell happened to be in, while
+    others read none at all — the same command meant different
+    settings depending on where it was typed)."""
+    explicit = getattr(args, "config", None)
+    if explicit:
+        return Path(explicit)
+    return data_dir() / DEFAULT_CONFIG_NAME
+
+
+def load_config(args: argparse.Namespace) -> ArgusConfig:
+    """Load the config :func:`resolve_config_path` names for this
+    invocation, warning loudly (stderr) about a config that exists
+    but has problems. A missing default config is the normal
+    fresh-install case — defaults apply silently."""
+    path = resolve_config_path(args)
+    config = ArgusConfig.load(path)
+    if getattr(args, "config", None) or path.is_file():
+        for warning in config.load_warnings:
+            print(f"Config warning: {warning}", file=sys.stderr)
+    return config
 
 
 def _resolve_vault_dir(args, config: ArgusConfig | None) -> Path:
@@ -229,6 +279,27 @@ def _resolve_pending_db(args, config: ArgusConfig | None) -> Path:
     if config is not None and config.pending_db:
         return Path(config.pending_db)
     return default_pending_db()
+
+
+def _read_pending_loose(args, config: ArgusConfig | None) -> list:
+    """Pending rows for a caller that could NOT open the vault.
+
+    The pending database is service-owned and lives in the trusted
+    vault directory: an ELEVATED or portable/dev process can read
+    it directly (and does — that route keeps working), but a
+    standard-user process in the installed layout cannot, and must
+    NOT be handed the trusted path as its source. There the
+    service-published pending VIEW (shared/pending-view.json) is
+    the display source — the same interface the GUI uses.
+    """
+    db_path = _resolve_pending_db(args, config)
+    try:
+        readable = db_path.is_file() and os.access(db_path, os.R_OK)
+    except OSError:
+        readable = False
+    if readable:
+        return read_pending_db(db_path)
+    return read_pending_view(pending_view_path())
 
 
 def _open_vault(args, config: ArgusConfig | None) -> Vault:
@@ -288,7 +359,7 @@ def _run_scan_actions(
     try:
         engine = ActionEngine(
             vault, config or ArgusConfig(),
-            config_path=args.config, history=history,
+            config_path=str(resolve_config_path(args)), history=history,
         )
         taken: dict[str, str] = {}
         for scanned in malicious:
@@ -382,11 +453,12 @@ def _cmd_scan(args: argparse.Namespace) -> int:
 
     # Config first: without an explicit --db, the scan uses the
     # CONFIG's signature_db (the same database protection uses).
-    config = ArgusConfig.load(args.config)
-    if args.config:
-        for warning in config.load_warnings:
-            print(f"Config warning: {warning}", file=sys.stderr)
-    exclusions = config.exclusions if args.config else None
+    # The config is the resolved machine config (see
+    # resolve_config_path) — its exclusions apply to scans whether
+    # or not --config was typed, the same answers the GUI and the
+    # service read.
+    config = load_config(args)
+    exclusions = config.exclusions
 
     # Database bootstrap: with no explicit --db, Argus uses the
     # configured database — creating + seeding it on first run ONLY
@@ -407,13 +479,28 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     else:
         db_path = Path(config.signature_db)
         try:
-            bootstrap_signature_db(db_path)
+            info = bootstrap_signature_db(db_path)
+            if info is None:
+                info = ensure_signature_db(db_path)
             db = SignatureDB.open(db_path)
         except SignatureError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             print(f"Build a database first: python -m argus sigdb init {db_path}",
                   file=sys.stderr)
             return EXIT_ERROR
+        if info is not None and getattr(info, "auth_deferred", False):
+            # Fix round 2 (FIX 3): this account cannot read the
+            # signature-authentication key (it is kept with the
+            # protection service), so the database was verified
+            # structurally here; the service verifies it in full.
+            # The scan proceeds; the exit code is unaffected.
+            print(
+                "Note: this account can't read Argus's "
+                "signature-authentication key (it's kept with the "
+                "protection service), so this scan verified the "
+                "signature database's structure only — the "
+                "protection service verifies it in full."
+            )
 
     rules: list[Rule] = BUILTIN_RULES
     if args.rules:
@@ -463,7 +550,7 @@ def _print_event(event: RealtimeEvent) -> None:
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
-    config = ArgusConfig.load(args.config)
+    config = load_config(args)
     if args.dirs:
         config.watch_dirs = [Path(d.strip()) for d in args.dirs.split(",") if d.strip()]
     if args.db:
@@ -472,9 +559,6 @@ def _cmd_watch(args: argparse.Namespace) -> int:
         config.process_monitor_enabled = False
     if args.status_file:
         config.status_file = args.status_file
-
-    for warning in config.load_warnings:
-        print(f"Config warning: {warning}", file=sys.stderr)
 
     detections_seen = 0
 
@@ -525,19 +609,37 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_watch_status(args: argparse.Namespace) -> int:
-    status = read_status_file(args.status_file)
+    # Status path: an explicit --status-file wins; otherwise the
+    # RESOLVED config's status_file (whose default is the shared
+    # data folder — never a bare CWD-relative name).
+    config = load_config(args)
+    status_path = Path(args.status_file or config.status_file)
+    status = read_status_file(status_path)
     if status is None:
         print("Argus real-time protection: NOT RUNNING "
-              f"(no status file at {args.status_file}).")
+              f"(no status file at {status_path}).")
         print("Start it with: python -m argus watch")
         return EXIT_ERROR
+    # The GUI's gates, verbatim (P2 parity): the Service Control
+    # Manager's word outranks the heartbeat file — SCM running
+    # means RUNNING even when the heartbeat is stale (details
+    # syncing); SCM stopped + stale heartbeat means NOT RUNNING,
+    # said out loud.
+    from .winservice import assess_service_status, query_service_state
+
+    verdict, note = assess_service_status(status, query_service_state())
     if args.json:
         print(json.dumps(status, indent=2))
-        return EXIT_CLEAN
+        return EXIT_CLEAN if verdict == "running" else EXIT_ERROR
     state = status.get("state", "unknown")
     uptime = status.get("uptime_seconds")
     uptime_text = f"{uptime}s" if uptime is not None else "—"
-    print(f"Argus real-time protection: {state.upper()}")
+    if verdict == "running":
+        print(f"Argus real-time protection: {state.upper()}")
+    else:
+        print("Argus real-time protection: NOT RUNNING")
+    if note:
+        print(f"  Note: {note}")
     print(f"  Version: {status.get('version')}  "
           f"Started: {status.get('started_at')}  "
           f"Uptime: {uptime_text}")
@@ -549,7 +651,7 @@ def _cmd_watch_status(args: argparse.Namespace) -> int:
           f"Files excluded: {status.get('files_excluded')}  "
           f"Scan errors: {status.get('scan_errors')}")
     print(f"  Last heartbeat: {status.get('heartbeat_at')}")
-    return EXIT_CLEAN
+    return EXIT_CLEAN if verdict == "running" else EXIT_ERROR
 
 
 def _cmd_service(args: argparse.Namespace) -> int:
@@ -570,7 +672,7 @@ def _cmd_service(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     try:
         code = perform_service_command(
-            command, config_path=getattr(args, "config", None)
+            command, config_path=str(resolve_config_path(args))
         )
     except ServiceUnavailable as exc:
         print(f"argus service: {exc}")
@@ -612,7 +714,7 @@ def _confirm(prompt: str, yes_flag: bool) -> bool:
 
 def _cmd_quarantine_list(args: argparse.Namespace) -> int:
     try:
-        vault = _open_vault(args, None)
+        vault = _open_vault(args, load_config(args))
     except PermissionError:
         return _quarantine_list_from_view(args)
     try:
@@ -673,12 +775,25 @@ def _quarantine_list_from_view(args: argparse.Namespace) -> int:
 
 def _cmd_quarantine_restore(args: argparse.Namespace) -> int:
     try:
-        vault = _open_vault(args, None)
+        vault = _open_vault(args, load_config(args))
     except PermissionError:
-        entry = _find_view_entry(args.id)
+        entry, details, error_exit = _service_entry_details(args.id)
         if entry is None:
             print(f"Error: no vault entry matches '{args.id}'.", file=sys.stderr)
             return EXIT_ERROR
+        if error_exit is not None:
+            return error_exit
+        if details is not None:
+            print(
+                "The protection service reports: "
+                f"{details['original_path']} "
+                f"(detection: {details.get('detection_name') or '—'})."
+            )
+            return _via_service(
+                "restore",
+                entry_id=details["entry_id"],
+                sha256=details["sha256"],
+            )
         return _via_service(
             "restore", entry_id=entry["id"], sha256=entry.get("sha256")
         )
@@ -701,21 +816,35 @@ def _cmd_quarantine_restore(args: argparse.Namespace) -> int:
 
 def _cmd_quarantine_delete(args: argparse.Namespace) -> int:
     try:
-        vault = _open_vault(args, None)
+        vault = _open_vault(args, load_config(args))
     except PermissionError:
-        entry = _find_view_entry(args.id)
+        entry, details, error_exit = _service_entry_details(args.id)
         if entry is None:
             print(f"Error: no vault entry matches '{args.id}'.", file=sys.stderr)
             return EXIT_ERROR
+        if error_exit is not None:
+            return error_exit
+        shown_path = (
+            details["original_path"] if details is not None
+            else entry.get("original_path")
+        )
+        if details is not None:
+            print(
+                "The protection service reports: "
+                f"{shown_path} "
+                f"(detection: {details.get('detection_name') or '—'})."
+            )
         if not _confirm(
-            f"Permanently delete {entry.get('original_path')} from the "
+            f"Permanently delete {shown_path} from the "
             "vault? This cannot be undone. [y/N] ",
             args.yes,
         ):
             print("Left as it is — still safe in the vault.")
             return EXIT_CLEAN
         return _via_service(
-            "delete", entry_id=entry["id"], sha256=entry.get("sha256")
+            "delete",
+            entry_id=details["entry_id"] if details is not None else entry["id"],
+            sha256=details["sha256"] if details is not None else entry.get("sha256"),
         )
     try:
         entry = _find_entry(vault, args.id)
@@ -742,25 +871,37 @@ def _cmd_quarantine_delete(args: argparse.Namespace) -> int:
 
 
 def _cmd_quarantine_allow(args: argparse.Namespace) -> int:
-    config = ArgusConfig.load(args.config)
-    for warning in config.load_warnings:
-        print(f"Config warning: {warning}", file=sys.stderr)
+    config = load_config(args)
     try:
         vault = _open_vault(args, config)
     except PermissionError:
-        entry = _find_view_entry(args.id)
+        entry, details, error_exit = _service_entry_details(args.id)
         if entry is None:
             print(f"Error: no vault entry matches '{args.id}'.", file=sys.stderr)
             return EXIT_ERROR
+        if error_exit is not None:
+            return error_exit
+        shown_path = (
+            details["original_path"] if details is not None
+            else entry.get("original_path")
+        )
+        if details is not None:
+            print(
+                "The protection service reports: "
+                f"{shown_path} "
+                f"(detection: {details.get('detection_name') or '—'})."
+            )
         if not _confirm(
-            f"Vouch for {entry.get('original_path')}? Argus will restore "
+            f"Vouch for {shown_path}? Argus will restore "
             "it and leave this exact file alone from now on. [y/N] ",
             args.yes,
         ):
             print("Left as it is — still in the vault.")
             return EXIT_CLEAN
         return _via_service(
-            "allow", entry_id=entry["id"], sha256=entry.get("sha256")
+            "allow",
+            entry_id=details["entry_id"] if details is not None else entry["id"],
+            sha256=details["sha256"] if details is not None else entry.get("sha256"),
         )
     history = History.open(_resolve_history_db(args, config))
     try:
@@ -776,7 +917,8 @@ def _cmd_quarantine_allow(args: argparse.Namespace) -> int:
             print("Left as it is — still in the vault.")
             return EXIT_CLEAN
         engine = ActionEngine(
-            vault, config, config_path=args.config, history=history
+            vault, config,
+            config_path=str(resolve_config_path(args)), history=history,
         )
         outcome = engine.allow_entry(entry.id, confirmed=True)
         print(outcome.message)
@@ -790,14 +932,17 @@ def _cmd_quarantine_allow(args: argparse.Namespace) -> int:
 
 
 def _cmd_pending_list(args: argparse.Namespace) -> int:
+    config = load_config(args)
     try:
-        vault = _open_vault(args, None)
+        vault = _open_vault(args, config)
         pending = vault.list_pending("pending")
         vault.close()
     except PermissionError:
-        # The queue lives in the shared folder — read it directly.
+        # This process cannot open the service-owned queue: read
+        # it the loose way (directly when this process may, else
+        # from the service-published pending view).
         pending = [
-            p for p in read_pending_db(_resolve_pending_db(args, None))
+            p for p in _read_pending_loose(args, config)
             if p.status == "pending"
         ]
         return _print_pending_list(args, pending)
@@ -877,8 +1022,63 @@ def _via_service(
     return EXIT_CLEAN if result.ok else EXIT_ERROR
 
 
+def _service_entry_details(idish: str):
+    """Resolve one vault entry for a via-service action, asking
+    the protection service for its OWN record when the verified
+    pipe is required (fix round 2, FIX 1).
+
+    Returns ``(view_entry, service_details, error_exit)``. The
+    snapshot view resolves WHICH record the typed id means; when
+    the pipe is required, the service's record — never the
+    unsigned view — supplies the path shown in prompts and the
+    fingerprint submitted. An unobtainable service record is a
+    hard stop (error_exit set, message already printed)."""
+    entry = _find_view_entry(idish)
+    if entry is None:
+        return None, None, None
+    try:
+        details = action_requests.fetch_entry_details(entry["id"])
+    except action_requests.PipeUnavailableError as exc:
+        print(
+            f"Error: {action_requests.pipe_failure_message(exc)}",
+            file=sys.stderr,
+        )
+        return entry, None, EXIT_ERROR
+    except action_requests.ServiceDetailsError as exc:
+        print(
+            f"Error: the protection service would not confirm "
+            f"that record: {exc}",
+            file=sys.stderr,
+        )
+        return entry, None, EXIT_ERROR
+    return entry, details, None
+
+
+def _service_pending_details(args, config, idish: str):
+    """The pending twin of :func:`_service_entry_details`."""
+    pending = _find_pending_loose(args, config, idish)
+    if pending is None:
+        return None, None, None
+    try:
+        details = action_requests.fetch_pending_details(pending.id)
+    except action_requests.PipeUnavailableError as exc:
+        print(
+            f"Error: {action_requests.pipe_failure_message(exc)}",
+            file=sys.stderr,
+        )
+        return pending, None, EXIT_ERROR
+    except action_requests.ServiceDetailsError as exc:
+        print(
+            f"Error: the protection service would not confirm "
+            f"that record: {exc}",
+            file=sys.stderr,
+        )
+        return pending, None, EXIT_ERROR
+    return pending, details, None
+
+
 def _find_pending_loose(args, config, idish: str):
-    rows = read_pending_db(_resolve_pending_db(args, config))
+    rows = _read_pending_loose(args, config)
     for row in rows:
         if row.id == idish:
             return row
@@ -887,15 +1087,30 @@ def _find_pending_loose(args, config, idish: str):
 
 
 def _cmd_pending_approve(args: argparse.Namespace) -> int:
-    config = ArgusConfig.load(args.config) if args.config else ArgusConfig()
+    config = load_config(args)
     try:
         vault = _open_vault(args, config)
     except PermissionError:
-        pending = _find_pending_loose(args, config, args.id)
+        pending, details, error_exit = _service_pending_details(
+            args, config, args.id
+        )
         if pending is None:
             print(f"Error: no pending action matches '{args.id}'.",
                   file=sys.stderr)
             return EXIT_ERROR
+        if error_exit is not None:
+            return error_exit
+        if details is not None:
+            print(
+                "The protection service reports: "
+                f"{details['action']} {details['path']} "
+                f"(detection: {details.get('detection_name') or '—'})."
+            )
+            return _via_service(
+                "approve-pending",
+                pending_id=details["pending_id"],
+                sha256=details["sha256"],
+            )
         return _via_service(
             "approve-pending", pending_id=pending.id, sha256=pending.sha256
         )
@@ -907,7 +1122,8 @@ def _cmd_pending_approve(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             return EXIT_ERROR
         engine = ActionEngine(
-            vault, config, config_path=args.config, history=history
+            vault, config,
+            config_path=str(resolve_config_path(args)), history=history,
         )
         outcome = engine.approve(pending.id)
         print(outcome.message)
@@ -921,15 +1137,30 @@ def _cmd_pending_approve(args: argparse.Namespace) -> int:
 
 
 def _cmd_pending_reject(args: argparse.Namespace) -> int:
-    config = ArgusConfig.load(args.config) if args.config else ArgusConfig()
+    config = load_config(args)
     try:
         vault = _open_vault(args, config)
     except PermissionError:
-        pending = _find_pending_loose(args, config, args.id)
+        pending, details, error_exit = _service_pending_details(
+            args, config, args.id
+        )
         if pending is None:
             print(f"Error: no pending action matches '{args.id}'.",
                   file=sys.stderr)
             return EXIT_ERROR
+        if error_exit is not None:
+            return error_exit
+        if details is not None:
+            print(
+                "The protection service reports: "
+                f"{details['action']} {details['path']} "
+                f"(detection: {details.get('detection_name') or '—'})."
+            )
+            return _via_service(
+                "reject-pending",
+                pending_id=details["pending_id"],
+                sha256=details["sha256"],
+            )
         return _via_service(
             "reject-pending", pending_id=pending.id, sha256=pending.sha256
         )
@@ -941,7 +1172,8 @@ def _cmd_pending_reject(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             return EXIT_ERROR
         engine = ActionEngine(
-            vault, config, config_path=args.config, history=history
+            vault, config,
+            config_path=str(resolve_config_path(args)), history=history,
         )
         engine.reject(pending.id)
         print(f"Declined. {pending.path} is left exactly as it is.")
@@ -955,7 +1187,7 @@ def _cmd_pending_reject(args: argparse.Namespace) -> int:
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
-    history = History.open(_resolve_history_db(args, None))
+    history = History.open(_resolve_history_db(args, load_config(args)))
     try:
         if args.json:
             print(json.dumps(report_dict(history, args.days), indent=2))
@@ -967,7 +1199,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
 
 
 def _cmd_history(args: argparse.Namespace) -> int:
-    history = History.open(_resolve_history_db(args, None))
+    history = History.open(_resolve_history_db(args, load_config(args)))
     try:
         scans = history.recent_scans(args.limit)
         detections = history.recent_detections(args.limit)
@@ -1046,9 +1278,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_watch = sub.add_parser(
         "watch", help="run real-time protection in the foreground")
-    p_watch.add_argument("--config", default=DEFAULT_CONFIG_NAME,
-                         help=f"config file (default: {DEFAULT_CONFIG_NAME}; "
-                              "missing file = built-in defaults)")
+    p_watch.add_argument("--config", default=None,
+                         help="config file (default: argus-config.json "
+                              "in the Argus data folder; missing file = "
+                              "built-in defaults)")
     p_watch.add_argument("--dirs", default=None,
                          help="comma-separated folders to watch "
                               "(overrides the config file)")
@@ -1062,8 +1295,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser(
         "watch-status", help="show real-time protection status")
-    p_status.add_argument("--status-file", default="argus-status.json",
-                          help="status file to read (default: argus-status.json)")
+    p_status.add_argument("--status-file", default=None,
+                          help="status file to read (default: the "
+                               "configured status file in the Argus "
+                               "data folder)")
+    p_status.add_argument("--config", default=None,
+                          help="config file (default: argus-config.json "
+                               "in the Argus data folder)")
     p_status.add_argument("--json", action="store_true",
                           help="print the raw status JSON")
     p_status.set_defaults(func=_cmd_watch_status)
@@ -1085,15 +1323,21 @@ def build_parser() -> argparse.ArgumentParser:
     sigsub = p_sigdb.add_subparsers(dest="sigdb_command")
 
     p_init = sigsub.add_parser("init", help="create a new signature database")
-    p_init.add_argument("path", nargs="?", default=DEFAULT_DB_NAME,
-                        help=f"database path (default: {DEFAULT_DB_NAME})")
+    p_init.add_argument("path", nargs="?", default=None,
+                        help="database path (default: the configured "
+                             "signature database in the Argus data folder)")
+    p_init.add_argument("--config", default=None,
+                        help="config file naming the default database")
     p_init.add_argument("--no-seed", action="store_true",
                         help="do not include the EICAR test signature")
     p_init.set_defaults(func=_cmd_sigdb_init)
 
     p_info = sigsub.add_parser("info", help="show signature database details")
-    p_info.add_argument("path", nargs="?", default=DEFAULT_DB_NAME,
-                        help=f"database path (default: {DEFAULT_DB_NAME})")
+    p_info.add_argument("path", nargs="?", default=None,
+                        help="database path (default: the configured "
+                             "signature database in the Argus data folder)")
+    p_info.add_argument("--config", default=None,
+                        help="config file naming the default database")
     p_info.set_defaults(func=_cmd_sigdb_info)
 
     # ---- Phase 4: quarantine vault ----
@@ -1107,6 +1351,8 @@ def build_parser() -> argparse.ArgumentParser:
                               "(quarantined, restored, deleted, allowed)")
     p_qlist.add_argument("--vault-dir", default=None,
                          help="vault location (default: Argus data folder)")
+    p_qlist.add_argument("--config", default=None,
+                         help="config file (default: Argus data folder)")
     p_qlist.add_argument("--json", action="store_true",
                          help="print machine-readable JSON")
     p_qlist.set_defaults(func=_cmd_quarantine_list)
@@ -1116,6 +1362,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_qrestore.add_argument("id", help="entry id (or unique prefix)")
     p_qrestore.add_argument("--vault-dir", default=None,
                             help="vault location (default: Argus data folder)")
+    p_qrestore.add_argument("--config", default=None,
+                            help="config file (default: Argus data folder)")
     p_qrestore.set_defaults(func=_cmd_quarantine_restore)
 
     p_qdelete = quarsub.add_parser(
@@ -1123,6 +1371,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_qdelete.add_argument("id", help="entry id (or unique prefix)")
     p_qdelete.add_argument("--vault-dir", default=None,
                            help="vault location (default: Argus data folder)")
+    p_qdelete.add_argument("--config", default=None,
+                           help="config file (default: Argus data folder)")
     p_qdelete.add_argument("--yes", action="store_true",
                            help="confirm without prompting")
     p_qdelete.set_defaults(func=_cmd_quarantine_delete)
@@ -1132,9 +1382,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_qallow.add_argument("id", help="entry id (or unique prefix)")
     p_qallow.add_argument("--vault-dir", default=None,
                           help="vault location (default: Argus data folder)")
-    p_qallow.add_argument("--config", default=DEFAULT_CONFIG_NAME,
-                          help=f"config file the exclusion is saved to "
-                               f"(default: {DEFAULT_CONFIG_NAME})")
+    p_qallow.add_argument("--config", default=None,
+                          help="config file the exclusion is saved to "
+                               "(default: argus-config.json in the Argus "
+                               "data folder)")
     p_qallow.add_argument("--history-db", default=None,
                           help="history database location")
     p_qallow.add_argument("--yes", action="store_true",
@@ -1149,6 +1400,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_plist = pendsub.add_parser("list", help="list pending actions")
     p_plist.add_argument("--vault-dir", default=None,
                          help="vault location (default: Argus data folder)")
+    p_plist.add_argument("--config", default=None,
+                         help="config file (default: Argus data folder)")
     p_plist.add_argument("--json", action="store_true",
                          help="print machine-readable JSON")
     p_plist.set_defaults(func=_cmd_pending_list)
@@ -1182,6 +1435,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="how far back to look (default: 7 days)")
     p_report.add_argument("--history-db", default=None,
                           help="history database location")
+    p_report.add_argument("--config", default=None,
+                          help="config file (default: Argus data folder)")
     p_report.add_argument("--json", action="store_true",
                           help="print machine-readable JSON")
     p_report.set_defaults(func=_cmd_report)
@@ -1192,6 +1447,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="how many entries to show (default: 20)")
     p_history.add_argument("--history-db", default=None,
                            help="history database location")
+    p_history.add_argument("--config", default=None,
+                           help="config file (default: Argus data folder)")
     p_history.add_argument("--json", action="store_true",
                            help="print machine-readable JSON")
     p_history.set_defaults(func=_cmd_history)
