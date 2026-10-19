@@ -45,7 +45,12 @@ jobs:
       - name: Check the release tag matches the code version
         run: |
           $tag = "${{ github.ref_name }}"
-          $code = python -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('argus/__init__.py').read()).group(1))"
+          $init = Get-Content argus/__init__.py -Raw
+          if ($init -notmatch '__version__\s*=\s*"([^"]+)"') {
+            Write-Host "Could not read __version__ from argus/__init__.py."
+            exit 1
+          }
+          $code = $Matches[1]
           if ("v$code" -ne $tag) {
             Write-Host "Release tag '$tag' does not match argus.__version__ '$code' (expected tag 'v$code')."
             exit 1
