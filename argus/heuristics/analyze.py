@@ -159,6 +159,12 @@ class HeuristicReport:
     #: PE-CONTENT heuristic score for such a file (never
     #: filename signals, never the oversize floor, and never
     #: its signature-database or pattern-rule detections).
+    #:
+    #: On Linux the same flag is set by the dpkg gate instead
+    #: (v1.2.0): dpkg records the file as an installed package's
+    #: payload AND the resolved path is a system location — see
+    #: :mod:`argus.platform_dpkg`. The scoring treatment is
+    #: identical: heuristic suspicion zeroed, detections stand.
     trusted_system_file: bool = False
     pe: PEInfo | None = None
     entropy: EntropySummary | None = None
@@ -734,6 +740,82 @@ def _is_trusted_location(path: Path, root: Path) -> bool:
 
 
 def analyze_file(
+    path: Path,
+    size: int | None = None,
+    *,
+    windows_root_dir: Path | None = None,
+    authenticode_verifier: AuthenticodeVerifier | None = None,
+    dpkg_verifier=None,
+) -> HeuristicReport:
+    """Run the heuristic analysis appropriate for *path*.
+
+    (The full routing documentation lives on
+    :func:`_analyze_file_routed`.) On Linux, the routed report
+    then passes the **dpkg system-file trust gate**
+    (:func:`_apply_dpkg_trust`): a file the package manager
+    installed, in its system home, has its heuristic suspicion
+    cleared — the exact analog of the Windows Microsoft-signature
+    trust, with the same limits (heuristic score only, signals
+    stay listed, signature/rule detections never cleared).
+    *dpkg_verifier* injects that check (tests); production
+    callers leave it None and get the platform's real verifier
+    (:mod:`argus.platform_dpkg`). Off Linux the gate never runs.
+    """
+    report = _analyze_file_routed(
+        path,
+        size,
+        windows_root_dir=windows_root_dir,
+        authenticode_verifier=authenticode_verifier,
+    )
+    if sys.platform.startswith("linux") and not report.trusted_system_file:
+        _apply_dpkg_trust(path, report, dpkg_verifier)
+    return report
+
+
+def _apply_dpkg_trust(
+    path: Path, report: HeuristicReport, dpkg_verifier
+) -> None:
+    """Apply Linux system-file trust to *report* in place.
+
+    Trust requires the WHOLE gate in
+    :mod:`argus.platform_dpkg`: dpkg records the file as an
+    installed package's payload AND the resolved path is a
+    system location. A verifier that errors fails CLOSED (no
+    trust) and is logged — the same discipline as a broken
+    Authenticode verifier on Windows. Ordinary files (the vast
+    majority: dpkg does not own them) earn no note; the gate is
+    silent unless it grants."""
+    try:
+        from ..platform_dpkg import STATUS_TRUSTED, platform_dpkg_verifier
+
+        verifier = (
+            dpkg_verifier
+            if dpkg_verifier is not None
+            else platform_dpkg_verifier()
+        )
+        if verifier is None:
+            return
+        outcome = verifier(path)
+    except Exception as exc:  # a broken verifier fails CLOSED
+        log.warning(
+            "dpkg verification of %s raised %r — treating the "
+            "file as untrusted",
+            path, exc,
+        )
+        return
+    if outcome is not None and outcome.status == STATUS_TRUSTED:
+        report.trusted_system_file = True
+        report.notes.append(
+            "recognized as a system file installed by this "
+            f"computer's package manager (package: {outcome.package}) "
+            "in its proper system location — Argus cleared the "
+            "heuristic suspicion for it. Any behaviour-based "
+            "findings are still listed, and the signature-database "
+            "and pattern-rule checks applied in full."
+        )
+
+
+def _analyze_file_routed(
     path: Path,
     size: int | None = None,
     *,
