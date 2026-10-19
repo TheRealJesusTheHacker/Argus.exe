@@ -259,11 +259,28 @@ def test_tray_initial_state_reflects_protection(qapp, backend, window):
     assert "off" in window.tray.tray.toolTip().lower()
 
 
-def test_dashboard_service_managed_disables_toggle(qapp, backend, window):
+def test_dashboard_service_managed_disables_toggle(qapp, backend, window, monkeypatch):
     """Fix #8: a live external (Windows service) heartbeat means
     protection is service-managed — the dashboard must not offer to
-    start a second engine next to it."""
+    start a second engine next to it.
+
+    Since the v1.0.4 heartbeat-trust fix, the heartbeat alone is
+    not enough on Windows: the SCM must also confirm the service
+    is running (see the companion test below). This test simulates
+    exactly that confirmation. ``service_managed()`` imports
+    ``query_service_state`` lazily from ``argus.winservice`` at
+    call time, so that module attribute is the patch seam; forcing
+    ``IS_WINDOWS`` on makes the gate run on every platform (on a
+    real Windows machine it already has that value, so the patch
+    only matters off Windows — where the pre-fix test silently
+    took the trusting path and then failed on Windows CI, which
+    has no ArgusProtection service installed)."""
     from datetime import datetime, timezone
+
+    monkeypatch.setattr(
+        "argus.winservice.query_service_state", lambda *a, **k: "running"
+    )
+    monkeypatch.setattr("argus.gui.backend.IS_WINDOWS", True)
 
     status = {
         "running": True,
@@ -281,6 +298,39 @@ def test_dashboard_service_managed_disables_toggle(qapp, backend, window):
     # And no heartbeat at all (plain dicts/tests) is not managed:
     plain = {"running": True, "paused": False}
     assert window.protection.service_managed(plain) is False
+
+
+def test_dashboard_service_managed_requires_scm_confirmation(
+    qapp, backend, window, monkeypatch
+):
+    """Spoofing regression (v1.0.4 P0): the status file lives in a
+    user-writable shared folder, so ANY process could write a
+    fresh "running" heartbeat. On Windows a fresh heartbeat must
+    therefore count for nothing unless the Service Control
+    Manager confirms ArgusProtection is actually running — if the
+    SCM says the service is stopped, absent, or cannot be queried,
+    protection is NOT service-managed."""
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr("argus.gui.backend.IS_WINDOWS", True)
+    status = {
+        "running": True,
+        "paused": False,
+        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
+        "state": "running",
+    }
+    for scm_state in ("stopped", "not-installed", False):
+        monkeypatch.setattr(
+            "argus.winservice.query_service_state",
+            lambda *a, _state=scm_state, **k: _state,
+        )
+        assert window.protection.service_managed(status) is False
+    # The same heartbeat, with the SCM confirming the service is
+    # running, is service-managed:
+    monkeypatch.setattr(
+        "argus.winservice.query_service_state", lambda *a, **k: "running"
+    )
+    assert window.protection.service_managed(status) is True
 
 
 def test_pending_reject_does_not_crash(qapp, backend, tmp_path, window, monkeypatch):
