@@ -82,25 +82,34 @@ class TrayController(QObject):
         self.tray.setIcon(make_app_icon(alert=True))
 
     def notify_detection(self, event: dict) -> None:
-        """Raise a tray notification for a real-time event."""
-        kind = event.get("type", "")
+        """Raise a tray notification for a real-time event.
+
+        *event* is a :meth:`RealtimeEvent.to_dict` dict: it carries
+        ``kind`` / ``message`` / ``severity`` / ``action`` / ``path``
+        — keyed exactly as the engine emits them."""
+        kind = event.get("kind", "")
         if kind == "detection":
-            verdict = event.get("verdict") or "a detection"
-            name = event.get("detection_name") or "Unknown threat"
+            verdict = event.get("verdict") or "flagged"
+            detail = event.get("message") or (
+                f"Argus flagged a file as {verdict}."
+            )
             self.alert()
             self.tray.showMessage(
                 "ARGUS.EXE found a threat",
-                f"{name} ({verdict}) in {event.get('path', '')}",
+                detail,
                 QSystemTrayIcon.MessageIcon.Warning,
                 8000,
             )
         elif kind == "action":
+            detail = event.get("message") or (
+                f"Argus asks to {event.get('action') or 'act on'} "
+                f"{event.get('path', '')}"
+            )
             self.tray.showMessage(
-                "ARGUS.EXE took action",
-                event.get("message") or f"{event.get('action')} on "
-                f"{event.get('path', '')}",
+                "ARGUS.EXE needs your decision",
+                detail,
                 QSystemTrayIcon.MessageIcon.Information,
                 6000,
             )
-            if event.get("outcome") == "pending":
+            if (event.get("severity") or "").lower() in ("critical", "high"):
                 self.alert()
