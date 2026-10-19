@@ -59,6 +59,7 @@ class PEBuilder:
         self._entry_offset = 0
         self._overlay = b""
         self._cert_size = 0
+        self._cert_blob: bytes | None = None
 
     # ------------------------------------------------------------------
     def add_section(
@@ -95,6 +96,18 @@ class PEBuilder:
 
     def set_cert(self, size: int = 0x1000) -> "PEBuilder":
         self._cert_size = size
+        return self
+
+    def set_cert_signer(
+        self, cn: str | None, org: str | None = None
+    ) -> "PEBuilder":
+        """Give the file a certificate whose PKCS#7 blob names a
+        signer (subject Common Name *cn*, Organization *org*) —
+        a structurally valid WIN_CERTIFICATE wrapping a minimal
+        DER SignedData, so the parser's signer extraction has a
+        real shape to walk. The signature is of course fake; the
+        parser does structural + identity work only."""
+        self._cert_blob = pkcs7_with_signer(cn, org)
         return self
 
     # ------------------------------------------------------------------
@@ -261,9 +274,13 @@ class PEBuilder:
                 total_raw_end = max(total_raw_end, raw_off + _align(len(data), FILE_ALIGNMENT))
         overlay_offset = total_raw_end
         cert_offset = overlay_offset + len(self._overlay)
-        total_size = cert_offset + self._cert_size
-        if self._cert_size:
-            directories[4] = (cert_offset, self._cert_size)
+        if self._cert_blob is not None:
+            cert_total = _align(8 + len(self._cert_blob), 8)
+        else:
+            cert_total = self._cert_size
+        total_size = cert_offset + cert_total
+        if cert_total:
+            directories[4] = (cert_offset, cert_total)
 
         out = bytearray(total_size)
 
@@ -320,7 +337,13 @@ class PEBuilder:
         # Overlay + certificate blob
         if self._overlay:
             out[overlay_offset : overlay_offset + len(self._overlay)] = self._overlay
-        if self._cert_size:
+        if self._cert_blob is not None:
+            struct.pack_into(
+                "<IHH", out, cert_offset, 8 + len(self._cert_blob), 0x0200, 0x0002
+            )
+            blob_at = cert_offset + 8
+            out[blob_at : blob_at + len(self._cert_blob)] = self._cert_blob
+        elif self._cert_size:
             struct.pack_into(
                 "<IHH", out, cert_offset, self._cert_size, 0x0200, 0x0002
             )
@@ -377,6 +400,165 @@ def packed_injector_pe() -> bytes:
                 ]
             }
         )
+        .set_entry(1)
+        .build()
+    )
+
+
+# ----------------------------------------------------------------------
+# Minimal DER builder: just enough ASN.1 to shape a PKCS#7
+# SignedData whose signer certificate names someone. The parser
+# under test walks exactly this shape (plus hostile deviations in
+# the negative tests, which build their own mutations).
+# ----------------------------------------------------------------------
+def _d_len(length: int) -> bytes:
+    if length < 0x80:
+        return bytes([length])
+    raw = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(raw)]) + raw
+
+
+def _d_tlv(tag: int, content: bytes) -> bytes:
+    return bytes([tag]) + _d_len(len(content)) + content
+
+
+def _d_seq(*parts: bytes) -> bytes:
+    return _d_tlv(0x30, b"".join(parts))
+
+
+def _d_set(*parts: bytes) -> bytes:
+    return _d_tlv(0x31, b"".join(parts))
+
+
+def _d_oid(content_hex: str) -> bytes:
+    return _d_tlv(0x06, bytes.fromhex(content_hex))
+
+
+def _d_int(value: int) -> bytes:
+    raw = value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+    if raw[0] & 0x80:
+        raw = b"\x00" + raw
+    return _d_tlv(0x02, raw)
+
+
+def _d_name(cn: str | None, org: str | None) -> bytes:
+    """An X.501 Name with the given CN / O (either may be None)."""
+    rdns = []
+    if org is not None:
+        rdns.append(
+            _d_set(_d_seq(_d_oid("55040a"), _d_tlv(0x13, org.encode())))
+        )
+    if cn is not None:
+        rdns.append(
+            _d_set(_d_seq(_d_oid("550403"), _d_tlv(0x0C, cn.encode())))
+        )
+    return _d_seq(*rdns)
+
+
+def _d_certificate(cn: str | None, org: str | None) -> bytes:
+    alg_id = _d_seq(_d_oid("2a864886f70d01010b"), _d_tlv(0x05, b""))
+    validity = _d_seq(
+        _d_tlv(0x17, b"240101000000Z"), _d_tlv(0x17, b"340101000000Z")
+    )
+    spki = _d_seq(
+        _d_seq(_d_oid("2a864886f70d010101"), _d_tlv(0x05, b"")),
+        _d_tlv(0x03, b"\x00\x00"),
+    )
+    tbs = _d_seq(
+        _d_tlv(0xA0, _d_int(2)),          # [0] version: v3
+        _d_int(0x1234),                    # serial
+        alg_id,                            # signature algorithm
+        _d_name("Fixture Issuing CA", "FixtureSoft"),  # issuer
+        validity,
+        _d_name(cn, org),                  # subject — the signer
+        spki,
+    )
+    return _d_seq(tbs, alg_id, _d_tlv(0x03, b"\x00\x00"))
+
+
+def pkcs7_with_signer(cn: str | None, org: str | None = None) -> bytes:
+    """A minimal PKCS#7 ContentInfo(SignedData) whose certificate
+    set holds one certificate naming (cn, org) as its subject."""
+    certs = _d_tlv(0xA0, _d_certificate(cn, org))  # [0] IMPLICIT set
+    signed_data = _d_seq(
+        _d_int(1),                                   # version
+        _d_set(),                                    # digestAlgorithms
+        _d_seq(_d_oid("2a864886f70d010701")),        # contentInfo: data
+        certs,
+    )
+    return _d_seq(
+        _d_oid("2a864886f70d010702"),                # signedData
+        _d_tlv(0xA0, signed_data),                   # [0] EXPLICIT
+    )
+
+
+# ----------------------------------------------------------------------
+# Ready-made fixtures (continued)
+# ----------------------------------------------------------------------
+def boring_windows_binary() -> bytes:
+    """The profile of a million mundane Windows system files:
+    ordinary sections, ordinary imports — including the kind that
+    LOOK spicy in isolation (service creation, a dispatcher entry
+    point, a pile of ordinal imports) but are simply what system
+    binaries do — a deterministic build timestamp, and a properly
+    formed Microsoft signature. It must never be flagged in its
+    system home."""
+    return (
+        PEBuilder(timestamp=1_700_000_000)
+        .add_section(".text", code_bytes(4096), TEXT_CHARS)
+        .add_section(
+            ".rdata",
+            b"Microsoft Windows Operating System\x00"
+            b"ordinary version strings live here\x00",
+            RDATA_CHARS,
+        )
+        .add_section(".data", b"\x00" * 256, DATA_RW_CHARS)
+        .set_imports(
+            {
+                "KERNEL32.dll": [
+                    "GetModuleHandleW",
+                    "GetModuleFileNameW",
+                    "GetProcAddress",
+                    "LoadLibraryW",
+                    "ExitProcess",
+                    "#12",
+                    "#345",
+                    "#678",
+                ],
+                "ADVAPI32.dll": [
+                    "OpenSCManagerW",
+                    "CreateServiceW",
+                    "StartServiceCtrlDispatcherW",
+                ],
+                "USER32.dll": ["MessageBoxW"],
+            }
+        )
+        .set_cert_signer("Microsoft Windows", "Microsoft Corporation")
+        .set_entry(0)
+        .build()
+    )
+
+
+def microsoft_signed_injector() -> bytes:
+    """The packed-injector profile (critical signal combination)
+    wearing a well-formed Microsoft signature. Location must be
+    the only thing that can save it — and only in a system home."""
+    return (
+        PEBuilder()
+        .add_section("UPX0", b"", RWX_CHARS, virtual_size=0x3000)
+        .add_section("UPX1", packed_bytes(8192), RWX_CHARS)
+        .set_imports(
+            {
+                "KERNEL32.dll": [
+                    "VirtualAllocEx",
+                    "WriteProcessMemory",
+                    "CreateRemoteThread",
+                    "LoadLibraryA",
+                    "GetProcAddress",
+                ]
+            }
+        )
+        .set_cert_signer("Microsoft Windows", "Microsoft Corporation")
         .set_entry(1)
         .build()
     )
