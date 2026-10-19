@@ -7,6 +7,7 @@ Usage::
     python -m argus scan <path> [options]   scan a file or folder
     python -m argus watch [options]         real-time protection (foreground)
     python -m argus watch-status            show real-time protection status
+    python -m argus service <command>       manage the Windows service (Phase 5)
     python -m argus quarantine list         what's in the quarantine vault
     python -m argus quarantine restore <id> put a quarantined file back
     python -m argus quarantine delete <id>  permanently delete a vault file
@@ -500,6 +501,32 @@ def _cmd_watch_status(args: argparse.Namespace) -> int:
     return EXIT_CLEAN
 
 
+def _cmd_service(args: argparse.Namespace) -> int:
+    """Windows service management (Phase 5). The winservice module is
+    imported lazily so the CLI — and this command's argument errors —
+    work on every platform; off Windows the module explains, in plain
+    language, why service management cannot run there."""
+    from .winservice import (
+        ServiceUnavailable,
+        perform_service_command,
+        route_service_command,
+    )
+
+    try:
+        command = route_service_command([args.service_command])
+    except ValueError as exc:
+        print(str(exc))
+        return EXIT_ERROR
+    try:
+        code = perform_service_command(
+            command, config_path=getattr(args, "config", None)
+        )
+    except ServiceUnavailable as exc:
+        print(f"argus service: {exc}")
+        return EXIT_ERROR
+    return EXIT_CLEAN if code == 0 else EXIT_ERROR
+
+
 # ----------------------------------------------------------------------
 # Quarantine / pending / report / history commands (Phase 4)
 # ----------------------------------------------------------------------
@@ -834,6 +861,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--json", action="store_true",
                           help="print the raw status JSON")
     p_status.set_defaults(func=_cmd_watch_status)
+
+    # ---- Phase 5: Windows service management ----
+    p_service = sub.add_parser(
+        "service",
+        help="manage the ARGUS.EXE Windows service (Windows only)")
+    p_service.add_argument(
+        "service_command",
+        choices=["install", "uninstall", "start", "stop", "restart",
+                 "status", "run", "register", "unregister"],
+        help="what to do with the service")
+    p_service.add_argument("--config", default=None,
+                           help="config file the service should use")
+    p_service.set_defaults(func=_cmd_service)
 
     p_sigdb = sub.add_parser("sigdb", help="manage the signature database")
     sigsub = p_sigdb.add_subparsers(dest="sigdb_command")
