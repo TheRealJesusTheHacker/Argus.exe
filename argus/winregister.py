@@ -166,6 +166,7 @@ def register_antivirus(
     properties: dict,
     *,
     wmi_factory: Callable[[], object] | None = None,
+    require_existing_exe: bool = False,
 ) -> dict:
     """Create (or replace) Argus's AntiVirusProduct instance.
 
@@ -173,12 +174,28 @@ def register_antivirus(
     An existing instance with the same display name is removed first
     so re-registration is idempotent. Returns the properties written.
     Raises :class:`RegistrationUnavailable` when WMI cannot be used.
+
+    With ``require_existing_exe=True`` (the real registration path),
+    the product executable named in the properties must exist on
+    disk first — Windows Security must never be told a missing
+    program is the machine's antivirus. Tests injecting a fake WMI
+    connection leave it off.
     """
     missing = [key for key in PROPERTY_KEYS if key not in properties]
     if missing:
         raise ValueError(
             f"properties are missing required keys: {', '.join(missing)}"
         )
+    if require_existing_exe:
+        from pathlib import Path
+
+        product_exe = Path(properties["pathToSignedProductExe"])
+        if not product_exe.exists():
+            raise RegistrationUnavailable(
+                f"cannot register ARGUS.EXE with Windows Security "
+                f"Center — the product executable {product_exe} does "
+                "not exist on this machine."
+            )
     wmi = (wmi_factory or _default_wmi_factory)()
     _delete_existing(wmi, properties["displayName"])
     instance = wmi.Get(WMI_CLASS).SpawnInstance_()
