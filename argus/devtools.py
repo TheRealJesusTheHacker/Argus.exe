@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 from .detections import Verdict
 from .heuristics.analyze import analyze_file
 from .heuristics.signals import Signal
+from .paths import write_text_atomic
 from .rules import Rule, RuleMatcher
 from .scanner import hash_file, scan_file
 from .scoring import CRITICAL_COMBINATIONS, SIGNED_DISCOUNT
@@ -77,12 +78,16 @@ class SignalSpec:
 SIGNAL_CATALOG: tuple[SignalSpec, ...] = (
     SignalSpec("rtl_override_filename", "critical", 60,
                "Filename hides an invisible right-to-left override character."),
+    SignalSpec("powershell_download_cradle", "critical", 50,
+               "Script downloads code and executes it in memory (download cradle)."),
     SignalSpec("process_injection_combo", "critical", 45,
                "Imports the API trio used to inject code into other programs."),
     SignalSpec("credential_access", "high", 35,
                "Reaches for stored passwords or the LSASS process."),
     SignalSpec("download_and_execute", "high", 35,
                "Can download a file and launch programs — dropper behaviour."),
+    SignalSpec("content_extension_mismatch", "high", 30,
+               "File IS a Windows program but its name claims otherwise."),
     SignalSpec("double_extension", "high", 30,
                "Disguised by a double extension, e.g. photo.jpg.exe."),
     SignalSpec("encoded_powershell_command", "high", 30,
@@ -97,6 +102,8 @@ SIGNAL_CATALOG: tuple[SignalSpec, ...] = (
                "Abuses the certutil tool to download files."),
     SignalSpec("high_entropy_executable_section", "high", 25,
                "Executable code section with near-random (packed) contents."),
+    SignalSpec("malformed_certificate", "high", 25,
+               "Claims a signature, but the certificate region is structurally fake."),
     SignalSpec("mshta_remote_script", "high", 25,
                "Runs a remote script through the mshta tool."),
     SignalSpec("regsvr32_remote", "high", 25,
@@ -105,16 +112,30 @@ SIGNAL_CATALOG: tuple[SignalSpec, ...] = (
                "Runs JavaScript through rundll32's URL handler."),
     SignalSpec("writable_executable_section", "high", 25,
                "A section that is both writable and executable (W+X)."),
+    SignalSpec("oversize_not_fully_analyzed", "medium", 25,
+               "Executable too large for full analysis — Suspicious floor."),
     SignalSpec("system_binary_masquerade", "medium", 15,
                "Named after a core Windows system program."),
     SignalSpec("anti_debug_imports", "medium", 15,
                "Imports debugger-detection APIs."),
+    SignalSpec("entry_point_outside_sections", "medium", 15,
+               "Starting address falls outside every declared section."),
     SignalSpec("entry_point_unusual", "medium", 15,
                "Starts running in an unusual section (packer hallmark)."),
+    SignalSpec("high_entropy_outside_sections", "medium", 15,
+               "Packed-looking data hidden outside every declared section."),
     SignalSpec("high_entropy_unparsed_executable", "medium", 15,
                "Claims to be a program, cannot be parsed, near-random contents."),
+    SignalSpec("high_entropy_window_in_section", "medium", 15,
+               "A packed pocket hidden inside an ordinary-looking section."),
+    SignalSpec("ordinal_heavy_imports", "medium", 15,
+               "Most imports referenced by number, hiding what it calls."),
     SignalSpec("packer_section_name", "medium", 15,
                "Has a section named after a known executable packer."),
+    SignalSpec("script_extension_mismatch", "medium", 15,
+               "File's contents are a script but its name claims otherwise."),
+    SignalSpec("script_fetches_remote_content", "medium", 15,
+               "Script fetches content from a web address."),
     SignalSpec("script_obfuscation", "medium", 15,
                "Script is densely obfuscated to hide from human readers."),
     SignalSpec("unsigned_elevation_request", "medium", 15,
@@ -127,8 +148,14 @@ SIGNAL_CATALOG: tuple[SignalSpec, ...] = (
                "Large unexplained data appended after the last section."),
     SignalSpec("keylogging_api", "medium", 12,
                "Uses a keyboard-hooking or key-state API."),
+    SignalSpec("imports_truncated", "medium", 10,
+               "Import table hit a safety cap — too large to fully read."),
+    SignalSpec("string_extraction_truncated", "low", 10,
+               "More embedded strings than Argus extracts (flooding)."),
     SignalSpec("tls_callbacks_present", "medium", 10,
                "Code runs before the program's official starting point."),
+    SignalSpec("unparseable_executable", "low", 10,
+               "Presents as a program but its structure cannot be parsed."),
     SignalSpec("very_long_script_line", "medium", 10,
                "A single script line over 2,000 characters (smuggled payload)."),
     SignalSpec("minimal_imports", "low", 5,
@@ -216,13 +243,10 @@ class DevSettings:
             },
         }
         target = Path(path)
-        if target.parent and not target.parent.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write (tmp file + rename): never leave a
-        # half-written settings file behind.
-        tmp = target.with_suffix(target.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, target)
+        # Atomic, crash-safe write (unique temp file + fsync +
+        # permission-preserving rename, the shared helper): never
+        # leave a half-written settings file behind.
+        write_text_atomic(target, json.dumps(data, indent=2) + "\n")
         self.source_path = target
 
     @classmethod
@@ -643,6 +667,11 @@ def run_self_test(work_dir: Path | str | None = None) -> SelfTestResult:
                 ],
             )
     artifacts = [scratch / "selftest.sigdb", scratch / "eicar-test-file.txt"]
+    # The signature DB's HMAC key file is created beside it (v1.0.4)
+    # and is equally ours to clean up.
+    from .signatures import key_path_for
+
+    artifacts.append(key_path_for(artifacts[0]))
     try:
         scratch.mkdir(parents=True, exist_ok=True)
         db_path = artifacts[0]
@@ -824,6 +853,55 @@ class SimulatedActionEngine:
         if event.kind != "action" or not event.path or not event.action:
             return None
         return self._record(event.action, event.path, event.action)
+
+    def approve(self, pending_id: str) -> "ActionOutcome":
+        """Simulated approval: records the intent, decides nothing.
+        The real queue entry stays exactly as it is."""
+        from .actions import ActionOutcome
+
+        detail = (
+            f"would approve queued action {pending_id} — the queue "
+            "entry was NOT decided and no file was touched."
+        )
+        self.records.append(
+            SimulatedAction(
+                action="approve-pending",
+                path=f"pending action {pending_id}",
+                detail=detail,
+            )
+        )
+        log.info("simulation: %s", detail)
+        return ActionOutcome(
+            action="approve-pending",
+            path=f"pending action {pending_id}",
+            done=False,
+            pending_id=pending_id,
+            message=f"Simulation mode is on: Argus {detail}",
+        )
+
+    def reject(self, pending_id: str) -> "ActionOutcome":
+        """Simulated rejection: records the intent, decides nothing."""
+        from .actions import ActionOutcome
+
+        detail = (
+            f"would reject queued action {pending_id} — the queue "
+            "entry was NOT decided and no file was touched."
+        )
+        self.records.append(
+            SimulatedAction(
+                action="reject-pending",
+                path=f"pending action {pending_id}",
+                detail=detail,
+            )
+        )
+        log.info("simulation: %s", detail)
+        return ActionOutcome(
+            action="reject-pending",
+            path=f"pending action {pending_id}",
+            done=False,
+            pending_id=pending_id,
+            message=f"Simulation mode is on: Argus {detail}",
+        )
 
 
 # ----------------------------------------------------------------------
