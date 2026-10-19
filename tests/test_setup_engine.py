@@ -140,21 +140,38 @@ def test_detect_state_portable_wins(monkeypatch):
 
 
 def test_detect_state_mapping():
+    # The registration answers are INJECTED: this test pins the
+    # SCM-state -> SetupState mapping only. Left uninjected, the
+    # live probes answer instead — on a real Windows machine with
+    # no Argus install they provably report the ARP entry missing
+    # (-> INSTALLED_INCOMPLETE, the product working as designed;
+    # that is what the v1.1.0 CI runner answered). The probe-based
+    # demotion itself is pinned by
+    # test_hunt_p1_6_detect_state_installed_incomplete.
+    registered = dict(av_registered=True, arp_present=True)
     assert (
-        setup_engine.detect_state(scm_state="not-installed", portable=False)
+        setup_engine.detect_state(
+            scm_state="not-installed", portable=False, **registered
+        )
         is SetupState.NOT_INSTALLED
     )
     assert (
-        setup_engine.detect_state(scm_state="running", portable=False)
+        setup_engine.detect_state(
+            scm_state="running", portable=False, **registered
+        )
         is SetupState.RUNNING
     )
     assert (
-        setup_engine.detect_state(scm_state="stopped", portable=False)
+        setup_engine.detect_state(
+            scm_state="stopped", portable=False, **registered
+        )
         is SetupState.INSTALLED_STOPPED
     )
     # Undeterminable must never claim protection exists.
     assert (
-        setup_engine.detect_state(scm_state="unknown", portable=False)
+        setup_engine.detect_state(
+            scm_state="unknown", portable=False, **registered
+        )
         is SetupState.NOT_INSTALLED
     )
 
