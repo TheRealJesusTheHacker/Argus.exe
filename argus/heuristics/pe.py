@@ -386,7 +386,13 @@ def _parse_imports(r: _Reader, rva_to_offset, imp_rva: int, is_64bit: bool) -> d
                     continue
                 # 2-byte hint precedes the function name.
                 functions.append(r.c_string(name_entry + 2, _MAX_NAME_BYTES))
-        imports[dll_name] = functions
+        if dll_name in imports:
+            # The same DLL can appear in more than one descriptor
+            # (duplicates, delay-load mirrors): merge the function
+            # lists instead of silently discarding the earlier one.
+            imports[dll_name].extend(functions)
+        else:
+            imports[dll_name] = functions
     return imports
 
 
