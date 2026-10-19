@@ -182,7 +182,14 @@ def _load_or_create_key(vault_dir: Path) -> bytes:
         return key
     key = os.urandom(KEY_SIZE)
     try:
-        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        # O_BINARY matters on Windows: without it the fd is text-mode and
+        # any 0x0A byte in the key would be written as CRLF, corrupting
+        # the key on disk (32-byte key read back as 33 bytes).
+        fd = os.open(
+            key_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
     except FileExistsError:  # lost a creation race — read the winner's key
         return _load_or_create_key(vault_dir)
     try:
