@@ -7,7 +7,7 @@ import pytest
 
 from argus.cli import EXIT_CLEAN, EXIT_DETECTIONS, EXIT_ERROR, main
 from argus.quarantine import Vault
-from argus.signatures import init_db
+from argus.signatures import EICAR_SHA256, init_db
 
 EICAR = rb"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
 
@@ -25,7 +25,8 @@ def cli_env(tmp_path, monkeypatch):
     return {
         "root": tmp_path, "target": target_dir, "db": db_path,
         "vault_dir": data_dir / "quarantine",
-        "history_db": data_dir / "history.db",
+        # v1.0.4 trust split: history lives in the shared subdir.
+        "history_db": data_dir / "shared" / "history.db",
     }
 
 
@@ -163,17 +164,21 @@ def test_quarantine_allow_via_cli(cli_env, tmp_path):
 
 
 def test_pending_flow_via_cli(cli_env, capsys):
-    # Simulate a queued real-time request in the same vault.
+    # Simulate a queued real-time request: since v1.0.4 the queue
+    # lives in the shared pending database (the trust split) — the
+    # service/GUI/CLI all open the vault with that pending path.
     from argus.actions import ActionEngine, DetectionInfo
     from argus.config import ArgusConfig
-    vault = Vault.open(cli_env["vault_dir"])
+    from argus.paths import default_pending_db
+
+    vault = Vault.open(cli_env["vault_dir"], default_pending_db())
     engine = ActionEngine(vault, ArgusConfig())
     target = cli_env["target"] / "eicar.com"
     pending = engine.enqueue(
         source="realtime", path=target, action="quarantine",
         info=DetectionInfo(name="EICAR-Test-File", severity="high",
                            verdict="Malicious", reasons=["test"],
-                           sha256=None),
+                           sha256=EICAR_SHA256),
     )
     vault.close()
 
@@ -184,7 +189,7 @@ def test_pending_flow_via_cli(cli_env, capsys):
     code = main(["pending", "approve", pending.id[:12]])
     assert code == EXIT_CLEAN
     assert not target.exists()
-    vault = Vault.open(cli_env["vault_dir"])
+    vault = Vault.open(cli_env["vault_dir"], default_pending_db())
     try:
         assert vault.count("quarantined") == 1
         assert vault.get_pending(pending.id).status == "done"
