@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import tempfile
 from dataclasses import dataclass, field, replace
@@ -217,7 +218,11 @@ class DevSettings:
         target = Path(path)
         if target.parent and not target.parent.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        # Atomic write (tmp file + rename): never leave a
+        # half-written settings file behind.
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
         self.source_path = target
 
     @classmethod
@@ -608,16 +613,39 @@ def run_self_test(work_dir: Path | str | None = None) -> SelfTestResult:
 
     Builds a throwaway signature database, writes the EICAR test file
     into a throwaway folder, scans it, and confirms Argus flags it as
-    the EICAR signature — then removes every trace. If *work_dir* is
-    given it is used (and cleaned) as the scratch space.
+    the EICAR signature — then removes every trace.
+
+    Scratch-space ownership is strict: with no *work_dir*, a fresh
+    temp folder is created and removed afterwards. A caller-supplied
+    *work_dir* is only ever USED, never owned: it must be empty (or
+    not exist yet), Argus removes only the two files it put there,
+    and the folder itself stays. A non-empty pre-existing folder is
+    refused outright — the self-test will not tidy up after itself
+    with a recursive delete of somebody else's directory.
     """
     steps: list[SelfTestStep] = []
-    scratch = Path(work_dir) if work_dir else Path(
-        tempfile.mkdtemp(prefix="argus-selftest-")
-    )
+    owns_dir = work_dir is None
+    if owns_dir:
+        scratch = Path(tempfile.mkdtemp(prefix="argus-selftest-"))
+    else:
+        scratch = Path(work_dir)
+        if scratch.is_dir() and any(scratch.iterdir()):
+            return SelfTestResult(
+                passed=False,
+                steps=[
+                    SelfTestStep(
+                        "scratch folder",
+                        False,
+                        f"{scratch} is not empty — the self-test only "
+                        "runs in an empty folder it can leave exactly "
+                        "as it found it.",
+                    )
+                ],
+            )
+    artifacts = [scratch / "selftest.sigdb", scratch / "eicar-test-file.txt"]
     try:
         scratch.mkdir(parents=True, exist_ok=True)
-        db_path = scratch / "selftest.sigdb"
+        db_path = artifacts[0]
         info = init_db(db_path, seed=True)
         steps.append(
             SelfTestStep(
@@ -626,7 +654,7 @@ def run_self_test(work_dir: Path | str | None = None) -> SelfTestResult:
                 f"built a test database with {info.count} signature(s)",
             )
         )
-        target = scratch / "eicar-test-file.txt"
+        target = artifacts[1]
         target.write_bytes(EICAR_BYTES)
         steps.append(
             SelfTestStep(
@@ -662,17 +690,26 @@ def run_self_test(work_dir: Path | str | None = None) -> SelfTestResult:
     except Exception as exc:  # the self-test must report, never crash
         steps.append(SelfTestStep("self-test run", False, f"error: {exc}"))
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-    removed = not scratch.exists()
-    steps.append(
-        SelfTestStep(
-            "cleanup",
-            removed,
-            "scratch folder removed"
-            if removed
-            else "scratch folder could not be fully removed",
-        )
-    )
+        if owns_dir:
+            shutil.rmtree(scratch, ignore_errors=True)
+            removed = not scratch.exists()
+            cleanup_detail = (
+                "scratch folder removed"
+                if removed
+                else "scratch folder could not be fully removed"
+            )
+        else:
+            # Caller-supplied folder: remove only what we put there.
+            for artifact in artifacts:
+                artifact.unlink(missing_ok=True)
+            removed = not any(artifact.exists() for artifact in artifacts)
+            cleanup_detail = (
+                "self-test files removed; the folder itself was "
+                "left in place"
+                if removed
+                else "self-test files could not be fully removed"
+            )
+    steps.append(SelfTestStep("cleanup", removed, cleanup_detail))
     return SelfTestResult(
         passed=all(step.ok for step in steps), steps=steps
     )
@@ -748,6 +785,39 @@ class SimulatedActionEngine:
     ) -> "ActionOutcome":
         return self._record(
             "allow", f"vault entry {entry_id}", "restore and allow"
+        )
+
+    def restore_entry(
+        self, entry_id: str, *, confirmed: bool = False
+    ) -> "ActionOutcome":
+        return self._record_entry("restore", entry_id, "restore")
+
+    def delete_entry(
+        self, entry_id: str, *, confirmed: bool = False
+    ) -> "ActionOutcome":
+        return self._record_entry("delete", entry_id, "permanently delete")
+
+    def _record_entry(
+        self, action: str, entry_id: str, verb: str
+    ) -> "ActionOutcome":
+        from .actions import ActionOutcome
+
+        detail = (
+            f"would {verb} the quarantined file held as vault entry "
+            f"{entry_id} — nothing was touched."
+        )
+        self.records.append(
+            SimulatedAction(
+                action=action, path=f"vault entry {entry_id}", detail=detail
+            )
+        )
+        log.info("simulation: %s", detail)
+        return ActionOutcome(
+            action=action,
+            path=f"vault entry {entry_id}",
+            done=False,
+            entry_id=entry_id,
+            message=f"Simulation mode is on: Argus {detail}",
         )
 
     def handle_realtime_event(self, event: "RealtimeEvent") -> "ActionOutcome | None":
