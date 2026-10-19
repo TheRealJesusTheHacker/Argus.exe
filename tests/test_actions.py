@@ -78,7 +78,9 @@ def test_destructive_actions_require_confirmation(env):
 
 def test_quarantine_action(env):
     target = _drop(env["root"], "evil.exe", EICAR)
-    outcome = env["engine"].quarantine(target, _info(), confirmed=True)
+    outcome = env["engine"].quarantine(
+        target, _info(sha256=hashlib.sha256(EICAR).hexdigest()), confirmed=True
+    )
     assert outcome.done
     assert outcome.entry_id
     assert not target.exists()
@@ -97,10 +99,15 @@ def test_delete_action_goes_through_vault(env):
 
 
 def test_delete_direct(env):
+    # v1.1.0 (P2): the direct-delete route was removed — delete
+    # always goes through the vault, and passing direct= is an error.
     target = _drop(env["root"], "evil.exe", EICAR)
-    env["engine"].delete(target, _info(), confirmed=True, direct=True)
+    with pytest.raises(TypeError):
+        env["engine"].delete(target, _info(), confirmed=True, direct=True)
+    assert target.exists()
+    env["engine"].delete(target, _info(), confirmed=True)
     assert not target.exists()
-    assert env["vault"].count() == 0
+    assert env["vault"].count() == 1  # the audit record
 
 
 def test_allow_entry_restores_excludes_and_scanner_stands_down(env, tmp_path):
@@ -108,7 +115,11 @@ def test_allow_entry_restores_excludes_and_scanner_stands_down(env, tmp_path):
     init_db(db_path)
     target = _drop(env["root"], "eicar.com", EICAR)
     engine = env["engine"]
-    outcome = engine.quarantine(target, _info(name="EICAR-Test-File"), confirmed=True)
+    outcome = engine.quarantine(
+        target,
+        _info(name="EICAR-Test-File", sha256=hashlib.sha256(EICAR).hexdigest()),
+        confirmed=True,
+    )
     entry_id = outcome.entry_id
 
     allowed = engine.allow_entry(entry_id, confirmed=True)
