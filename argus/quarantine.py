@@ -45,6 +45,7 @@ import os
 import sqlite3
 import struct
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -61,6 +62,13 @@ KEY_SIZE = 32
 KEY_FILENAME = "vault.key"
 DB_FILENAME = "vault.db"
 BLOBS_DIRNAME = "blobs"
+
+#: How long a ``*.tmp`` file in the blob store must sit untouched
+#: before the open-time sweep may remove it. A temp younger than this
+#: might belong to a quarantine/restore running in ANOTHER Argus
+#: process right now (the service and the GUI share the vault), so
+#: only genuinely stale leftovers are swept.
+STALE_TEMP_AGE_SECONDS = 3600.0
 
 #: Statuses a vault entry can be in. ``quarantined`` is the only live
 #: state; the rest are terminal outcomes the audit trail keeps.
@@ -411,9 +419,11 @@ class Vault:
         """Open (creating if needed) the vault at *vault_dir*.
 
         Also sweeps stale ``*.tmp`` files out of the blob store —
-        leftovers from an interrupted quarantine or restore. A temp
-        file is never a live blob, so removing one cannot lose a
-        quarantined file.
+        leftovers from an interrupted quarantine or restore. Only
+        temps older than :data:`STALE_TEMP_AGE_SECONDS` are removed:
+        a younger one may belong to an operation in flight in another
+        Argus process sharing this vault. A temp file is never a live
+        blob, so removing a stale one cannot lose a quarantined file.
         """
         root = Path(vault_dir)
         blobs = root / BLOBS_DIRNAME
@@ -422,14 +432,22 @@ class Vault:
         conn = sqlite3.connect(root / DB_FILENAME, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         try:
+            # The service and the GUI share this database: WAL lets
+            # readers and a writer coexist, and busy_timeout makes a
+            # contender wait instead of erroring out.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
             conn.executescript(_SCHEMA)
             conn.commit()
         except sqlite3.Error as exc:
             conn.close()
             raise QuarantineError(f"could not open vault index: {exc}") from exc
         vault = cls(root, key, conn)
+        cutoff = time.time() - STALE_TEMP_AGE_SECONDS
         for stale in blobs.glob("*.tmp"):
             try:
+                if stale.stat().st_mtime >= cutoff:
+                    continue  # possibly in use by another process
                 stale.unlink()
             except OSError:
                 log.warning("could not remove stale vault temp file %s", stale)
@@ -492,7 +510,14 @@ class Vault:
                 "(its fingerprint no longer matches the scan). Argus left "
                 "it alone — scan it again."
             )
-        os.replace(tmp_path, blob_path)
+        try:
+            os.replace(tmp_path, blob_path)
+        except OSError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise QuarantineError(
+                f"could not move {source_path} into the vault: {exc}. "
+                "The original file has not been touched."
+            ) from exc
         try:
             self._verify_blob(blob_path, plain_sha)
         except QuarantineError:
@@ -560,11 +585,19 @@ class Vault:
         """Decrypt an entry back to its original location.
 
         The blob's tamper tag is verified *while* decrypting into a
-        temp file inside the vault; the temp file is only moved into
-        place after verification passes, so a damaged blob restores
-        nothing. If a file now exists at the original location it is
-        **never overwritten** — the restored file lands next to it as
-        ``name (restored by Argus).ext`` (numbered if needed).
+        temp file inside the vault; those verified bytes are then
+        published only after verification passes, so a damaged blob
+        restores nothing. Publishing is careful in two ways:
+
+        - the file is stream-copied (via a staging file in the
+          DESTINATION directory), never renamed across volumes — a
+          vault and a home folder on different drives restore fine;
+        - the destination name is claimed atomically (hard link /
+          exclusive create), so a file that appeared at the original
+          location in the meantime is **never overwritten** — the
+          restored file lands next to it as
+          ``name (restored by Argus).ext`` (numbered if needed).
+
         Returns the path the file was restored to.
         """
         entry = self._require_entry(entry_id, live=True)
@@ -598,16 +631,12 @@ class Vault:
                 "match its fingerprint — Argus removed it rather than "
                 "hand you a damaged file."
             )
-        destination = self._restore_destination(Path(entry.original_path))
         try:
-            if destination.parent and not destination.parent.exists():
-                destination.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(tmp_path, destination)
-        except OSError as exc:
+            destination = self._publish_restored(
+                tmp_path, Path(entry.original_path)
+            )
+        finally:
             tmp_path.unlink(missing_ok=True)
-            raise QuarantineError(
-                f"could not put {entry.original_path} back: {exc}"
-            ) from exc
         blob_path.unlink(missing_ok=True)
         self._update_entry(
             entry.id,
@@ -619,19 +648,97 @@ class Vault:
         log.info("restored entry %s to %s", entry.id, destination)
         return destination
 
+    def _publish_restored(self, verified_tmp: Path, original: Path) -> Path:
+        """Put the verified plaintext at *original* (or beside it),
+        never overwriting anything. Returns the path used.
+
+        The bytes are first stream-copied to a staging file inside
+        the destination directory (so no cross-volume rename is ever
+        involved), then each candidate name is claimed atomically.
+        Raises :class:`QuarantineError` with everything cleaned up if
+        no name can be claimed.
+        """
+        parent = original.parent
+        stage_path = parent / f".{original.name}.argus-restore-{_new_id()}.tmp"
+        try:
+            if parent and not parent.exists():
+                parent.mkdir(parents=True, exist_ok=True)
+            with open(verified_tmp, "rb") as src, open(stage_path, "wb") as dst:
+                while True:
+                    chunk = src.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+        except OSError as exc:
+            stage_path.unlink(missing_ok=True)
+            raise QuarantineError(
+                f"could not put {original} back: {exc}"
+            ) from exc
+        try:
+            for candidate in self._restore_candidates(original):
+                try:
+                    os.link(stage_path, candidate)
+                except FileExistsError:
+                    continue  # name taken — try the next variant
+                except OSError:
+                    # No hard links here (filesystem limits): claim
+                    # the name exclusively and copy into it instead.
+                    try:
+                        self._claim_and_copy(verified_tmp, candidate)
+                    except FileExistsError:
+                        continue
+                    except OSError as exc:
+                        raise QuarantineError(
+                            f"could not put {original} back: {exc}"
+                        ) from exc
+                    return candidate
+                return candidate
+            raise QuarantineError(
+                f"could not put {original} back: every restored-name "
+                "variant is taken."
+            )
+        finally:
+            stage_path.unlink(missing_ok=True)
+
     @staticmethod
-    def _restore_destination(original: Path) -> Path:
-        if not original.exists():
-            return original
+    def _claim_and_copy(source: Path, candidate: Path) -> None:
+        """Create *candidate* exclusively (O_EXCL — fails if it
+        exists) and stream *source* into it. On any failure the
+        claimed file is removed again: a partial restore must never
+        be left behind."""
+        fd = os.open(
+            candidate,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o666,
+        )
+        try:
+            with os.fdopen(fd, "wb") as dst, open(source, "rb") as src:
+                while True:
+                    chunk = src.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+        except BaseException:
+            candidate.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _restore_candidates(original: Path) -> Iterator[Path]:
+        """Names a restore may use, in order: the original name,
+        then ``name (restored by Argus).ext``, numbered upwards."""
+        yield original
         stem, suffix = original.stem, original.suffix
-        candidate = original.with_name(f"{stem} (restored by Argus){suffix}")
+        yield original.with_name(f"{stem} (restored by Argus){suffix}")
         counter = 2
-        while candidate.exists():
-            candidate = original.with_name(
+        while counter <= 100:
+            yield original.with_name(
                 f"{stem} (restored by Argus {counter}){suffix}"
             )
             counter += 1
-        return candidate
 
     def delete_permanent(self, entry_id: str) -> None:
         """Destroy a quarantined file for good: overwrite its blob,
@@ -757,11 +864,16 @@ class Vault:
             return
         assignments = ", ".join(f"{name} = ?" for name in fields)
         with self._lock:
-            self._conn.execute(
-                f"UPDATE entries SET {assignments} WHERE id = ?",
-                (*fields.values(), entry_id),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    f"UPDATE entries SET {assignments} WHERE id = ?",
+                    (*fields.values(), entry_id),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                raise QuarantineError(
+                    f"could not update the vault entry: {exc}"
+                ) from exc
 
     # ------------------------------------------------------------------
     # Pending actions queue (decisions live in argus.actions)
@@ -791,20 +903,25 @@ class Vault:
             reasons=list(reasons or []),
         )
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO pending_actions (id, created_at, decided_at,"
-                " source, path, sha256, action, severity, verdict,"
-                " detection_name, reasons, status, entry_id, error)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    pending.id, pending.created_at, pending.decided_at,
-                    pending.source, pending.path, pending.sha256,
-                    pending.action, pending.severity, pending.verdict,
-                    pending.detection_name, json.dumps(pending.reasons),
-                    pending.status, pending.entry_id, pending.error,
-                ),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    "INSERT INTO pending_actions (id, created_at, decided_at,"
+                    " source, path, sha256, action, severity, verdict,"
+                    " detection_name, reasons, status, entry_id, error)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        pending.id, pending.created_at, pending.decided_at,
+                        pending.source, pending.path, pending.sha256,
+                        pending.action, pending.severity, pending.verdict,
+                        pending.detection_name, json.dumps(pending.reasons),
+                        pending.status, pending.entry_id, pending.error,
+                    ),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                raise QuarantineError(
+                    f"could not record the pending action: {exc}"
+                ) from exc
         return pending
 
     def get_pending(self, pending_id: str) -> PendingAction | None:
@@ -844,9 +961,14 @@ class Vault:
         error: str | None = None,
     ) -> None:
         with self._lock:
-            self._conn.execute(
-                "UPDATE pending_actions SET status = ?, decided_at = ?,"
-                " entry_id = ?, error = ? WHERE id = ?",
-                (status, _utcnow_iso(), entry_id, error, pending_id),
-            )
-            self._conn.commit()
+            try:
+                self._conn.execute(
+                    "UPDATE pending_actions SET status = ?, decided_at = ?,"
+                    " entry_id = ?, error = ? WHERE id = ?",
+                    (status, _utcnow_iso(), entry_id, error, pending_id),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                raise QuarantineError(
+                    f"could not update the pending action: {exc}"
+                ) from exc
