@@ -7,10 +7,13 @@ vault / history / action engine, and answers the questions pages ask
 Phase 3 ArgusService for in-app real-time protection, and ScanWorker
 runs scans off the UI thread with progress signals.
 
-Simulation mode is honored here at the single choke point: when the
-Dev Toolkit's simulation toggle is on, :meth:`GuiBackend.actions`
-returns the simulated engine that records intent and touches
-nothing.
+Simulation mode is honored by the ACTIONS layer itself, which
+consults the persisted Dev Toolkit flag at act time through
+:func:`argus.devtools.simulation_status` — the ONE reader of the
+devtools settings (fix round 2): the GUI's banner view below reads
+through the same function, and a settings file that cannot be
+parsed means simulation is ON (fail-safe) everywhere, with the
+warning surfaced on the dashboard.
 """
 
 from __future__ import annotations
@@ -24,18 +27,23 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from .. import action_requests
+from .. import action_requests, devtools, setup_engine
 from ..actions import ActionEngine
 from ..config import DEFAULT_CONFIG_NAME, ArgusConfig
-from ..devtools import DevSettings, SimulatedActionEngine, evaluate_signals
-from ..heuristics.analyze import analyze_file
-from ..paths import data_dir, default_pending_db, vault_view_path
-from ..quarantine import QuarantineEntry, Vault, read_pending_db
+from ..devtools import DevSettings, evaluate_signals
+from ..heuristics.analyze import analyze_file, waive_oversize_floor
+from ..paths import data_dir, default_pending_db, pending_view_path, vault_view_path
+from ..quarantine import QuarantineEntry, Vault, read_pending_view
 from ..reporting import History
 from ..rules import BUILTIN_RULES
 from ..scanner import ScannedFile, iter_files, scan_file
 from ..service import ArgusService
-from ..signatures import SignatureDB, SignatureError, bootstrap_signature_db
+from ..signatures import (
+    SignatureDB,
+    SignatureError,
+    bootstrap_signature_db,
+    ensure_signature_db,
+)
 
 log = logging.getLogger("argus.gui")
 
@@ -66,21 +74,39 @@ class GuiBackend:
         # an error, but it must never stop the GUI from opening:
         # record it, log it loudly, and let scans surface it.
         self.signature_db_error: str | None = None
+        #: True when the signature database could only be
+        # verified structurally from THIS account because its
+        # authentication key lives where standard users cannot
+        # read it (the installed layout's service-only vault
+        # subtree) — verification is deferred to the protection
+        # service, which reports its own verdict in its status
+        # (fix round 2, FIX 3). The dashboard must NOT show the
+        # red couldn't-open banner for this state.
+        self.signature_db_auth_deferred: bool = False
         try:
-            bootstrap_signature_db(self.config.signature_db)
+            info = bootstrap_signature_db(self.config.signature_db)
+            if info is None:
+                info = ensure_signature_db(self.config.signature_db)
+            if info is not None and getattr(info, "auth_deferred", False):
+                self.signature_db_auth_deferred = True
         except SignatureError as exc:
             self.signature_db_error = str(exc)
             log.error("signature database bootstrap: %s", exc)
+        # The Dev Toolkit settings live at the devtools module's
+        # OWN default (the shared folder): the ActionEngine's
+        # act-time simulation check reads
+        # devtools.default_devtools_path(), so the GUI's toggle
+        # must write the SAME file or the two would silently
+        # disagree about whether simulation is on.
         self.devtools_path = (
             Path(devtools_path)
             if devtools_path
-            else base / "argus-devtools.json"
+            else devtools.default_devtools_path()
         )
         self.dev = DevSettings.load(self.devtools_path)
         self._vault: Vault | None = None
         self._history: History | None = None
         self._actions: ActionEngine | None = None
-        self.simulated = SimulatedActionEngine()
 
     # -- persistence ---------------------------------------------------
     def save_config(self) -> None:
@@ -93,9 +119,29 @@ class GuiBackend:
     def save_dev(self) -> None:
         self.dev.save(self.devtools_path)
 
+    def simulation_status(self) -> tuple[bool, str | None]:
+        """(simulation_on, warning) for banners and routing —
+        read through :func:`argus.devtools.simulation_status`,
+        the ONE settings reader the actions seam also uses (fix
+        round 2, FIX 6), OR'd with this session's settings
+        object: the Dev Toolkit toggle flips the object and
+        saves it in the same gesture, and either one saying ON
+        means ON — for a safety flag, the safe direction wins
+        every disagreement. A corrupt settings file forces ON
+        plus the warning, whatever the object says."""
+        on, warning = devtools.simulation_status(self.devtools_path)
+        if warning is not None:
+            return True, warning
+        return bool(on or self.dev.simulation_mode), None
+
     @property
     def simulation_mode(self) -> bool:
-        return self.dev.simulation_mode
+        """The Dev Toolkit simulation flag as the GUI knows it —
+        see :meth:`simulation_status`. This property is a VIEW
+        for banners and routing only; whether an action is
+        actually simulated is decided inside the engine, which
+        consults the same single reader at act time."""
+        return self.simulation_status()[0]
 
     # -- stores ---------------------------------------------------------
     def pending_db_path(self) -> Path:
@@ -161,10 +207,44 @@ class GuiBackend:
             return [], False
 
     def pending_actions_loose(self):
-        """Pending actions read straight from the shared pending
-        database — for when the vault itself cannot be opened by
-        this process (installed layout, standard user)."""
-        return read_pending_db(self.pending_db_path())
+        """Pending actions for DISPLAY from the service-published
+        pending view (``shared/pending-view.json``).
+
+        The pending database itself now lives in the trusted,
+        service-owned vault directory (see
+        :func:`argus.paths.default_pending_db`): in the installed
+        layout this process must NOT read or write it directly —
+        the view the service publishes is the display source."""
+        return read_pending_view(pending_view_path())
+
+    def owns_pending_store(self) -> bool:
+        """True when THIS process owns the pending store: the
+        portable edition (data beside the exe) or a process that
+        can write the vault directory (elevated / dev tree). Only
+        then may the GUI open the pending database directly."""
+        if setup_engine.is_portable():
+            return True
+        vault_dir = Path(self.config.vault_dir or _default_vault())
+        return action_requests.path_writable(vault_dir)
+
+    def pending_display(self) -> tuple[list, bool]:
+        """Pending actions for display: ``(rows, via_service)``.
+
+        Direct from the action engine when this process owns the
+        store; otherwise from the service-published pending view,
+        with decisions routed through the service request channel
+        (``via_service`` True)."""
+        if self.owns_pending_store():
+            try:
+                return self.actions().list_pending(), False
+            except Exception:
+                log.exception(
+                    "pending store not readable directly — using the view"
+                )
+        return (
+            [p for p in self.pending_actions_loose() if p.status == "pending"],
+            True,
+        )
 
     def history(self) -> History:
         if self._history is None:
@@ -173,11 +253,12 @@ class GuiBackend:
             )
         return self._history
 
-    def actions(self) -> ActionEngine | SimulatedActionEngine:
-        """The action surface for destructive operations — real or
-        simulated, decided here and nowhere else."""
-        if self.dev.simulation_mode:
-            return self.simulated
+    def actions(self) -> ActionEngine:
+        """The action surface for destructive operations — the
+        ONE engine seam. Simulation is the actions layer's own
+        concern (it consults the persisted Dev Toolkit flag), so
+        this always returns the real engine; there is no parallel
+        simulated engine to route to."""
         if self._actions is None:
             self._actions = ActionEngine(
                 self.vault(),
@@ -188,18 +269,10 @@ class GuiBackend:
         return self._actions
 
     def real_actions(self) -> ActionEngine:
-        """The real action engine even in simulation mode. Used for
-        read-only bookkeeping (dashboard counts) — decisions
-        themselves route through :meth:`actions` like everywhere
-        else, so simulation mode records intent instead of acting."""
-        if self._actions is None:
-            self._actions = ActionEngine(
-                self.vault(),
-                self.config,
-                config_path=self.config_path,
-                history=self.history(),
-            )
-        return self._actions
+        """Backwards-compatible alias of :meth:`actions` — the
+        real/simulated split this name used to mark has collapsed
+        into the single engine seam."""
+        return self.actions()
 
     # -- dashboard numbers ---------------------------------------------
     def dashboard_numbers(self) -> dict:
@@ -209,11 +282,14 @@ class GuiBackend:
         recent = history.recent_scans(limit=1)
         try:
             quarantined = self.vault().count(status="quarantined")
-            pending = len(self.real_actions().list_pending())
+            pending_rows, _via = self.pending_display()
+            pending = len(pending_rows)
         except Exception:
             # Installed layout, standard user: the vault is not
-            # readable here — count from the published view and the
-            # shared pending database instead of failing the page.
+            # readable here — count from the published views (the
+            # vault view and the pending view) instead of failing
+            # the page. The trusted pending database itself is
+            # never touched by this process in that layout.
             entries, _direct = self.vault_entries_view()
             quarantined = sum(
                 1 for e in entries if e.status == "quarantined"
@@ -294,27 +370,58 @@ class ProtectionController(QObject):
         self._backend = backend
         self._service: ArgusService | None = None
         self._last_external_status: dict | None = None
+        self._last_setup_state = None
         # When no in-process engine runs, protection state comes
         # from the service heartbeat file — poll it so the
         # dashboard cannot freeze on a stale "protected" (a service
         # that stopped heartbeating must turn the banner red, and a
-        # service that came back must clear it).
+        # service that came back must clear it). The setup state is
+        # polled alongside: a setup finishing (or a service being
+        # removed) in another process must re-render the dashboard's
+        # setup states without anyone reopening the window.
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(5000)
         self._poll_timer.timeout.connect(self._poll_external_status)
         self._poll_timer.start()
 
+    def setup_state(self) -> setup_engine.SetupState:
+        """How protection is set up on this machine right now
+        (installed? running? portable?) — the dashboard renders its
+        states from this. Cheap enough to poll: one SCM query."""
+        return setup_engine.detect_state()
+
     def _poll_external_status(self) -> None:
         if self._service is not None:
             return  # the in-process engine reports its own changes
         current = self.status()
-        if current != self._last_external_status:
+        state = self.setup_state()
+        if (
+            current != self._last_external_status
+            or state != self._last_setup_state
+        ):
             self._last_external_status = current
+            self._last_setup_state = state
             self.status_changed.emit(current)
 
     def _on_engine_event(self, event) -> None:
         self.detection.emit(event.to_dict())
         self.status_changed.emit(self.status())
+
+    def begin_setup(self) -> bool:
+        """Kick off the one-time setup: relaunch this same program
+        elevated with ``--run-setup`` (one Windows permission
+        prompt) and let the polling notice when protection comes
+        up. A declined prompt is a designed state, not an error
+        dump: the dashboard shows the permission message with the
+        same button to try again."""
+        if setup_engine.relaunch_as_admin(["--run-setup"]):
+            return True
+        self.failed.emit(
+            "Argus needs your permission to finish setting up. "
+            "Choose “Set up protection” and allow the Windows "
+            "prompt to continue."
+        )
+        return False
 
     def start(self) -> bool:
         if self._service is not None:
@@ -330,15 +437,71 @@ class ProtectionController(QObject):
                 "in the Dev Toolkit to start real protection."
             )
             return False
+        if IS_WINDOWS:
+            state = self.setup_state()
+            if state is setup_engine.SetupState.NOT_INSTALLED:
+                # Never start a local engine here: on an installed
+                # layout this window cannot (and must not) touch
+                # the protection vault — setup is the only honest
+                # next step, and the dashboard offers it as one.
+                self.failed.emit(
+                    "Protection isn't set up on this PC yet. "
+                    "Choose “Set up protection” to finish — it "
+                    "takes a few seconds."
+                )
+                return False
+            if state is setup_engine.SetupState.INSTALLED_INCOMPLETE:
+                # A partial install (service present, registration
+                # incomplete): starting is not the fix — finishing
+                # setup is. Re-entering install() heals it, because
+                # install is resumable per-step.
+                self.failed.emit(
+                    "Protection was only partly set up on this PC. "
+                    "Choose “Finish setting up protection” — Argus "
+                    "will complete the missing pieces."
+                )
+                return False
+            if state is setup_engine.SetupState.INSTALLED_STOPPED:
+                # The service exists but is stopped: starting IT is
+                # the action (through one permission prompt). The
+                # in-process engine must never run against the
+                # installed layout — that was the v1.0.5 dead end
+                # (a raw "Access is denied" on the vault).
+                if setup_engine.start_service_elevated():
+                    return True
+                self.failed.emit(
+                    "Argus needs your permission to turn protection "
+                    "on. Choose “Turn protection on” and allow the "
+                    "Windows prompt to continue."
+                )
+                return False
+            if state is setup_engine.SetupState.RUNNING:
+                return True  # the service already has it
         service = ArgusService(
             config_path=str(self._backend.config_path),
             on_event=self._on_engine_event,
         )
         try:
             service.start()
-        except Exception as exc:  # reported, never swallowed
-            self.failed.emit(f"Protection could not start: {exc}")
+        except PermissionError:
+            # Belt and braces for the v1.0.5 failure class: any
+            # local start that hits the installed layout's locked
+            # folders becomes plain language and a route, never a
+            # raw OS error on screen.
+            log.exception("protection start hit a locked folder")
+            self.failed.emit(
+                "Argus can't start protection from this window on "
+                "an installed copy. Choose “Set up protection” so "
+                "Argus can protect this PC the way it's meant to."
+            )
+            return False
+        except Exception:  # reported, never swallowed, never raw
             log.exception("protection failed to start")
+            self.failed.emit(
+                "Protection couldn't start. Close Argus, open it "
+                "again, and try once more — if it keeps failing, "
+                "contact Sentinel Safeguard."
+            )
             return False
         self._service = service
         self.status_changed.emit(self.status())
@@ -364,9 +527,13 @@ class ProtectionController(QObject):
         if self._service is not None:
             try:
                 self._service.reload_config()
-            except Exception as exc:  # reported, never swallowed
-                self.failed.emit(f"Settings could not be applied: {exc}")
+            except Exception:  # reported, never swallowed, never raw
                 log.exception("protection config reload failed")
+                self.failed.emit(
+                    "Your new settings couldn't be applied. "
+                    "Protection is still running with the previous "
+                    "settings."
+                )
                 return
             self.status_changed.emit(self.status())
 
@@ -411,6 +578,40 @@ class ProtectionController(QObject):
             return query_service_state() == "running"
         return True
 
+    def scm_running(self) -> bool:
+        """The Service Control Manager's own word: is
+        ArgusProtection running? (Windows only — anywhere else
+        there is no SCM to ask, and the answer is False.)"""
+        if not IS_WINDOWS:
+            return False
+        from ..winservice import query_service_state
+
+        return query_service_state() == "running"
+
+    def service_managed_stale(self, status: dict | None) -> bool:
+        """The P1-12 branch: the SCM says the service IS running
+        but the heartbeat is stale (or missing), so
+        :meth:`service_managed` — which also demands a fresh
+        heartbeat for its details — does not apply. Protection is
+        still ON (the SCM cannot be fooled by a stale file); only
+        the details are syncing. The dashboard must show exactly
+        that, never "off"."""
+        if self._service is not None:
+            return False
+        if self.service_managed(status):
+            return False  # the fresh-heartbeat branch already covers it
+        return self.scm_running()
+
+    def request_status_refresh(self) -> None:
+        """Force a status re-check NOW (the primary action of the
+        stale-heartbeat dashboard branch): re-read the status
+        file, re-poll the SCM/setup state, and republish."""
+        self._last_external_status = None
+        current = self.status()
+        self._last_external_status = current
+        self._last_setup_state = self.setup_state()
+        self.status_changed.emit(current)
+
     def status(self) -> dict:
         if self._service is not None:
             return self._service.status()
@@ -451,9 +652,12 @@ class ScanWorker(QObject):
     def run(self) -> None:  # thread entry point
         try:
             self.execute(self._roots)
-        except Exception as exc:  # surfaced, never swallowed
+        except Exception:  # surfaced, never swallowed, never raw
             log.exception("scan failed")
-            self.failed.emit(f"The scan could not finish: {exc}")
+            self.failed.emit(
+                "The scan couldn't finish. Try the scan again — "
+                "if it keeps failing, restart Argus."
+            )
 
     def execute(self, roots: list[Path]) -> dict:
         """Scan *roots* now (blocking). Returns the summary dict that
@@ -521,10 +725,39 @@ class ScanWorker(QObject):
         if scanned.result.error or scanned.result.sha256 is None:
             return
         report = analyze_file(scanned.result.path, scanned.result.size)
-        evaluation = evaluate_signals(
-            report.signals, self._backend.dev, signed=report.signed
-        )
         assessment = scanned.assessment
+        # The scanner's oversize-floor waiver, applied identically
+        # here (one shared helper — the verdicts cannot diverge):
+        # this fresh report re-derives the floor, so it is waived
+        # again under the same conditions, with the rule half
+        # decided by the detections the scanner recorded.
+        waive_oversize_floor(
+            report,
+            rule_detection_count=sum(
+                1 for det in assessment.detections if det.kind == "rule"
+            ),
+        )
+        # Signals the SCANNER already surfaced on this assessment
+        # must survive the toolkit re-scoring — above all the
+        # tamper signal (argus_program_file_replaced), which the
+        # scanner attaches when a file sits at Argus's own program
+        # address without an identity proof. The fresh analysis
+        # report cannot know about it, so overwriting
+        # assessment.signals with the report's signals alone would
+        # silently drop the tamper indicator from the GUI surface.
+        report_names = {sig.name for sig in report.signals}
+        carried = [
+            sig for sig in assessment.signals if sig.name not in report_names
+        ]
+        evaluation = evaluate_signals(
+            list(report.signals) + carried, self._backend.dev,
+            # The signed trim is EARNED (P1-20): a DER-parsed PKCS#7
+            # SignedData with an extracted signer — the same
+            # eligibility argus.scoring requires — never the mere
+            # structural presence of a certificate table.
+            signed=getattr(report, "signed_trim_eligible", report.signed),
+            trusted_system_file=report.trusted_system_file,
+        )
         assessment.signals = evaluation.counted_signals
         assessment.score = evaluation.score
         assessment.heuristic_verdict = evaluation.verdict
