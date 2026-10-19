@@ -1,0 +1,41 @@
+ARGUS.EXE — License Agreement
+Sentinel Safeguard LLC
+
+Please read this agreement. By installing or using ARGUS.EXE
+("Argus"), you accept these terms.
+
+1. WHO OWNS ARGUS
+Argus is owned by Sentinel Safeguard LLC. Installing it gives you
+a license to use it — it does not transfer ownership of the
+software to you.
+
+2. WHAT YOU MAY DO
+You may install and use Argus on computers you own or are
+authorized to protect — at home or in your business — at no
+charge under this license.
+
+3. WHAT YOU MAY NOT DO
+- Sell, rent, or redistribute Argus or copies of it.
+- Claim Argus is your own product, or remove Sentinel Safeguard
+  branding or notices from it.
+- Use Argus to violate the law or another person's rights.
+
+4. YOUR FILES AND YOUR DECISIONS
+Argus never deletes a file silently. Quarantine is reversible,
+and permanent deletion always waits for your explicit decision.
+Your quarantine vault and scan history stay on your machine;
+uninstalling keeps them unless you choose "remove all data."
+
+5. NO WARRANTY
+Antivirus software cannot catch everything, and Argus is
+provided "as is" without warranties of any kind. Sentinel
+Safeguard LLC is not liable for damages arising from the use or
+inability to use Argus. Keep backups of anything that matters.
+
+6. CHANGES
+Future versions of Argus may be offered under different terms.
+Any version you already have stays yours to use under the terms
+it came with.
+
+Sentinel Safeguard LLC — Security For Everyone
+Kansas City, Missouri
