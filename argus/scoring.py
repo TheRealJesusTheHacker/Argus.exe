@@ -22,6 +22,17 @@ Two adjustments keep the model honest:
   so a certificate table trims points (signed software has an
   accountable publisher) but can never whitewash a file to Clean from
   a Malicious-level score, and never cancels a critical combination.
+- **A recognised Windows system file is not scored for its PE
+  content.** When a file is a structurally-valid signed Microsoft
+  binary in its proper system location (see
+  :mod:`argus.heuristics.analyze`), its PE-content heuristic
+  signals are zeroed: normal operating-system files must not be
+  flagged for having ordinary system-binary properties.
+  Filename/masquerade signals and the oversize floor are not PE
+  content and are NEVER zeroed. This clears ONLY (part of) the
+  heuristic score — a signature-database match or a pattern-rule
+  detection on the same file still decides the verdict on its
+  own, and every signal stays listed on the report.
 
 Every point in a score traces back to a named signal with a
 plain-language explanation. No opaque math, no scareware inflation.
@@ -46,6 +57,34 @@ CRITICAL_COMBINATIONS: tuple[frozenset[str], ...] = (
     frozenset({"process_injection_combo", "high_entropy_executable_section"}),
 )
 
+#: Signals system-file trust can NEVER zero (v1.1.0 hunt P0-3 /
+#: L7 P2). Trust is a statement about PE *content* heuristics —
+#: that a genuine Windows binary's sections/imports/strings look
+#: the way Windows binaries look. It says nothing about the
+#: file's NAME (masquerade is a property of the name, not the
+#: content, and a trusted binary wearing a lying name is still
+#: lying), nothing about the oversize floor (a file too large to
+#: fully analyse was, by definition, not cleared by analysis),
+#: and nothing about Argus's own tamper indicator.
+TRUST_PROTECTED_SIGNAL_NAMES = frozenset({
+    "rtl_override_filename",
+    "double_extension",
+    "system_binary_masquerade",
+    "oversize_not_fully_analyzed",
+    "argus_program_file_replaced",
+})
+
+#: "Hot pocket" window signals (v1.1.0 hunt P2): a high-entropy
+#: pocket found by the sliding windows. Their points carry a
+#: FLOOR through the signed trim: the trim may reduce a score,
+#: but it may not dilute a hot pocket's contribution to zero —
+#: dilution (a small hot pocket inside a large signed file) is
+#: exactly how pockets hide.
+HOT_POCKET_SIGNAL_NAMES = frozenset({
+    "high_entropy_window_in_section",
+    "high_entropy_outside_sections",
+})
+
 
 @dataclass
 class ScoredSignals:
@@ -56,6 +95,10 @@ class ScoredSignals:
     score: int = 0
     signed: bool = False
     short_circuit: bool = False
+    #: True when the file was recognised as a signed Windows
+    #: system file: the heuristic score was zeroed in full (raw
+    #: score and signals are still recorded — nothing is hidden).
+    trusted_system_file: bool = False
 
     @property
     def verdict(self) -> Verdict:
@@ -81,17 +124,59 @@ class ScoredSignals:
 _SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
-def score_signals(signals: list[Signal], *, signed: bool = False) -> ScoredSignals:
+def score_signals(
+    signals: list[Signal],
+    *,
+    signed: bool = False,
+    trusted_system_file: bool = False,
+) -> ScoredSignals:
     """Combine heuristic *signals* into a score and verdict.
 
-    ``signed`` records that the file carries an Authenticode
-    certificate table; it trims the score (see module docstring) but
-    never below the Suspicious line when the raw score was at
-    Malicious level, and never overrides a critical combination.
+    ``signed`` records that the signed score trim applies (see
+    module docstring): it lowers but never erases, never below the
+    Suspicious line when the raw score was at Malicious level, and
+    never overrides a critical combination. Since
+    the v1.1.0 hunt (P1-20) callers may only pass True when the
+    certificate payload DER-parses as PKCS#7 SignedData WITH an
+    extracted signer — a certificate region that is mere junk
+    bytes earns no trim, however valid its table header looks.
+
+    ``trusted_system_file`` records that the file was recognised
+    as a signed Windows system file in a system location: the
+    PE-content heuristic score is zeroed outright (critical
+    combinations included — a combination of system-binary
+    properties inside a genuine system file is a description of
+    Windows, not of malware). Filename/masquerade signals and the
+    oversize floor are NOT content heuristics and are never
+    zeroed (see :data:`TRUST_PROTECTED_SIGNAL_NAMES`): they keep
+    their points and can still carry the verdict. Only the
+    HEURISTIC score is affected either way; signature and rule
+    detections are combined elsewhere and never cleared here.
     """
     raw = sum(sig.points for sig in signals)
     names = {sig.name for sig in signals}
     short_circuit = any(combo <= names for combo in CRITICAL_COMBINATIONS)
+
+    if trusted_system_file:
+        protected = sum(
+            sig.points
+            for sig in signals
+            if sig.name in TRUST_PROTECTED_SIGNAL_NAMES
+        )
+        protected_names = names & TRUST_PROTECTED_SIGNAL_NAMES
+        return ScoredSignals(
+            signals=list(signals),
+            raw_score=raw,
+            score=protected,
+            signed=signed,
+            # A critical combination can only be completed by
+            # protected signals; the known combinations are pure
+            # PE-content, so trust clears them by construction.
+            short_circuit=any(
+                combo <= protected_names for combo in CRITICAL_COMBINATIONS
+            ),
+            trusted_system_file=True,
+        )
 
     score = raw
     if signed and raw > 0:
@@ -101,6 +186,18 @@ def score_signals(signals: list[Signal], *, signed: bool = False) -> ScoredSigna
             # at least a Suspicious verdict after the discount.
             score = max(score, SUSPICIOUS_THRESHOLD)
         score = max(score, 0)
+        # Hot-pocket floor: the trim cannot dilute a sliding-window
+        # high-entropy pocket's own contribution to zero.
+        pocket_points = sum(
+            sig.points for sig in signals if sig.name in HOT_POCKET_SIGNAL_NAMES
+        )
+        if pocket_points:
+            score = max(score, min(pocket_points, raw))
+    if "oversize_not_fully_analyzed" in names:
+        # The oversize signal's own contract: a file that was not
+        # fully analysed is rated AT LEAST Suspicious — no trim
+        # may talk it back under the line it promises.
+        score = max(score, SUSPICIOUS_THRESHOLD)
 
     return ScoredSignals(
         signals=list(signals),
@@ -108,4 +205,5 @@ def score_signals(signals: list[Signal], *, signed: bool = False) -> ScoredSigna
         score=score,
         signed=signed,
         short_circuit=short_circuit,
+        trusted_system_file=trusted_system_file,
     )
