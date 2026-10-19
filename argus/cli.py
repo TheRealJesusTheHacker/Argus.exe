@@ -40,7 +40,7 @@ from .actions import (
 )
 from .config import DEFAULT_CONFIG_NAME, ArgusConfig
 from .detections import Verdict
-from .paths import default_history_db, default_vault_dir
+from .paths import data_dir, default_history_db, default_vault_dir
 from .quarantine import QuarantineEntry, QuarantineError, Vault
 from .realtime import RealtimeEvent
 from .reporting import (
@@ -52,7 +52,13 @@ from .reporting import (
 from .rules import BUILTIN_RULES, Rule, RuleError, load_rules
 from .scanner import ScanReport, ScannedFile, scan_path
 from .service import ArgusService, read_status_file
-from .signatures import DEFAULT_DB_NAME, SignatureDB, SignatureError, init_db
+from .signatures import (
+    DEFAULT_DB_NAME,
+    SignatureDB,
+    SignatureError,
+    ensure_signature_db,
+    init_db,
+)
 
 EXIT_CLEAN = 0
 EXIT_DETECTIONS = 1
@@ -348,11 +354,21 @@ def _cmd_scan(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return EXIT_ERROR
 
+    # Database bootstrap: with no explicit --db, Argus uses (and on
+    # first run creates + seeds) the database in its data folder, so
+    # a fresh install scans out of the box. An explicitly named --db
+    # is the user's own file: if it is missing, that is an error
+    # worth saying out loud, not something to quietly paper over.
+    if args.db is not None:
+        db_path = Path(args.db)
+    else:
+        db_path = data_dir() / DEFAULT_DB_NAME
+        ensure_signature_db(db_path)
     try:
-        db = SignatureDB.open(args.db)
+        db = SignatureDB.open(db_path)
     except SignatureError as exc:
         print(f"Error: {exc}", file=sys.stderr)
-        print(f"Build a database first: python -m argus sigdb init {args.db}",
+        print(f"Build a database first: python -m argus sigdb init {db_path}",
               file=sys.stderr)
         return EXIT_ERROR
 
@@ -809,8 +825,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_scan = sub.add_parser("scan", help="scan a file or folder")
     p_scan.add_argument("path", help="file or folder to scan")
-    p_scan.add_argument("--db", default=DEFAULT_DB_NAME,
-                        help=f"signature database path (default: {DEFAULT_DB_NAME})")
+    p_scan.add_argument("--db", default=None,
+                        help="signature database path (default: "
+                             f"{DEFAULT_DB_NAME} in the Argus data "
+                             "folder, created and seeded on first use)")
     p_scan.add_argument("--rules", default=None,
                         help="optional JSON file with extra/replacement rules")
     p_scan.add_argument("--no-heuristics", action="store_true",
