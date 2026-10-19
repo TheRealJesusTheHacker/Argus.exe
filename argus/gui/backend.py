@@ -61,11 +61,19 @@ class GuiBackend:
         devtools_path: Path | str | None = None,
     ):
         base = data_dir()
-        self.config_path = (
-            Path(config_path)
-            if config_path
-            else base / DEFAULT_CONFIG_NAME
-        )
+        if config_path:
+            self.config_path = Path(config_path)
+        elif sys.platform.startswith("linux"):
+            # The .deb edition (v1.2.0): an admin-placed config in
+            # /etc/argus wins for the GUI exactly as it does for
+            # the service — one helper, one answer, so the window
+            # and the protection service can never read different
+            # settings (see argus.linuxservice.preferred_config_path).
+            from .. import linuxservice
+
+            self.config_path = linuxservice.preferred_config_path()
+        else:
+            self.config_path = base / DEFAULT_CONFIG_NAME
         self.config = ArgusConfig.load(self.config_path)
         # First-run bootstrap: a fresh install has no signature
         # database yet — create + seed the DEFAULT one so the first
