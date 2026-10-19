@@ -20,6 +20,7 @@ flat (byte counters plus one 4 KiB window buffer), whether the file is
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass, field
 
 #: At or above this, data is considered high-entropy (packed/encrypted
@@ -48,13 +49,23 @@ def _entropy_from_counts(counts: list[int] | tuple[int, ...], total: int) -> flo
     return entropy
 
 
+def _add_counts(histogram: list[int], data: bytes) -> None:
+    """Add *data*'s byte histogram into *histogram* (a 256-bin list).
+
+    Bulk-counted with :class:`collections.Counter` (C-accelerated)
+    instead of a per-byte Python loop — identical results, far less
+    time on multi-MB streams.
+    """
+    for value, n in Counter(data).items():
+        histogram[value] += n
+
+
 def shannon_entropy(data: bytes) -> float:
     """Shannon entropy of an in-memory buffer (0.0–8.0 bits per byte)."""
     if not data:
         return 0.0
     counts = [0] * 256
-    for byte in data:
-        counts[byte] += 1
+    _add_counts(counts, data)
     return _entropy_from_counts(counts, len(data))
 
 
@@ -100,16 +111,14 @@ class EntropyAnalyzer:
     def feed(self, chunk: bytes) -> None:
         if not chunk:
             return
-        for byte in chunk:
-            self._total_counts[byte] += 1
+        _add_counts(self._total_counts, chunk)
         self._total += len(chunk)
 
         view = chunk
         while view:
             room = self._window_size - self._win_len
             take = view[:room]
-            for byte in take:
-                self._win_counts[byte] += 1
+            _add_counts(self._win_counts, take)
             self._win_len += len(take)
             view = view[len(take):]
             if self._win_len == self._window_size:
@@ -179,9 +188,7 @@ class SectionEntropyTracker:
             if lo >= hi:
                 continue
             piece = chunk[lo - offset : hi - offset]
-            counts = self._counts[idx]
-            for byte in piece:
-                counts[byte] += 1
+            _add_counts(self._counts[idx], piece)
             self._totals[idx] += len(piece)
 
     def entropy_for(self, index: int) -> float | None:
