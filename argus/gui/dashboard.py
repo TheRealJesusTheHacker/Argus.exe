@@ -130,12 +130,27 @@ class DashboardPage(QWidget):
     def set_status(self, status: dict) -> None:
         headline, detail, tone = protection_headline(status)
         self.headline_label.setText(headline)
-        self.detail_label.setText(detail)
         self.status_dot.setStyleSheet(
             f"font-size: 44px; color: {_TONE_COLORS[tone]};"
         )
         running = bool(status.get("running"))
         paused = bool(status.get("paused"))
+        if self._protection.service_managed(status):
+            # Protection is run by the installed Windows service.
+            # This window must never start a SECOND engine next to
+            # it — the controls hand over to the service instead.
+            self.detail_label.setText(
+                detail + " Protection is managed by the Argus "
+                "Windows service — it started with Windows and runs "
+                "whether or not this window is open."
+            )
+            self.toggle_button.setText("Managed by the Windows service")
+            self.toggle_button.setEnabled(False)
+            self.pause_button.setText("Pause")
+            self.pause_button.setEnabled(False)
+            return
+        self.detail_label.setText(detail)
+        self.toggle_button.setEnabled(True)
         self.toggle_button.setText(
             "Turn protection off" if running else "Turn protection on"
         )
@@ -161,6 +176,8 @@ class DashboardPage(QWidget):
 
     # ------------------------------------------------------------------
     def _toggle_protection(self) -> None:
+        if self._protection.service_managed(self._protection.status()):
+            return  # the Windows service owns protection right now
         if self._protection.running:
             self._protection.stop()
         else:
