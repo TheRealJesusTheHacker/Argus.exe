@@ -14,9 +14,9 @@ where asking becomes doing — carefully. The rules are absolute:
   real-time policy, permanent deletion waits for a human. The most a
   policy may do unattended is *quarantine* a Critical file —
   quarantine is reversible, deletion is not.
-- **Quarantine-first.** Deleting a file "for real" routes it through
-  the vault first (so the vault index keeps the audit record) unless
-  the caller explicitly asks for a direct delete.
+- **Quarantine-first.** Deleting a file "for real" always routes it
+  through the vault first (so the vault index keeps the audit
+  record) — there is no direct-delete route.
 
 Real-time integration: :meth:`ActionEngine.handle_realtime_event`
 consumes the engine's events under ``config.realtime_default``:
@@ -76,6 +76,33 @@ class ConfirmationRequired(ActionError):
     retrying with ``confirmed=True`` without an actual human/policy
     decision behind it would defeat the point.
     """
+
+
+def _simulation_on(override: bool | None) -> bool:
+    """The one simulation seam (P1-9): an explicit override wins;
+    otherwise the persisted Dev Toolkit flag is consulted AT ACT
+    TIME, so a flag flipped after this engine was built still
+    blocks the action."""
+    if override is not None:
+        return bool(override)
+    try:
+        from .devtools import simulation_mode_enabled
+
+        return simulation_mode_enabled()
+    except Exception:
+        return False
+
+
+def _simulated_outcome(action: str, path: str, would: str) -> "ActionOutcome":
+    return ActionOutcome(
+        action=action,
+        path=str(path),
+        done=False,
+        message=(
+            f"Simulation mode is on: Argus would {would} — "
+            "nothing was touched, no records were changed."
+        ),
+    )
 
 
 def _require_confirmed(confirmed: bool, what: str) -> None:
@@ -159,9 +186,24 @@ class ActionEngine:
         info: DetectionInfo,
         *,
         confirmed: bool = False,
+        simulation: bool | None = None,
     ) -> ActionOutcome:
         """Move *path* into the quarantine vault."""
         _require_confirmed(confirmed, f"Quarantining {path}")
+        if _simulation_on(simulation):
+            return _simulated_outcome(
+                QUARANTINE, str(path),
+                f"quarantine {Path(path).name} ({path})",
+            )
+        if info.sha256 is None:
+            raise ActionError(
+                "Argus cannot quarantine this file: no fingerprint "
+                "(SHA-256) was recorded for it, so the quarantined "
+                "copy could not be verified against the file that "
+                "was flagged. Scan the file again and retry from "
+                "the fresh result — quarantining without a "
+                "fingerprint is refused."
+            )
         entry = self.vault.quarantine_file(
             path,
             detection_name=info.name,
@@ -189,52 +231,38 @@ class ActionEngine:
         info: DetectionInfo,
         *,
         confirmed: bool = False,
-        direct: bool = False,
+        simulation: bool | None = None,
     ) -> ActionOutcome:
         """Permanently delete *path*.
 
-        Default route goes through the vault first, so the vault
-        index keeps an audit record of what was destroyed and why.
-        ``direct=True`` skips the vault (the file is removed where it
-        stands) — only history remembers it. Either way this needs
-        explicit confirmation; there is no automatic delete anywhere
-        in Argus.
+        The only route goes through the vault first, so the vault
+        index keeps an audit record of what was destroyed and why
+        (the former ``direct=True`` route was removed in v1.1.0).
+        This needs explicit confirmation; there is no automatic
+        delete anywhere in Argus.
         """
         _require_confirmed(confirmed, f"Permanently deleting {path}")
+        if _simulation_on(simulation):
+            return _simulated_outcome(
+                DELETE, str(path),
+                f"permanently delete {Path(path).name} ({path})",
+            )
         target = Path(path)
         if not target.is_file():
             raise ActionError(f"nothing to delete at {target}")
         sha256 = info.sha256
         if sha256 is None:
             sha256, _ = hash_file(target)
-        if direct:
-            # A direct delete has no vault step to re-verify the
-            # file, so verify it HERE: the fingerprint the human
-            # approved must be the fingerprint of the file that is
-            # about to disappear. A mismatch means the file changed
-            # since the decision — deleting it would be deleting a
-            # different file than the one that was reviewed.
-            actual, _ = hash_file(target)
-            if actual.lower() != sha256.lower():
-                raise ActionError(
-                    f"{target} changed since it was reviewed (its "
-                    "fingerprint no longer matches the detection). "
-                    "Argus will not delete a file that is not the one "
-                    "you approved — scan it again."
-                )
-            target.unlink()
-            entry_id = None
-        else:
-            entry = self.vault.quarantine_file(
-                target,
-                detection_name=info.name,
-                severity=info.severity,
-                verdict=info.verdict,
-                reasons=info.reasons or [],
-                sha256=sha256,
-            )
-            self.vault.delete_permanent(entry.id)
-            entry_id = entry.id
+        entry = self.vault.quarantine_file(
+            target,
+            detection_name=info.name,
+            severity=info.severity,
+            verdict=info.verdict,
+            reasons=info.reasons or [],
+            sha256=sha256,
+        )
+        self.vault.delete_permanent(entry.id)
+        entry_id = entry.id
         self._record_action(info, str(target), "deleted", sha256)
         return ActionOutcome(
             action=DELETE,
@@ -245,12 +273,18 @@ class ActionEngine:
         )
 
     def allow_entry(
-        self, entry_id: str, *, confirmed: bool = False
+        self, entry_id: str, *, confirmed: bool = False,
+        simulation: bool | None = None,
     ) -> ActionOutcome:
         """Vouch for a quarantined file: restore it, add its
         fingerprint to the exclusions, and mark it allowed — Argus
         will leave that exact file alone from now on."""
         _require_confirmed(confirmed, "Allowing a quarantined file")
+        if _simulation_on(simulation):
+            return _simulated_outcome(
+                ALLOW, f"vault entry {entry_id}",
+                f"restore and allow the file held as vault entry {entry_id}",
+            )
         entry = self.vault.get_entry(entry_id)
         if entry is None:
             raise ActionError(f"no vault entry with id {entry_id}")
@@ -277,11 +311,17 @@ class ActionEngine:
         )
 
     def restore_entry(
-        self, entry_id: str, *, confirmed: bool = False
+        self, entry_id: str, *, confirmed: bool = False,
+        simulation: bool | None = None,
     ) -> ActionOutcome:
         """Put a quarantined file back where it lived (the vault
         never overwrites a file that has since taken its place)."""
         _require_confirmed(confirmed, "Restoring a quarantined file")
+        if _simulation_on(simulation):
+            return _simulated_outcome(
+                RESTORE, f"vault entry {entry_id}",
+                f"restore the file held as vault entry {entry_id}",
+            )
         entry = self.vault.get_entry(entry_id)
         if entry is None:
             raise ActionError(f"no vault entry with id {entry_id}")
@@ -296,11 +336,17 @@ class ActionEngine:
         )
 
     def delete_entry(
-        self, entry_id: str, *, confirmed: bool = False
+        self, entry_id: str, *, confirmed: bool = False,
+        simulation: bool | None = None,
     ) -> ActionOutcome:
         """Permanently destroy a quarantined file. The vault index
         row stays as the audit record."""
         _require_confirmed(confirmed, "Permanently deleting a quarantined file")
+        if _simulation_on(simulation):
+            return _simulated_outcome(
+                DELETE, f"vault entry {entry_id}",
+                f"permanently delete the file held as vault entry {entry_id}",
+            )
         entry = self.vault.get_entry(entry_id)
         if entry is None:
             raise ActionError(f"no vault entry with id {entry_id}")
@@ -322,11 +368,17 @@ class ActionEngine:
         )
 
     def allow_file(
-        self, path: Path | str, *, confirmed: bool = False
+        self, path: Path | str, *, confirmed: bool = False,
+        simulation: bool | None = None,
     ) -> ActionOutcome:
         """Vouch for a file that is still on disk (not quarantined):
         fingerprint it and add the fingerprint to the exclusions."""
         _require_confirmed(confirmed, f"Allowing {path}")
+        if _simulation_on(simulation):
+            return _simulated_outcome(
+                ALLOW, str(path),
+                f"allow (vouch for) {Path(path).name} ({path})",
+            )
         target = Path(path)
         if not target.is_file():
             raise ActionError(f"nothing to allow at {target}")
@@ -383,10 +435,20 @@ class ActionEngine:
     def list_pending(self) -> list[PendingAction]:
         return self.vault.list_pending("pending")
 
-    def approve(self, pending_id: str) -> ActionOutcome:
+    def approve(
+        self, pending_id: str, *, simulation: bool | None = None
+    ) -> ActionOutcome:
         """Carry out a queued action. Approving IS the confirmation —
         a human reviewed this exact file and said yes."""
         pending = self._require_pending(pending_id)
+        if _simulation_on(simulation):
+            outcome = _simulated_outcome(
+                pending.action, pending.path,
+                f"carry out the queued {pending.action} on "
+                f"{Path(pending.path).name} ({pending.path})",
+            )
+            outcome.pending_id = pending_id
+            return outcome
         info = DetectionInfo(
             name=pending.detection_name or "Detection",
             severity=pending.severity,
@@ -421,9 +483,13 @@ class ActionEngine:
                         "the one you approved — scan it again."
                     )
             if pending.action == QUARANTINE:
-                outcome = self.quarantine(pending.path, info, confirmed=True)
+                outcome = self.quarantine(
+                    pending.path, info, confirmed=True, simulation=simulation
+                )
             elif pending.action == DELETE:
-                outcome = self.delete(pending.path, info, confirmed=True)
+                outcome = self.delete(
+                    pending.path, info, confirmed=True, simulation=simulation
+                )
             else:
                 raise ActionError(
                     f"queued action {pending.action!r} cannot be approved"
@@ -589,9 +655,13 @@ class ActionEngine:
                 self.config.absorb_disk_exclusions(self.config_path)
                 self.config.save(self.config_path)
             except OSError as exc:
+                log.warning(
+                    "could not save the exclusion to %s: %r",
+                    self.config_path, exc,
+                )
                 raise ActionError(
-                    f"the file was vouched for, but the exclusion could "
-                    f"not be saved to {self.config_path}: {exc}. It will "
+                    "the file was vouched for, but the exclusion could "
+                    f"not be saved to {self.config_path}. It will "
                     "be allowed until Argus restarts; add the fingerprint "
                     "to your config by hand to keep it permanent."
                 ) from exc
