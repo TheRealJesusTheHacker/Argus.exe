@@ -32,7 +32,12 @@ if the key file is lost, vault contents cannot be restored.
 
 This module also stores the **pending actions** queue: actions that
 policy says Argus may take but a human has not approved yet
-(approve/reject lives in :mod:`argus.actions`).
+(approve/reject lives in :mod:`argus.actions`). Since v1.0.4 the
+queue lives in its OWN database (``pending.db``) — by default in the
+shared data subdirectory, not inside vault.db: pending rows are
+written and decided by user-side processes, while the vault itself
+sits in the trusted root that standard users cannot write (see
+:mod:`argus.paths`). vault.db keeps entries only.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat as statmod
 import struct
 import threading
 import time
@@ -61,6 +67,7 @@ TAG_SIZE = 32  # HMAC-SHA256
 KEY_SIZE = 32
 KEY_FILENAME = "vault.key"
 DB_FILENAME = "vault.db"
+PENDING_DB_FILENAME = "pending.db"
 BLOBS_DIRNAME = "blobs"
 
 #: How long a ``*.tmp`` file in the blob store must sit untouched
@@ -92,8 +99,12 @@ CREATE TABLE IF NOT EXISTS entries (
     blob_name      TEXT,
     resolved_at    TEXT,
     restored_path  TEXT,
-    note           TEXT
+    note           TEXT,
+    mode           INTEGER
 );
+"""
+
+_PENDING_SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending_actions (
     id             TEXT PRIMARY KEY,
     created_at     TEXT NOT NULL,
@@ -302,6 +313,10 @@ class QuarantineEntry:
     resolved_at: str | None = None
     restored_path: str | None = None
     note: str | None = None
+    #: The original file's permission bits (POSIX mode), recorded at
+    #: quarantine time so a restore can put them back. None for
+    #: entries recorded before v1.0.4 (or where stat was unavailable).
+    mode: int | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -319,6 +334,7 @@ class QuarantineEntry:
             "resolved_at": self.resolved_at,
             "restored_path": self.restored_path,
             "note": self.note,
+            "mode": self.mode,
         }
 
     @classmethod
@@ -338,6 +354,7 @@ class QuarantineEntry:
             resolved_at=row["resolved_at"],
             restored_path=row["restored_path"],
             note=row["note"],
+            mode=row["mode"] if "mode" in row.keys() else None,
         )
 
 
@@ -399,31 +416,97 @@ class PendingAction:
 
 
 # ----------------------------------------------------------------------
+# Loose pending-DB reads (no vault key needed)
+# ----------------------------------------------------------------------
+def read_pending_db(path: Path | str) -> list[PendingAction]:
+    """Read pending actions straight from a pending database file.
+
+    For callers that cannot open the vault itself (a standard-user
+    GUI on an installed machine: the vault sits in the trusted root,
+    the pending DB in the shared folder). Missing file/table reads
+    as an empty queue — the queue simply has nothing in it yet.
+    """
+    db_path = Path(path)
+    if not db_path.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(
+            f"{db_path.absolute().as_uri()}?mode=ro", uri=True
+        )
+    except sqlite3.Error:
+        return []
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "pending_actions" not in tables:
+            return []
+        rows = conn.execute(
+            "SELECT * FROM pending_actions ORDER BY created_at"
+        ).fetchall()
+        return [PendingAction._from_row(row) for row in rows]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+# ----------------------------------------------------------------------
 # The vault
 # ----------------------------------------------------------------------
 class Vault:
-    """An opened quarantine vault (directory + key + SQLite index)."""
+    """An opened quarantine vault (directory + key + SQLite index).
 
-    def __init__(self, vault_dir: Path, key: bytes, conn: sqlite3.Connection) -> None:
+    Two databases: ``vault.db`` (entries only — the trusted record
+    of what is held) and the pending-actions database, which by
+    default lives beside the vault but in production sits in the
+    shared data subdirectory (see :meth:`open`).
+    """
+
+    def __init__(
+        self,
+        vault_dir: Path,
+        key: bytes,
+        conn: sqlite3.Connection,
+        pending_conn: sqlite3.Connection,
+        pending_path: Path,
+    ) -> None:
         self.dir = vault_dir
         self.blobs_dir = vault_dir / BLOBS_DIRNAME
         self._key = key
         self._conn = conn
+        self._pending_conn = pending_conn
+        self.pending_path = pending_path
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Opening
     # ------------------------------------------------------------------
     @classmethod
-    def open(cls, vault_dir: Path | str) -> "Vault":
+    def open(
+        cls, vault_dir: Path | str, pending_db_path: Path | str | None = None
+    ) -> "Vault":
         """Open (creating if needed) the vault at *vault_dir*.
 
-        Also sweeps stale ``*.tmp`` files out of the blob store —
-        leftovers from an interrupted quarantine or restore. Only
-        temps older than :data:`STALE_TEMP_AGE_SECONDS` are removed:
+        *pending_db_path* locates the pending-actions database; when
+        omitted it defaults to ``pending.db`` inside the vault
+        directory (portable / dev / direct use). Production callers
+        pass the shared location (:func:`argus.paths.default_pending_db`)
+        so the queue lives outside the trusted vault tree. Pending
+        rows recorded by older versions INSIDE vault.db are migrated
+        across on first open (copied, then the old table is dropped —
+        vault.db keeps entries only).
+
+        Also sweeps stale temp files: ``*.tmp`` leftovers in the blob
+        store, and ``.*.argus-restore-*.tmp`` staging files older
+        than :data:`STALE_TEMP_AGE_SECONDS` in the original folders
+        of recorded entries. Only temps older than that are removed:
         a younger one may belong to an operation in flight in another
-        Argus process sharing this vault. A temp file is never a live
-        blob, so removing a stale one cannot lose a quarantined file.
+        Argus process sharing this vault.
         """
         root = Path(vault_dir)
         blobs = root / BLOBS_DIRNAME
@@ -431,18 +514,38 @@ class Vault:
         key = _load_or_create_key(root)
         conn = sqlite3.connect(root / DB_FILENAME, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        pending_path = (
+            Path(pending_db_path)
+            if pending_db_path is not None
+            else root / PENDING_DB_FILENAME
+        )
+        if pending_path.parent and not pending_path.parent.exists():
+            pending_path.parent.mkdir(parents=True, exist_ok=True)
+        pending_conn = sqlite3.connect(pending_path, check_same_thread=False)
+        pending_conn.row_factory = sqlite3.Row
         try:
-            # The service and the GUI share this database: WAL lets
+            # The service and the GUI share these databases: WAL lets
             # readers and a writer coexist, and busy_timeout makes a
             # contender wait instead of erroring out.
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            for candidate in (conn, pending_conn):
+                candidate.execute("PRAGMA journal_mode=WAL")
+                candidate.execute("PRAGMA busy_timeout=5000")
             conn.executescript(_SCHEMA)
+            # Entries recorded before v1.0.4 have no mode column.
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(entries)")
+            }
+            if "mode" not in columns:
+                conn.execute("ALTER TABLE entries ADD COLUMN mode INTEGER")
+            pending_conn.executescript(_PENDING_SCHEMA)
             conn.commit()
+            pending_conn.commit()
+            Vault._migrate_pending_rows(conn, pending_conn)
         except sqlite3.Error as exc:
             conn.close()
+            pending_conn.close()
             raise QuarantineError(f"could not open vault index: {exc}") from exc
-        vault = cls(root, key, conn)
+        vault = cls(root, key, conn, pending_conn, pending_path)
         cutoff = time.time() - STALE_TEMP_AGE_SECONDS
         for stale in blobs.glob("*.tmp"):
             try:
@@ -451,11 +554,73 @@ class Vault:
                 stale.unlink()
             except OSError:
                 log.warning("could not remove stale vault temp file %s", stale)
+        vault._sweep_stale_restore_staging(cutoff)
         return vault
+
+    @staticmethod
+    def _migrate_pending_rows(
+        conn: sqlite3.Connection, pending_conn: sqlite3.Connection
+    ) -> None:
+        """Move any pending_actions rows still living in vault.db
+        (pre-v1.0.4 layout) into the pending database, then drop the
+        old table so vault.db keeps entries only. Idempotent."""
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "pending_actions" not in tables:
+            return
+        rows = conn.execute("SELECT * FROM pending_actions").fetchall()
+        if rows:
+            columns = [row[1] for row in conn.execute(
+                "PRAGMA table_info(pending_actions)")]
+            placeholders = ", ".join("?" for _ in columns)
+            pending_conn.executemany(
+                f"INSERT OR IGNORE INTO pending_actions "
+                f"({', '.join(columns)}) VALUES ({placeholders})",
+                [tuple(row[col] for col in columns) for row in rows],
+            )
+            pending_conn.commit()
+            log.info(
+                "migrated %d pending action(s) from vault.db to %s",
+                len(rows), "the pending database",
+            )
+        conn.execute("DROP TABLE pending_actions")
+        conn.commit()
+
+    def _sweep_stale_restore_staging(self, cutoff: float) -> None:
+        """Remove abandoned restore staging files
+        (``.<name>.argus-restore-*.tmp``) from the original folders
+        of recorded entries. Best-effort: a restore stages its file
+        in the destination folder, and a crash mid-publish used to
+        leave it there forever."""
+        try:
+            parents = {
+                str(Path(entry.original_path).parent)
+                for entry in self.list_entries()
+            }
+        except QuarantineError:
+            return
+        for parent in parents:
+            folder = Path(parent)
+            try:
+                candidates = list(folder.glob(".*.argus-restore-*.tmp"))
+            except OSError:
+                continue
+            for stale in candidates:
+                try:
+                    if stale.stat().st_mtime >= cutoff:
+                        continue
+                    stale.unlink()
+                except OSError:
+                    pass
 
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+            self._pending_conn.close()
 
     def __enter__(self) -> "Vault":
         return self
@@ -494,7 +659,9 @@ class Vault:
         tmp_path = self.blobs_dir / f"{entry_id}.encrypt.tmp"
         nonce = os.urandom(NONCE_SIZE)
         try:
-            size = source_path.stat().st_size
+            source_stat = source_path.stat()
+            size = source_stat.st_size
+            mode = statmod.S_IMODE(source_stat.st_mode)
             with open(source_path, "rb") as src, open(tmp_path, "wb") as dst:
                 plain_sha = _encrypt_stream(src, dst, self._key, nonce)
         except OSError as exc:
@@ -536,6 +703,7 @@ class Vault:
             reasons=list(reasons or []),
             status="quarantined",
             blob_name=blob_name,
+            mode=mode,
         )
         try:
             self._insert_entry(entry)
@@ -637,14 +805,43 @@ class Vault:
             )
         finally:
             tmp_path.unlink(missing_ok=True)
+        # Put the original permission bits back (recorded at
+        # quarantine time). Best-effort: some filesystems have no
+        # POSIX modes to restore.
+        if entry.mode is not None:
+            try:
+                os.chmod(destination, entry.mode)
+            except OSError:
+                pass
+        # Bookkeeping BEFORE destroying the blob: if the index
+        # update fails, the entry must still match the vault's
+        # contents — an entry saying "quarantined" with no blob
+        # behind it would be a zombie nobody can act on. On failure
+        # the entry is annotated with what happened and the blob is
+        # KEPT, so the restore can be retried cleanly.
+        try:
+            self._update_entry(
+                entry.id,
+                status=final_status,
+                resolved_at=_utcnow_iso(),
+                restored_path=str(destination),
+                blob_name=None,
+            )
+        except QuarantineError as exc:
+            note = (
+                f"restored to {destination}, but Argus could not update "
+                f"its records ({exc}); the vault copy is being kept so "
+                "nothing is lost — restoring again is safe."
+            )
+            try:
+                self._update_entry(entry.id, note=note)
+            except QuarantineError:
+                log.warning(
+                    "could not annotate vault entry %s after restore: %s",
+                    entry.id, note,
+                )
+            raise QuarantineError(note) from exc
         blob_path.unlink(missing_ok=True)
-        self._update_entry(
-            entry.id,
-            status=final_status,
-            resolved_at=_utcnow_iso(),
-            restored_path=str(destination),
-            blob_name=None,
-        )
         log.info("restored entry %s to %s", entry.id, destination)
         return destination
 
@@ -844,13 +1041,15 @@ class Vault:
                     "INSERT INTO entries (id, original_path, sha256, size,"
                     " quarantined_at, detection_name, severity, verdict,"
                     " reasons, status, blob_name, resolved_at, restored_path,"
-                    " note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " note, mode)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         entry.id, entry.original_path, entry.sha256, entry.size,
                         entry.quarantined_at, entry.detection_name,
                         entry.severity, entry.verdict,
                         json.dumps(entry.reasons), entry.status, entry.blob_name,
                         entry.resolved_at, entry.restored_path, entry.note,
+                        entry.mode,
                     ),
                 )
                 self._conn.commit()
@@ -904,7 +1103,7 @@ class Vault:
         )
         with self._lock:
             try:
-                self._conn.execute(
+                self._pending_conn.execute(
                     "INSERT INTO pending_actions (id, created_at, decided_at,"
                     " source, path, sha256, action, severity, verdict,"
                     " detection_name, reasons, status, entry_id, error)"
@@ -917,7 +1116,7 @@ class Vault:
                         pending.status, pending.entry_id, pending.error,
                     ),
                 )
-                self._conn.commit()
+                self._pending_conn.commit()
             except sqlite3.Error as exc:
                 raise QuarantineError(
                     f"could not record the pending action: {exc}"
@@ -926,7 +1125,7 @@ class Vault:
 
     def get_pending(self, pending_id: str) -> PendingAction | None:
         with self._lock:
-            row = self._conn.execute(
+            row = self._pending_conn.execute(
                 "SELECT * FROM pending_actions WHERE id = ?", (pending_id,)
             ).fetchone()
         return PendingAction._from_row(row) if row else None
@@ -934,11 +1133,11 @@ class Vault:
     def list_pending(self, status: str | None = "pending") -> list[PendingAction]:
         with self._lock:
             if status is None:
-                rows = self._conn.execute(
+                rows = self._pending_conn.execute(
                     "SELECT * FROM pending_actions ORDER BY created_at"
                 ).fetchall()
             else:
-                rows = self._conn.execute(
+                rows = self._pending_conn.execute(
                     "SELECT * FROM pending_actions WHERE status = ?"
                     " ORDER BY created_at",
                     (status,),
@@ -947,7 +1146,7 @@ class Vault:
 
     def pending_count(self) -> int:
         with self._lock:
-            row = self._conn.execute(
+            row = self._pending_conn.execute(
                 "SELECT COUNT(*) FROM pending_actions WHERE status = 'pending'"
             ).fetchone()
         return int(row[0])
@@ -962,12 +1161,12 @@ class Vault:
     ) -> None:
         with self._lock:
             try:
-                self._conn.execute(
+                self._pending_conn.execute(
                     "UPDATE pending_actions SET status = ?, decided_at = ?,"
                     " entry_id = ?, error = ? WHERE id = ?",
                     (status, _utcnow_iso(), entry_id, error, pending_id),
                 )
-                self._conn.commit()
+                self._pending_conn.commit()
             except sqlite3.Error as exc:
                 raise QuarantineError(
                     f"could not update the pending action: {exc}"
