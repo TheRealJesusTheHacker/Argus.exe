@@ -283,7 +283,12 @@ def test_hunt_p1_26_self_check_census_and_failure_naming(capsys):
     ) == 0
     assert imported == list(SELF_CHECK_MODULES)
     out = capsys.readouterr().out
-    assert "1.1.0" in out and "self-check OK" in out
+    # The banner carries the LIVE package version (asserted against
+    # argus.__version__, not a literal, so a version bump can never
+    # strand this test on the old string).
+    from argus import __version__ as _live_version
+
+    assert _live_version in out and "self-check OK" in out
 
     def failing(name):
         if name == "win32service":
@@ -847,6 +852,10 @@ def test_hunt_p0_3_gui_worker_trusted_file_keeps_protected_signals(
     from argus.gui.backend import ScanWorker
     from argus.heuristics.analyze import analyze_file
     from argus.heuristics.signals import Signal
+    from argus.platform_authenticode import (
+        STATUS_VERIFIED,
+        AuthenticodeResult,
+    )
     from argus.scanner import scan_file
     from argus.signatures import SignatureDB
 
@@ -855,6 +864,21 @@ def test_hunt_p0_3_gui_worker_trusted_file_keeps_protected_signals(
     system32.mkdir(parents=True)
     monkeypatch.setattr(
         "argus.heuristics.analyze.windows_root", lambda: root
+    )
+    # Trust layering (see the P0-3 note in test_hunt_b_detection):
+    # the fixture's certificate bytes are fabricated, so the REAL
+    # WinVerifyTrust gate refuses them on Windows — the product
+    # working as designed. The scan-worker path takes no verifier
+    # argument (production always uses the platform verifier), so
+    # the seam is patched at the analyze module boundary: an
+    # approving double stands in for gate 2 while this test pins
+    # the structural gate (identity + location) and the worker's
+    # protected-signal scoring.
+    monkeypatch.setattr(
+        "argus.heuristics.analyze.platform_verifier",
+        lambda: lambda _path: AuthenticodeResult(
+            STATUS_VERIFIED, 0, "test double: fixture approved"
+        ),
     )
     target = system32 / "driver.jpg.exe"  # double-extension masquerade
     target.write_bytes(complete_microsoft_pe())
