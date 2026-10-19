@@ -23,20 +23,42 @@ Rule format (plain dicts / JSON)::
 Evaluation is streaming: :class:`RuleMatcher` accepts chunks of a file
 and keeps only a small rolling tail in memory, so even large files are
 matched without being loaded whole. Files larger than
-``MAX_RULE_SCAN_SIZE`` (64 MB) are not rule-scanned at all — the caller
-notes the skip; hash-based detection still applies at any size.
+``MAX_RULE_SCAN_SIZE`` (64 MB) of NON-executable content are not
+rule-scanned — the caller notes the skip; executable content is
+matched at any size (see :mod:`argus.scanner`), and hash-based
+detection applies regardless.
+
+Abuse caps (v1.0.4): rules are data, and data can be hostile or just
+broken. Loading caps the rule count, each pattern's length, and each
+pattern's wildcard density — a rule that breaks a cap is rejected
+with a warning and the rest still load. Matching runs under a
+per-file time budget: when it expires, matching stops and the
+matcher says so (``budget_exceeded``) instead of grinding a CPU core
+on an adversarial file.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .signatures import SEVERITIES
 
+log = logging.getLogger("argus.rules")
+
 #: Files larger than this are skipped by the rule engine (hash-only).
 MAX_RULE_SCAN_SIZE = 64 * 1024 * 1024  # 64 MB
+
+#: Load-time abuse caps (see the module docstring).
+MAX_RULES = 512
+MAX_PATTERN_LENGTH = 4096
+MAX_WILDCARD_RATIO = 0.5
+
+#: Per-file wall-clock budget for pattern matching, in seconds.
+MATCH_TIME_BUDGET_SECONDS = 2.0
 
 
 class RuleError(Exception):
@@ -144,6 +166,23 @@ class Rule:
             )
         if not self.patterns:
             raise RuleError(f"rule {self.name!r}: at least one pattern is required")
+        for pattern in self.patterns:
+            if pattern.length > MAX_PATTERN_LENGTH:
+                raise RuleError(
+                    f"rule {self.name!r}: pattern is {pattern.length} bytes "
+                    f"(cap is {MAX_PATTERN_LENGTH}) — oversized patterns "
+                    "are rejected at load"
+                )
+            if pattern.has_wildcards:
+                wild = sum(1 for m in pattern.mask if m == 0)
+                if wild / pattern.length > MAX_WILDCARD_RATIO:
+                    raise RuleError(
+                        f"rule {self.name!r}: pattern is "
+                        f"{wild / pattern.length:.0%} wildcards (cap is "
+                        f"{MAX_WILDCARD_RATIO:.0%}) — a mostly-wildcard "
+                        "pattern matches almost anything and costs a "
+                        "full scan per byte"
+                    )
 
     @property
     def max_pattern_length(self) -> int:
@@ -199,17 +238,39 @@ class RuleMatcher:
     Memory use is bounded by the longest pattern, not the file size:
     only a tail of ``max_pattern_length - 1`` bytes is carried between
     chunks so patterns straddling a chunk boundary still match.
+
+    Matching runs under a per-file time budget
+    (:data:`MATCH_TIME_BUDGET_SECONDS`): once it expires, feed()
+    becomes a no-op and :attr:`budget_exceeded` is set — the caller
+    notes the partial coverage instead of pretending the file was
+    fully matched.
     """
 
-    def __init__(self, rules: list[Rule]) -> None:
+    def __init__(
+        self, rules: list[Rule], *, time_budget: float = MATCH_TIME_BUDGET_SECONDS
+    ) -> None:
         self._rules = rules
         self._tail = b""
         self._matched: dict[int, set[int]] = {}  # rule index -> pattern indexes
         overlap = max((r.max_pattern_length for r in rules), default=1) - 1
         self._keep = max(overlap, 0)
+        self._time_budget = max(0.0, float(time_budget))
+        self._started: float | None = None
+        self.budget_exceeded = False
 
     def feed(self, chunk: bytes) -> None:
-        if not chunk or not self._rules:
+        if not chunk or not self._rules or self.budget_exceeded:
+            return
+        now = time.monotonic()
+        if self._started is None:
+            self._started = now
+        elif now - self._started > self._time_budget:
+            self.budget_exceeded = True
+            log.warning(
+                "rule matching stopped: per-file time budget "
+                "(%.1fs) exhausted — coverage is partial",
+                self._time_budget,
+            )
             return
         window = self._tail + chunk
         for idx, rule in enumerate(self._rules):
@@ -243,7 +304,14 @@ def evaluate_rules(rules: list[Rule], data: bytes) -> list[RuleHit]:
 
 
 def load_rules(path: Path | str) -> list[Rule]:
-    """Load rules from a JSON file (a list of rule dicts)."""
+    """Load rules from a JSON file (a list of rule dicts).
+
+    A file that is not JSON, or not a list, raises
+    :class:`RuleError`. Individual broken or over-cap rules are
+    rejected with a logged warning while the rest still load — one
+    bad rule must not disarm all the others. At most
+    :data:`MAX_RULES` rules are loaded.
+    """
     text = Path(path).read_text(encoding="utf-8")
     try:
         specs = json.loads(text)
@@ -251,7 +319,21 @@ def load_rules(path: Path | str) -> list[Rule]:
         raise RuleError(f"rules file is not valid JSON: {exc}") from exc
     if not isinstance(specs, list):
         raise RuleError("rules file must contain a JSON list of rules")
-    return [Rule.from_dict(spec) for spec in specs]
+    if len(specs) > MAX_RULES:
+        log.warning(
+            "rules file has %d rules; loading only the first %d",
+            len(specs), MAX_RULES,
+        )
+        specs = specs[:MAX_RULES]
+    rules: list[Rule] = []
+    for spec in specs:
+        try:
+            rules.append(Rule.from_dict(spec))
+        except RuleError as exc:
+            log.warning("rule rejected at load: %s", exc)
+        except (TypeError, AttributeError) as exc:
+            log.warning("rule rejected at load: malformed rule (%s)", exc)
+    return rules
 
 
 # ----------------------------------------------------------------------
