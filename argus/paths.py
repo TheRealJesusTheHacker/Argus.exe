@@ -51,6 +51,56 @@ import sys
 import tempfile
 from pathlib import Path
 
+# ----------------------------------------------------------------------
+# The Linux installed layout (v1.2.0 — the .deb edition)
+#
+# Windows installs Argus under Program Files with machine data under
+# ProgramData; the Debian package installs the same one-program
+# product the Filesystem Hierarchy Standard way:
+#
+#   program   /usr/lib/argus/argus        (one file, like Argus.exe)
+#   data      /var/lib/argus/             (vault, sigdb, history —
+#                                          the ProgramData analog:
+#                                          ONE machine-wide tree the
+#                                          root service and every
+#                                          user's GUI/CLI share)
+#   config    /etc/argus/                 (the admin's override
+#                                          config, when one exists)
+#   runtime   /run/argus/                 (the verified-action
+#                                          socket — systemd creates
+#                                          it via RuntimeDirectory)
+#   logs      /var/log/argus/
+#
+# These constants are the single source for the layout: the systemd
+# unit, the maintainer scripts, the self-trust identity gate, and
+# the socket channel all read them from here.
+# ----------------------------------------------------------------------
+LINUX_INSTALL_DIR = Path("/usr/lib/argus")
+LINUX_PROGRAM_PATH = LINUX_INSTALL_DIR / "argus"
+LINUX_DATA_DIR = Path("/var/lib/argus")
+LINUX_CONFIG_DIR = Path("/etc/argus")
+LINUX_CONFIG_PATH = LINUX_CONFIG_DIR / "argus-config.json"
+LINUX_RUNTIME_DIR = Path("/run/argus")
+LINUX_LOG_DIR = Path("/var/log/argus")
+LINUX_UNIT_PATHS = (
+    Path("/etc/systemd/system/argus-protection.service"),
+    Path("/run/systemd/system/argus-protection.service"),
+    Path("/usr/lib/systemd/system/argus-protection.service"),
+)
+
+
+def linux_installed_layout() -> bool:
+    """True when this machine carries the .deb-installed layout:
+    the packaged program file is present at its canonical FHS
+    address. A source checkout or a portable run has no such file
+    and keeps the per-user XDG data home, exactly as before."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        return LINUX_PROGRAM_PATH.is_file()
+    except OSError:
+        return False
+
 
 def data_dir() -> Path:
     """Root folder for Argus's data (vault, history, config, DB)."""
@@ -64,6 +114,13 @@ def data_dir() -> Path:
         return Path(base) / "Argus"
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "Argus"
+    if sys.platform.startswith("linux") and linux_installed_layout():
+        # The .deb edition: machine-wide, shared by the root
+        # protection service and every user's GUI/CLI — the same
+        # reasoning as ProgramData on Windows (see the module
+        # docstring). Without the installed layout (source
+        # checkout, portable run), the per-user XDG home stands.
+        return LINUX_DATA_DIR
     xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
     return Path(xdg) / "argus"
 
