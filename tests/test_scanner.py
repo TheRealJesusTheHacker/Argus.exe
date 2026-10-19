@@ -197,7 +197,12 @@ def test_scan_permission_error_counted_not_raised(tmp_path, db, monkeypatch):
 
 def test_oversize_file_skips_rules_but_not_hash(tmp_path, db, monkeypatch):
     monkeypatch.setattr(scanner, "MAX_RULE_SCAN_SIZE", 8)
-    payload = tmp_path / "big.ps1"
+    # Hunt P0-5: oversize SCRIPTS stream pattern rules at any size
+    # now (the PE treatment), so this pin uses bulk data — the
+    # oversize skip survives for non-program, non-script content.
+    # (Script-oversize rule streaming is pinned in
+    # tests/test_hunt_b_detection.py.)
+    payload = tmp_path / "big.bin"
     payload.write_bytes(b"DownloadString " + b"A" * 100)
     report = scan_path(tmp_path, db, BUILTIN_RULES)
     scanned = report.files[0]
