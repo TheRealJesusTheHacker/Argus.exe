@@ -11,6 +11,7 @@ skips the ask.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +35,8 @@ from ..actions import DetectionInfo
 from ..reporting import DetectionRecord
 from .backend import GuiBackend, ScanWorker
 from . import theme
+
+log = logging.getLogger("argus.gui")
 
 
 class ScanPage(QWidget):
@@ -319,10 +322,11 @@ class ScanPage(QWidget):
                 started_at=datetime.now(timezone.utc).isoformat(),
                 finished_at=datetime.now(timezone.utc).isoformat(),
             )
-        except Exception as exc:  # bookkeeping never hides a scan result
+        except Exception:  # bookkeeping never hides a scan result
+            log.exception("scan history could not be saved")
             self.result_label.setText(
-                f"Note: the scan finished, but its history could not "
-                f"be saved ({exc})."
+                "Note: the scan finished, but its history could "
+                "not be saved. The results above are still correct."
             )
 
     # ------------------------------------------------------------------
@@ -363,13 +367,57 @@ class ScanPage(QWidget):
         if scanned is not None:
             info = DetectionInfo.from_scanned(scanned)
         else:
+            # Fallback row (no live scan object): the actions layer
+            # refuses a fingerprint-less decision now, so a missing
+            # sha256 is computed from the file itself — the REAL
+            # hash of the file the user is deciding about, never a
+            # placeholder.
+            sha256 = row.get("sha256")
+            if not sha256 and path.is_file():
+                try:
+                    from ..scanner import hash_file
+
+                    sha256, _size = hash_file(path)
+                except OSError:
+                    sha256 = None
             info = DetectionInfo(
                 name="Flagged file",
                 severity=row.get("severity") or "high",
                 verdict=row["verdict"],
-                sha256=row.get("sha256"),
+                sha256=sha256,
                 reasons=list(row.get("reasons") or []),
             )
+        if action == "quarantine" and not info.sha256:
+            # Quarantine REQUIRES a fingerprint: the vault records
+            # what it took by hash, and the action engine refuses a
+            # sha256=None quarantine outright. One last attempt to
+            # hash the file as it stands NOW; if that is impossible
+            # (it vanished, or is unreadable), the honest outcome is
+            # a note saying exactly that — never a doomed call into
+            # the engine and never a placeholder fingerprint.
+            hashed = None
+            if path.is_file():
+                try:
+                    from ..scanner import hash_file
+
+                    hashed, _size = hash_file(path)
+                except OSError:
+                    hashed = None
+            if not hashed:
+                QMessageBox.warning(
+                    self,
+                    "Can't quarantine this file",
+                    f"Argus couldn't read {path.name} to take its "
+                    "fingerprint, so it can't be quarantined safely "
+                    "— the file may have moved or been deleted. "
+                    "Run the scan again to refresh the results.",
+                )
+                self.result_label.setText(
+                    f"Quarantine not possible for {path.name}: no "
+                    "fingerprint could be taken. Re-scan to refresh."
+                )
+                return
+            info.sha256 = hashed
         try:
             if action == "quarantine":
                 outcome = engine.quarantine(path, info, confirmed=True)
@@ -377,8 +425,15 @@ class ScanPage(QWidget):
                 outcome = engine.delete(path, info, confirmed=True)
             else:
                 outcome = engine.allow_file(path, confirmed=True)
-        except Exception as exc:
-            QMessageBox.critical(self, "That did not work", str(exc))
+        except Exception:
+            log.exception("scan result action failed")
+            QMessageBox.critical(
+                self,
+                "That did not work",
+                "Argus couldn't do that just now. The file was "
+                "left exactly as it was. Try again — if it keeps "
+                "failing, restart Argus.",
+            )
             return
         QMessageBox.information(self, "Done", outcome.message)
         self.result_label.setText(outcome.message)
