@@ -1,0 +1,79 @@
+#!/bin/sh
+# Argus (.deb edition) — post-installation script.
+#
+# Runs as root after the package payload is unpacked. Its whole
+# job: create the data tree with the permissions the design
+# requires, record the installed program's fingerprint so the
+# product can prove its own identity later, and enable + start
+# the protection service. Idempotent: `apt install --reinstall`
+# and upgrades run it again safely. Nothing else is registered
+# anywhere — no cron, no shell hooks, no other services.
+set -e
+
+DATA_DIR=/var/lib/argus
+PROGRAM=/usr/lib/argus/argus
+UNIT=argus-protection.service
+
+case "$1" in
+    configure)
+        # The data tree. Modes carry the security design (the
+        # Linux form of the Windows ACLs):
+        #   quarantine/ 0700 — stored malware: root (the service)
+        #     only; no user account can read or write the blobs.
+        #   requests/ 1733 — the UNPRIVILEGED action-request
+        #     drop: any user may create a request file, nobody
+        #     can list or read anyone else's (sticky + write/
+        #     traverse only). Privileged actions never travel
+        #     this way in the installed layout — they use the
+        #     verified socket; this drop carries polls/results.
+        #   everything else 0755 root-owned: users read status
+        #     and reports; only the service writes.
+        install -d -o root -g root -m 0755 "$DATA_DIR"
+        install -d -o root -g root -m 0700 "$DATA_DIR/quarantine"
+        install -d -o root -g root -m 1733 "$DATA_DIR/requests"
+        install -d -o root -g root -m 0755 "$DATA_DIR/results"
+        install -d -o root -g root -m 0755 "$DATA_DIR/shared"
+        install -d -o root -g root -m 0755 "$DATA_DIR/trusted"
+        install -d -o root -g root -m 0755 /var/log/argus
+        install -d -o root -g root -m 0755 /etc/argus
+
+        # Record the installed program's identity: its canonical
+        # path + SHA-256 fingerprint, in the root-owned data
+        # root. The scanner's self-trust and the socket channel's
+        # caller verification both check callers against this
+        # record; it is refreshed on every configure, so an
+        # upgrade re-keys trust to the new binary automatically.
+        if [ -f "$PROGRAM" ]; then
+            VERSION="$(dpkg-query -W -f='${Version}' argus 2>/dev/null || true)"
+            SHA256="$(sha256sum "$PROGRAM" | awk '{print $1}')"
+            TMP_IDENTITY="$DATA_DIR/.self-identity.json.tmp"
+            printf '{"exe_path": "%s", "exe_sha256": "%s", "version": "%s"}\n' \
+                "$PROGRAM" "$SHA256" "$VERSION" > "$TMP_IDENTITY"
+            chmod 0644 "$TMP_IDENTITY"
+            mv "$TMP_IDENTITY" "$DATA_DIR/self-identity.json"
+        fi
+
+        # Enable the protection service at boot, and start it
+        # now when systemd is actually running this machine
+        # (in a chroot/container install there is no live
+        # systemd to talk to — enabling still applies, and the
+        # service starts at the first real boot).
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl enable "$UNIT"
+            if [ -d /run/systemd/system ]; then
+                systemctl daemon-reload || true
+                systemctl start "$UNIT" || \
+                    echo "argus: the protection service did not start;" \
+                         "check 'systemctl status $UNIT'." >&2
+            fi
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument: $1" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
