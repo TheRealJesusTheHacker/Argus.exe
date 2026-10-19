@@ -105,9 +105,11 @@ def test_init_db_reinit_keeps_count_truthful(tmp_path):
 
 
 def test_signature_db_path_with_uri_characters(tmp_path):
-    # Regression (fix #9): #, ?, % in a path must not break the
-    # read-only SQLite URI open() builds.
-    weird = tmp_path / "we#ird?dir%"
+    # Regression (fix #9): #, %, and spaces in a path must not break
+    # the read-only SQLite URI open() builds. ('?' would be the other
+    # classic URI breaker, but it is illegal in Windows filenames, so
+    # the fixture sticks to characters every OS allows.)
+    weird = tmp_path / "we#ird dir%"
     weird.mkdir()
     db_path = weird / "sigs.sigdb"
     init_db(db_path, seed=True)
