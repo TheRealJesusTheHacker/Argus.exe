@@ -163,6 +163,19 @@ def detect_state(
     """
     if is_portable() if portable is None else portable:
         return SetupState.PORTABLE
+    if (
+        scm_state is None
+        and sys.platform.startswith("linux")
+        and (paths.linux_installed_layout() or _linux_unit_present())
+    ):
+        # The .deb edition (v1.2.0): systemd is the service
+        # manager here, and its states — plus the package
+        # layout's own proofs — classify the machine. Injected
+        # probes (tests, support tooling) keep the historical
+        # SCM-shaped path below on every platform, unchanged.
+        from . import linuxservice
+
+        return linuxservice.detect_state()
     state = (
         scm_state
         if scm_state is not None
@@ -190,6 +203,16 @@ def detect_state(
     if state == "running":
         return SetupState.RUNNING
     return SetupState.INSTALLED_STOPPED
+
+
+def _linux_unit_present() -> bool:
+    """True when a systemd unit file for Argus exists at any of
+    the standard locations (the .deb installs one even before
+    its first start)."""
+    try:
+        return any(p.is_file() for p in paths.LINUX_UNIT_PATHS)
+    except OSError:
+        return False
 
 
 # ----------------------------------------------------------------------
