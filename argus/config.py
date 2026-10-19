@@ -34,8 +34,11 @@ from .signatures import SEVERITIES
 log = logging.getLogger("argus.config")
 
 #: Actions the response policy can assign to a severity. ``quarantine``
-#: and ``delete`` are *requests* — in Phase 3 Argus only emits an action
-#: event; the moves themselves are Phase 4 and always user-confirmed.
+#: and ``delete`` are *requests*: the real-time engine emits an action
+#: event, and :mod:`argus.actions` decides what happens under the
+#: user's ``realtime_default`` policy — the queue, or (for Critical
+#: only, if the user chose it) immediate quarantine. Deletion always
+#: needs a human decision.
 VALID_ACTIONS = ("quarantine", "delete", "alert", "log", "ignore")
 
 #: Default per-severity actions: the worst threats ask for quarantine,
@@ -46,6 +49,17 @@ DEFAULT_SEVERITY_ACTIONS: dict[str, str] = {
     "medium": "alert",
     "low": "log",
 }
+
+#: How real-time action *requests* are handled (Phase 4):
+#: - ``ask`` — queue every request in the pending-actions queue for a
+#:   human decision (the default; nothing is touched);
+#: - ``auto-quarantine-critical`` — Critical-severity files are
+#:   quarantined immediately under the user's own policy; everything
+#:   else waits in the queue. Deletion is NEVER automatic;
+#: - ``log-only`` — requests are written to history, nothing is queued
+#:   or moved (simulation-style).
+REALTIME_POLICIES = ("ask", "auto-quarantine-critical", "log-only")
+DEFAULT_REALTIME_POLICY = "ask"
 
 DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_STABLE_POLLS = 2
@@ -127,6 +141,12 @@ class ArgusConfig:
     status_file: str = DEFAULT_STATUS_FILE
     event_log_file: str | None = None
     heartbeat_interval: float = 5.0
+    #: How real-time action requests are handled (see REALTIME_POLICIES).
+    realtime_default: str = DEFAULT_REALTIME_POLICY
+    #: Quarantine vault location (None = the standard app-data home).
+    vault_dir: str | None = None
+    #: Scan history database location (None = standard app-data home).
+    history_db: str | None = None
     #: Problems found while loading (empty when the config was clean).
     load_warnings: list[str] = field(default_factory=list)
     #: Where the config was loaded from (None = pure defaults).
@@ -143,6 +163,51 @@ class ArgusConfig:
 
     def is_excluded(self, path: Path | str, sha256: str | None = None) -> bool:
         return self.exclusions.is_excluded(path, sha256)
+
+    def add_hash_exclusion(self, sha256: str) -> None:
+        """Vouch for a file by fingerprint: Argus will leave any file
+        with this SHA-256 alone, wherever it appears. In-memory only —
+        call :meth:`save` to make it permanent."""
+        digest = sha256.lower()
+        if digest not in self.exclusions.hashes:
+            self.exclusions = Exclusions(
+                paths=self.exclusions.paths,
+                hashes=self.exclusions.hashes | {digest},
+            )
+
+    def save(self, path: Path | str) -> None:
+        """Write this config back to *path* as JSON (the same shape
+        :meth:`load` reads). Used when Argus itself changes a setting
+        on the user's behalf — e.g. Allow adds an exclusion."""
+        data = {
+            "watch_dirs": [str(d) for d in self.watch_dirs],
+            "poll_interval_seconds": self.poll_interval,
+            "stable_polls": self.stable_polls,
+            "process_monitor_enabled": self.process_monitor_enabled,
+            "process_poll_interval_seconds": self.process_poll_interval,
+            "heartbeat_interval_seconds": self.heartbeat_interval,
+            "heuristics": self.heuristics,
+            "severity_actions": dict(self.severity_actions),
+            "realtime_default": self.realtime_default,
+            "exclusions": {
+                "paths": list(self.exclusions.paths),
+                "hashes": sorted(self.exclusions.hashes),
+            },
+            "max_realtime_file_size_mb": round(
+                self.max_realtime_file_size / (1024 * 1024), 3
+            ),
+            "signature_db": self.signature_db,
+            "rules_file": self.rules_file,
+            "status_file": self.status_file,
+            "event_log_file": self.event_log_file,
+            "vault_dir": self.vault_dir,
+            "history_db": self.history_db,
+        }
+        target = Path(path)
+        if target.parent and not target.parent.exists():
+            target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        self.source_path = target
 
     # ------------------------------------------------------------------
     # Loading — tolerant by design: defaults + loud warnings, no raises
@@ -285,12 +350,25 @@ class ArgusConfig:
                 warn(f"'{key}' must be a non-empty string — keeping default")
 
         for key, attr in (("rules_file", "rules_file"),
-                          ("event_log_file", "event_log_file")):
+                          ("event_log_file", "event_log_file"),
+                          ("vault_dir", "vault_dir"),
+                          ("history_db", "history_db")):
             value = raw.get(key)
             if isinstance(value, str) and value:
                 setattr(self, attr, value)
             elif value is not None and value is not False:
                 warn(f"'{key}' must be a path string or null — keeping default")
+
+        policy = raw.get("realtime_default")
+        if policy is not None:
+            if isinstance(policy, str) and policy.lower() in REALTIME_POLICIES:
+                self.realtime_default = policy.lower()
+            else:
+                warn(
+                    f"'realtime_default' must be one of "
+                    f"{', '.join(REALTIME_POLICIES)} — keeping "
+                    f"'{DEFAULT_REALTIME_POLICY}'"
+                )
 
     def _float(self, raw: dict, key: str, default: float, *, minimum: float) -> float:
         value = raw.get(key)
