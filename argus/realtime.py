@@ -52,6 +52,14 @@ log = logging.getLogger("argus.realtime")
 #: backoff before Argus reports it as NotScanned and stops trying.
 MAX_LOCKED_RETRIES = 5
 
+#: Hard bound on pending locked-file retry timers (v1.1.0 P2).
+#: The retry list is pruned — finished timers, timers whose file
+#: vanished, and timers for files that exhausted their retries
+#: are dropped (see :meth:`RealtimeEngine._prune_retry_timers`) —
+#: and this cap bounds what pruning alone cannot: a flood of
+#: distinct locked files cannot grow the list without limit.
+MAX_PENDING_RETRY_TIMERS = 256
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -614,9 +622,15 @@ class RealtimeEngine:
 
         self._report(item, scanned)
 
-        if item.source == "watch":
+        if item.source in ("watch", "process"):
             # Named NTFS data streams on the file get the same
-            # treatment (Windows only; a no-op elsewhere).
+            # treatment on BOTH intake paths (v1.1.0 P2): a file
+            # the watcher noticed AND the image a process launched
+            # from. ADS enumeration lives in the scanner
+            # (scan_named_streams / iter_data_streams) and was
+            # previously wired only to the watch path, so a
+            # launched program's hidden streams were never checked
+            # in real time. Windows only; a no-op elsewhere.
             for stream_scanned in scan_named_streams(
                 path, self.db, self.rules,
                 heuristics=cfg.heuristics, exclusions=cfg.exclusions,
@@ -626,6 +640,44 @@ class RealtimeEngine:
                         _WorkItem(path=stream_scanned.path, source=item.source),
                         stream_scanned,
                     )
+
+    def _prune_retry_timers(self, *, drop_path: Path | None = None) -> int:
+        """Drop stale locked-file retry timers; return how many.
+
+        An entry is dropped (and its timer cancelled) when it has
+        already fired, when its file has vanished, when its retry
+        count exceeds :data:`MAX_LOCKED_RETRIES`, or when it names
+        *drop_path* (a file whose retries are finished). Called
+        whenever a retry is scheduled, whenever one fires, from
+        the status snapshot, and before the exhaustion report —
+        the list can no longer grow by one entry per locked file
+        forever (v1.1.0 P2).
+        """
+        kept: list[threading.Timer] = []
+        dropped = 0
+        for timer in list(self._retry_timers):
+            timer_path = getattr(timer, "argus_path", None)
+            attempts = getattr(timer, "argus_attempts", None)
+            drop = bool(timer.finished.is_set())
+            if not drop and drop_path is not None and timer_path is not None:
+                drop = Path(timer_path) == drop_path
+            if not drop and attempts is not None:
+                drop = attempts > MAX_LOCKED_RETRIES
+            if not drop and timer_path is not None:
+                try:
+                    drop = not Path(timer_path).exists()
+                except OSError:
+                    drop = True
+            if drop:
+                dropped += 1
+                try:
+                    timer.cancel()
+                except Exception:
+                    pass
+            else:
+                kept.append(timer)
+        self._retry_timers[:] = kept
+        return dropped
 
     def _handle_locked(self, item: _WorkItem) -> None:
         """A file Argus could not read (locked/denied): retry with
@@ -641,15 +693,42 @@ class RealtimeEngine:
                 force=item.force,
                 attempts=item.attempts + 1,
             )
-            timer = threading.Timer(delay, self._requeue, args=(retry,))
+            self._prune_retry_timers()
+            holder: dict = {}
+
+            def _fire() -> None:
+                fired = holder.get("timer")
+                if fired is not None and fired in self._retry_timers:
+                    self._retry_timers.remove(fired)
+                self._requeue(retry)
+
+            timer = threading.Timer(delay, _fire)
             timer.daemon = True
+            # Bookkeeping for _prune_retry_timers (attributes on
+            # the Timer object keep the list's element type —
+            # plain Timers — unchanged for stop() and callers).
+            timer.argus_path = path  # type: ignore[attr-defined]
+            timer.argus_attempts = retry.attempts  # type: ignore[attr-defined]
+            holder["timer"] = timer
             self._retry_timers.append(timer)
+            # Bound the list even under a flood of distinct
+            # locked files: the oldest pending retries are
+            # cancelled and dropped past the cap.
+            while len(self._retry_timers) > MAX_PENDING_RETRY_TIMERS:
+                oldest = self._retry_timers.pop(0)
+                try:
+                    oldest.cancel()
+                except Exception:
+                    pass
             timer.start()
             log.info(
                 "could not read %s (locked?) — retry %d/%d in %.0fs",
                 path, retry.attempts, MAX_LOCKED_RETRIES, delay,
             )
             return
+        # Retries exhausted: no pending timer for this file may
+        # linger — prune every entry that names it.
+        self._prune_retry_timers(drop_path=path)
         self._emit(
             RealtimeEvent(
                 kind="detection",
@@ -668,8 +747,20 @@ class RealtimeEngine:
         )
 
     def _requeue(self, item: _WorkItem) -> None:
-        if not self._stop.is_set():
-            self._queue.put(item)
+        self._prune_retry_timers()
+        if self._stop.is_set():
+            return
+        try:
+            exists = item.path.exists()
+        except OSError:
+            exists = False
+        if not exists:
+            # The locked file vanished while its retry was
+            # pending: the retry is dropped, never queued, and
+            # any other pending entries for it are pruned.
+            self._prune_retry_timers(drop_path=item.path)
+            return
+        self._queue.put(item)
 
     # ------------------------------------------------------------------
     # Reporting + response policy
@@ -778,6 +869,9 @@ class RealtimeEngine:
 
     def status_snapshot(self) -> dict:
         """Numbers the service layer publishes in its heartbeat."""
+        # The heartbeat is the engine's regular housekeeping
+        # moment: stale locked-file retries are pruned here too.
+        self._prune_retry_timers()
         with self._lock:
             stats = self.stats
             snapshot = {
