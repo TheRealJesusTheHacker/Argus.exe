@@ -80,10 +80,16 @@ def default_watch_dirs() -> list[Path]:
 
 
 def _normalize_path_str(raw: str) -> str:
-    """Canonical form for path comparison: expanded, absolute,
-    case-normalized for the platform."""
+    """Canonical form for path comparison: expanded, RESOLVED
+    (symlinks / junctions followed via ``os.path.realpath``),
+    absolute, case-normalized for the platform. Resolution is
+    applied to stored roots AND to candidates at check time, so
+    an excluded path reached through a link is still excluded,
+    and a link inside an excluded tree that points OUT of it is
+    judged by where it actually leads — link laundering fails in
+    both directions."""
     expanded = os.path.expanduser(os.path.expandvars(raw))
-    return os.path.normcase(os.path.abspath(expanded))
+    return os.path.normcase(os.path.realpath(expanded))
 
 
 @dataclass
@@ -103,10 +109,19 @@ class Exclusions:
         if not self.paths:
             return False
         candidate = _normalize_path_str(str(path))
-        for excluded in self.paths:
+        for raw_excluded in self.paths:
+            # Stored entries are normalised again at check time:
+            # a set built by hand (or loaded before the resolution
+            # rule) must be judged on resolved roots, not strings.
+            excluded = _normalize_path_str(raw_excluded)
             if candidate == excluded:
                 return True
-            prefix = excluded + os.sep
+            # A root that is its own root ("/", "C:\\") already
+            # ends in the separator — appending another doubles
+            # it and no child would ever match.
+            prefix = (
+                excluded if excluded.endswith(os.sep) else excluded + os.sep
+            )
             if candidate.startswith(prefix):
                 return True
         return False
