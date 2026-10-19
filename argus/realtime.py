@@ -12,16 +12,17 @@ This module ties the pieces together into always-on protection:
   severity: Critical/High ask for quarantine, Medium alerts, Low is
   logged (all configurable).
 
-**Honesty box — what "real-time" means in this phase.** Files are
+**Honesty box — what "real-time" means here.** Files are
 scanned the moment they finish being written. Programs are scanned
 when the process monitor *notices* them starting (it polls), which
 means a fast program may already be running when its scan completes:
 Argus raises the alarm immediately, but it does not yet *block* a
 program before it runs. True pre-execution blocking needs the Windows
 service + driver work in the install phase, and Argus will not claim
-otherwise. Likewise, the policy only *emits action events* here —
-actually moving a file into quarantine or deleting it is Phase 4,
-always user-confirmed. This module never deletes or moves anything.
+otherwise. This module never deletes or moves anything itself: it
+emits *action events*, and :mod:`argus.actions` carries them out
+under the user's ``realtime_default`` policy — queued for a human
+decision by default; deletion is never automatic, under any policy.
 """
 
 from __future__ import annotations
@@ -63,7 +64,9 @@ class RealtimeEvent:
 
     - ``"detection"`` — a scanned file was flagged;
     - ``"action"`` — the response policy asks for something to be done
-      (quarantine/delete). Emitted, never executed, in this phase;
+      (quarantine/delete). Emitted here; carried out by
+      :mod:`argus.actions` under the user's real-time policy, never
+      by this module, and deletion always waits for a human;
     - ``"process"`` — a program was seen starting and its file scanned;
     - ``"info"`` — operational notes (unreadable files, oversized
       files, watcher problems).
@@ -594,9 +597,12 @@ class RealtimeEngine:
                     sha256=scanned.result.sha256,
                     message=(
                         f"Policy asks to {verb} {path.name} "
-                        f"(severity: {severity.capitalize()}). Argus has NOT "
-                        f"touched the file — quarantine and deletion arrive "
-                        f"in Phase 4 and always ask you first."
+                        f"(severity: {severity.capitalize()}). What happens "
+                        f"next follows your real-time setting "
+                        f"(currently '{self.config.realtime_default}'): by "
+                        "default the request waits in the pending-actions "
+                        "queue for your decision, and Argus never deletes "
+                        "a file on its own."
                     ),
                 )
             )

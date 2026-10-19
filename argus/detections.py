@@ -28,8 +28,9 @@ if TYPE_CHECKING:  # runtime import would be circular; signals are duck-typed
 
 
 #: Severity ordering, weakest to strongest. Every detection and every
-#: heuristic signal carries one of these; per-severity actions (e.g.
-#: Critical → auto-quarantine) arrive in Phase 4.
+#: heuristic signal carries one of these; severities drive the
+#: per-severity actions in :mod:`argus.actions` (e.g. Critical
+#: findings can be auto-quarantined under a user-configured policy).
 SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 

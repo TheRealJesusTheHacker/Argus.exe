@@ -24,8 +24,12 @@ from pathlib import Path
 from typing import Callable
 
 from . import __version__
+from .actions import ActionEngine
 from .config import ArgusConfig
+from .paths import default_history_db, default_vault_dir
+from .quarantine import Vault
 from .realtime import RealtimeEngine, RealtimeEvent
+from .reporting import History
 from .rules import BUILTIN_RULES, Rule, load_rules
 from .signatures import SignatureDB, SignatureError
 
@@ -55,6 +59,9 @@ class ArgusService:
         self.on_event = on_event
         self.config: ArgusConfig = config or ArgusConfig()
         self.engine: RealtimeEngine | None = None
+        self.vault: Vault | None = None
+        self.history: History | None = None
+        self.actions: ActionEngine | None = None
         self._db: SignatureDB | None = None
         self._stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
@@ -91,8 +98,29 @@ class ArgusService:
 
         self._db = SignatureDB.open(self.config.signature_db)
         rules = self._load_rules()
+        # Phase 4 wiring: the vault, history, and action engine are
+        # opened BEFORE the engine starts, so every real-time event
+        # is routed through the action policy from the first second.
+        vault_dir = (
+            Path(self.config.vault_dir)
+            if self.config.vault_dir
+            else default_vault_dir()
+        )
+        history_path = (
+            Path(self.config.history_db)
+            if self.config.history_db
+            else default_history_db()
+        )
+        self.vault = Vault.open(vault_dir)
+        self.history = History.open(history_path)
+        self.actions = ActionEngine(
+            self.vault,
+            self.config,
+            config_path=self.config_path,
+            history=self.history,
+        )
         self.engine = RealtimeEngine(
-            self.config, self._db, rules, on_event=self.on_event
+            self.config, self._db, rules, on_event=self._dispatch_event
         )
         self.engine.start()
         self._started_at = _utcnow()
@@ -115,6 +143,13 @@ class ArgusService:
             self._fold_engine_stats()
             self.engine.stop()
             self.engine = None
+        self.actions = None
+        if self.history is not None:
+            self.history.close()
+            self.history = None
+        if self.vault is not None:
+            self.vault.close()
+            self.vault = None
         if self._db is not None:
             self._db.close()
             self._db = None
@@ -155,6 +190,13 @@ class ArgusService:
             self._fold_engine_stats()
             self.engine.stop()
             self.engine = None
+        self.actions = None
+        if self.history is not None:
+            self.history.close()
+            self.history = None
+        if self.vault is not None:
+            self.vault.close()
+            self.vault = None
         if self._db is not None:
             self._db.close()
             self._db = None
@@ -176,6 +218,25 @@ class ArgusService:
                 waiter.wait(0.25)
         finally:
             self.stop()
+
+    # ------------------------------------------------------------------
+    # Event dispatch: action policy first, then the caller's callback
+    # ------------------------------------------------------------------
+    def _dispatch_event(self, event: RealtimeEvent) -> None:
+        """Route engine events through the Phase 4 action layer
+        (history recording, pending queue, policy), then hand the
+        event to the user's own callback. Action-layer failures are
+        logged loudly and never take protection down."""
+        if self.actions is not None:
+            try:
+                outcome = self.actions.handle_realtime_event(event)
+            except Exception:
+                log.exception("action layer failed on a real-time event")
+                outcome = None
+            if outcome is not None:
+                log.info("real-time action: %s", outcome.message)
+        if self.on_event is not None:
+            self.on_event(event)
 
     # ------------------------------------------------------------------
     # Status / heartbeat
@@ -208,7 +269,14 @@ class ArgusService:
             "uptime_seconds": uptime,
             "watch_dirs": [str(d) for d in self.config.watch_dirs],
             "process_monitor_enabled": self.config.process_monitor_enabled,
+            "realtime_default": self.config.realtime_default,
             "files_watched": engine_stats.get("files_watched", 0),
+            "quarantined_files": (
+                self.vault.count("quarantined") if self.vault is not None else 0
+            ),
+            "pending_actions": (
+                self.vault.pending_count() if self.vault is not None else 0
+            ),
             **totals,
             "last_error": self.last_error,
         }
