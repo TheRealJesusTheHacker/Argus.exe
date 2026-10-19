@@ -25,7 +25,7 @@
 ;   the uninstall form.
 
 #define AppName "ARGUS.EXE"
-#define AppVersion "1.0.4"
+#define AppVersion "1.0.5"
 #define AppPublisher "Sentinel Safeguard LLC"
 #define AppExeName "Argus.exe"
 #define ServiceExeName "ArgusService.exe"
