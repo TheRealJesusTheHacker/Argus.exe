@@ -1,0 +1,33 @@
+ARGUS.EXE — Sentinel Safeguard LLC
+"All eyes. All detection." / "Security For Everyone"
+
+BEFORE YOU INSTALL
+------------------
+This installer will:
+
+  * Put ARGUS.EXE in Program Files\Sentinel Safeguard\Argus.
+  * Install and start the ArgusProtection Windows service, so
+    real-time protection is on from boot, before you log in.
+  * Register ARGUS.EXE with Windows Security Center as this
+    computer's antivirus provider, so it appears by name in
+    Windows Security.
+
+Administrator rights are required, because a protection service
+and Security Center registration are machine-wide settings.
+
+YOUR DATA
+---------
+Argus keeps its quarantine vault, scan history, and settings
+under your user profile (Local AppData\Argus).
+
+If you ever uninstall: the program and service are removed, but
+the vault and history are KEPT unless you check "remove all
+data" in the uninstaller. Reinstalling picks up where you left
+off.
+
+FIRST RUN
+---------
+The first time you open ARGUS.EXE, a short welcome wizard helps
+you pick the folders to watch and how Argus should respond when
+it finds something — including a self-test that proves detection
+works on this machine.

@@ -1,0 +1,53 @@
+name: build-windows
+
+# Builds the Windows product when a release is published:
+#   * runs the full test suite (GUI tests run offscreen)
+#   * builds Argus.exe (GUI) and ArgusService.exe (service host)
+#     with PyInstaller
+#   * builds ArgusSetup.exe with Inno Setup
+#   * attaches the installer and both portable exes to the release
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install ".[gui,windows]" pytest pyinstaller
+
+      - name: Run the test suite (GUI offscreen)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Build Argus.exe (GUI)
+        run: pyinstaller packaging/Argus.spec --noconfirm
+
+      - name: Build ArgusService.exe (service host)
+        run: pyinstaller packaging/ArgusService.spec --noconfirm
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build the installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\argus.iss'
+
+      - name: Attach the installer and portable exes to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.ref_name }} dist/ArgusSetup.exe dist/Argus.exe dist/ArgusService.exe --clobber
