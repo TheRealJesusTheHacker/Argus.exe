@@ -33,6 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
+from . import action_requests
 from .actions import (
     ActionEngine,
     ActionError,
@@ -40,8 +41,13 @@ from .actions import (
 )
 from .config import DEFAULT_CONFIG_NAME, ArgusConfig
 from .detections import Verdict
-from .paths import data_dir, default_history_db, default_vault_dir
-from .quarantine import QuarantineEntry, QuarantineError, Vault
+from .paths import (
+    default_history_db,
+    default_pending_db,
+    default_vault_dir,
+    vault_view_path,
+)
+from .quarantine import QuarantineEntry, QuarantineError, Vault, read_pending_db
 from .realtime import RealtimeEvent
 from .reporting import (
     DetectionRecord,
@@ -56,7 +62,7 @@ from .signatures import (
     DEFAULT_DB_NAME,
     SignatureDB,
     SignatureError,
-    ensure_signature_db,
+    bootstrap_signature_db,
     init_db,
 )
 
@@ -102,6 +108,11 @@ def _print_human(report: ScanReport) -> None:
           f"Skipped (unreadable): {stats.files_skipped}  "
           f"Excluded by you: {stats.files_excluded}  "
           f"Folders skipped: {stats.dirs_skipped}")
+    not_scanned = [f for f in report.files if f.verdict is Verdict.NOT_SCANNED]
+    if not_scanned:
+        print(f"Not scanned: {len(not_scanned)} file(s) could not be "
+              "read (locked or unreadable) — they were NOT cleared "
+              "as safe; close the program using them and scan again.")
     print(f"Data scanned: {stats.bytes_scanned / (1024 * 1024):.1f} MB")
     n = len(report.detections)
     if n:
@@ -214,6 +225,21 @@ def _resolve_history_db(args, config: ArgusConfig | None) -> Path:
     return default_history_db()
 
 
+def _resolve_pending_db(args, config: ArgusConfig | None) -> Path:
+    if config is not None and config.pending_db:
+        return Path(config.pending_db)
+    return default_pending_db()
+
+
+def _open_vault(args, config: ArgusConfig | None) -> Vault:
+    """Open the vault the way every production caller does: entries
+    in the vault directory, the pending queue in its shared
+    database (v1.0.4 trust split)."""
+    return Vault.open(
+        _resolve_vault_dir(args, config), _resolve_pending_db(args, config)
+    )
+
+
 def _prompt_scan_action(scanned: ScannedFile) -> str | None:
     """Ask what to do with one Malicious file. Returns "quarantine",
     "delete", or None (leave it). EOF/Ctrl-C means leave everything."""
@@ -257,7 +283,7 @@ def _run_scan_actions(
     if mode is None:
         return {}
 
-    vault = Vault.open(_resolve_vault_dir(args, config))
+    vault = _open_vault(args, config)
     history = History.open(_resolve_history_db(args, config))
     try:
         engine = ActionEngine(
@@ -354,23 +380,40 @@ def _cmd_scan(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return EXIT_ERROR
 
-    # Database bootstrap: with no explicit --db, Argus uses (and on
-    # first run creates + seeds) the database in its data folder, so
-    # a fresh install scans out of the box. An explicitly named --db
-    # is the user's own file: if it is missing, that is an error
-    # worth saying out loud, not something to quietly paper over.
+    # Config first: without an explicit --db, the scan uses the
+    # CONFIG's signature_db (the same database protection uses).
+    config = ArgusConfig.load(args.config)
+    if args.config:
+        for warning in config.load_warnings:
+            print(f"Config warning: {warning}", file=sys.stderr)
+    exclusions = config.exclusions if args.config else None
+
+    # Database bootstrap: with no explicit --db, Argus uses the
+    # configured database — creating + seeding it on first run ONLY
+    # at the default location, so a fresh install scans out of the
+    # box. An explicitly named --db is the user's own file: if it is
+    # missing, that is an error worth saying out loud, not something
+    # to quietly paper over. The bootstrap runs inside the same try
+    # as the open, so its errors take the same loud exit.
     if args.db is not None:
         db_path = Path(args.db)
+        try:
+            db = SignatureDB.open(db_path)
+        except SignatureError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            print(f"Build a database first: python -m argus sigdb init {db_path}",
+                  file=sys.stderr)
+            return EXIT_ERROR
     else:
-        db_path = data_dir() / DEFAULT_DB_NAME
-        ensure_signature_db(db_path)
-    try:
-        db = SignatureDB.open(db_path)
-    except SignatureError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        print(f"Build a database first: python -m argus sigdb init {db_path}",
-              file=sys.stderr)
-        return EXIT_ERROR
+        db_path = Path(config.signature_db)
+        try:
+            bootstrap_signature_db(db_path)
+            db = SignatureDB.open(db_path)
+        except SignatureError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            print(f"Build a database first: python -m argus sigdb init {db_path}",
+                  file=sys.stderr)
+            return EXIT_ERROR
 
     rules: list[Rule] = BUILTIN_RULES
     if args.rules:
@@ -380,14 +423,6 @@ def _cmd_scan(args: argparse.Namespace) -> int:
             print(f"Error loading rules: {exc}", file=sys.stderr)
             db.close()
             return EXIT_ERROR
-
-    config: ArgusConfig | None = None
-    exclusions = None
-    if args.config:
-        config = ArgusConfig.load(args.config)
-        for warning in config.load_warnings:
-            print(f"Config warning: {warning}", file=sys.stderr)
-        exclusions = config.exclusions
 
     started_at = _utcnow_iso()
     try:
@@ -576,7 +611,10 @@ def _confirm(prompt: str, yes_flag: bool) -> bool:
 
 
 def _cmd_quarantine_list(args: argparse.Namespace) -> int:
-    vault = Vault.open(_resolve_vault_dir(args, None))
+    try:
+        vault = _open_vault(args, None)
+    except PermissionError:
+        return _quarantine_list_from_view(args)
     try:
         entries = vault.list_entries(status=args.status)
         if args.json:
@@ -607,8 +645,43 @@ def _cmd_quarantine_list(args: argparse.Namespace) -> int:
         vault.close()
 
 
+def _quarantine_list_from_view(args: argparse.Namespace) -> int:
+    """Quarantine list when the vault itself is not readable by
+    this process: the service-published snapshot is the source."""
+    entries = _view_entry_dicts()
+    if args.status:
+        entries = [e for e in entries if e.get("status") == args.status]
+    if args.json:
+        print(json.dumps(entries, indent=2))
+        return EXIT_CLEAN
+    if not entries:
+        print("The quarantine vault is empty (per the protection "
+              "service's snapshot).")
+        return EXIT_CLEAN
+    print("Quarantine vault (from the protection service's snapshot — "
+          "this account cannot open the vault directly):")
+    for entry in entries:
+        print(f"\n  {str(entry.get('id', ''))[:12]}…  "
+              f"[{str(entry.get('status', '')).upper()}] "
+              f"{entry.get('original_path')}")
+        print(f"    Caught: {entry.get('detection_name')} "
+              f"(severity: {entry.get('severity')}, "
+              f"verdict: {entry.get('verdict')})")
+        print(f"    Full id: {entry.get('id')}")
+    return EXIT_CLEAN
+
+
 def _cmd_quarantine_restore(args: argparse.Namespace) -> int:
-    vault = Vault.open(_resolve_vault_dir(args, None))
+    try:
+        vault = _open_vault(args, None)
+    except PermissionError:
+        entry = _find_view_entry(args.id)
+        if entry is None:
+            print(f"Error: no vault entry matches '{args.id}'.", file=sys.stderr)
+            return EXIT_ERROR
+        return _via_service(
+            "restore", entry_id=entry["id"], sha256=entry.get("sha256")
+        )
     try:
         entry = _find_entry(vault, args.id)
         if entry is None:
@@ -627,7 +700,23 @@ def _cmd_quarantine_restore(args: argparse.Namespace) -> int:
 
 
 def _cmd_quarantine_delete(args: argparse.Namespace) -> int:
-    vault = Vault.open(_resolve_vault_dir(args, None))
+    try:
+        vault = _open_vault(args, None)
+    except PermissionError:
+        entry = _find_view_entry(args.id)
+        if entry is None:
+            print(f"Error: no vault entry matches '{args.id}'.", file=sys.stderr)
+            return EXIT_ERROR
+        if not _confirm(
+            f"Permanently delete {entry.get('original_path')} from the "
+            "vault? This cannot be undone. [y/N] ",
+            args.yes,
+        ):
+            print("Left as it is — still safe in the vault.")
+            return EXIT_CLEAN
+        return _via_service(
+            "delete", entry_id=entry["id"], sha256=entry.get("sha256")
+        )
     try:
         entry = _find_entry(vault, args.id)
         if entry is None:
@@ -656,7 +745,23 @@ def _cmd_quarantine_allow(args: argparse.Namespace) -> int:
     config = ArgusConfig.load(args.config)
     for warning in config.load_warnings:
         print(f"Config warning: {warning}", file=sys.stderr)
-    vault = Vault.open(_resolve_vault_dir(args, config))
+    try:
+        vault = _open_vault(args, config)
+    except PermissionError:
+        entry = _find_view_entry(args.id)
+        if entry is None:
+            print(f"Error: no vault entry matches '{args.id}'.", file=sys.stderr)
+            return EXIT_ERROR
+        if not _confirm(
+            f"Vouch for {entry.get('original_path')}? Argus will restore "
+            "it and leave this exact file alone from now on. [y/N] ",
+            args.yes,
+        ):
+            print("Left as it is — still in the vault.")
+            return EXIT_CLEAN
+        return _via_service(
+            "allow", entry_id=entry["id"], sha256=entry.get("sha256")
+        )
     history = History.open(_resolve_history_db(args, config))
     try:
         entry = _find_entry(vault, args.id)
@@ -685,29 +790,39 @@ def _cmd_quarantine_allow(args: argparse.Namespace) -> int:
 
 
 def _cmd_pending_list(args: argparse.Namespace) -> int:
-    vault = Vault.open(_resolve_vault_dir(args, None))
     try:
+        vault = _open_vault(args, None)
         pending = vault.list_pending("pending")
-        if args.json:
-            print(json.dumps([p.to_dict() for p in pending], indent=2))
-            return EXIT_CLEAN
-        if not pending:
-            print("No actions are waiting for your decision.")
-            return EXIT_CLEAN
-        print(f"{len(pending)} action(s) waiting for your decision:")
-        for item in pending:
-            severity = (item.severity or "unknown").capitalize()
-            print(f"\n  {item.id[:12]}…  {item.action.upper()} {item.path}")
-            print(f"    Flagged: {item.detection_name} "
-                  f"(severity: {severity}, verdict: {item.verdict})")
-            print(f"    Since: {item.created_at}  Source: {item.source}")
-            for reason in item.reasons:
-                print(f"    Why: {reason}")
-            print(f"    Decide: argus pending approve {item.id[:12]}  |  "
-                  f"argus pending reject {item.id[:12]}")
-        return EXIT_CLEAN
-    finally:
         vault.close()
+    except PermissionError:
+        # The queue lives in the shared folder — read it directly.
+        pending = [
+            p for p in read_pending_db(_resolve_pending_db(args, None))
+            if p.status == "pending"
+        ]
+        return _print_pending_list(args, pending)
+    return _print_pending_list(args, pending)
+
+
+def _print_pending_list(args: argparse.Namespace, pending) -> int:
+    if args.json:
+        print(json.dumps([p.to_dict() for p in pending], indent=2))
+        return EXIT_CLEAN
+    if not pending:
+        print("No actions are waiting for your decision.")
+        return EXIT_CLEAN
+    print(f"{len(pending)} action(s) waiting for your decision:")
+    for item in pending:
+        severity = (item.severity or "unknown").capitalize()
+        print(f"\n  {item.id[:12]}…  {item.action.upper()} {item.path}")
+        print(f"    Flagged: {item.detection_name} "
+              f"(severity: {severity}, verdict: {item.verdict})")
+        print(f"    Since: {item.created_at}  Source: {item.source}")
+        for reason in item.reasons:
+            print(f"    Why: {reason}")
+        print(f"    Decide: argus pending approve {item.id[:12]}  |  "
+              f"argus pending reject {item.id[:12]}")
+    return EXIT_CLEAN
 
 
 def _find_pending(vault: Vault, idish: str):
@@ -718,9 +833,72 @@ def _find_pending(vault: Vault, idish: str):
     return matches[0] if len(matches) == 1 else None
 
 
+# ----------------------------------------------------------------------
+# Service request channel fallback (v1.0.4 trust split)
+#
+# On an installed machine the vault sits in the trusted root: this
+# process may not be able to open it at all (PermissionError). The
+# action is then handed to the protection service, which executes
+# it against its own records — the human's confirmation happened
+# here at the CLI, the service re-verifies the fingerprint.
+# ----------------------------------------------------------------------
+def _view_entry_dicts() -> list[dict]:
+    try:
+        raw = json.loads(vault_view_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [e for e in raw.get("entries", []) if isinstance(e, dict)]
+
+
+def _find_view_entry(idish: str) -> dict | None:
+    entries = _view_entry_dicts()
+    for entry in entries:
+        if entry.get("id") == idish:
+            return entry
+    matches = [e for e in entries if str(e.get("id", "")).startswith(idish)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _via_service(
+    kind: str,
+    *,
+    entry_id: str | None = None,
+    pending_id: str | None = None,
+    sha256: str | None = None,
+) -> int:
+    result = action_requests.submit_and_wait(
+        kind,
+        entry_id=entry_id,
+        pending_id=pending_id,
+        sha256=sha256,
+        requested_by="Argus CLI",
+    )
+    print(result.message)
+    return EXIT_CLEAN if result.ok else EXIT_ERROR
+
+
+def _find_pending_loose(args, config, idish: str):
+    rows = read_pending_db(_resolve_pending_db(args, config))
+    for row in rows:
+        if row.id == idish:
+            return row
+    matches = [p for p in rows if p.id.startswith(idish)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _cmd_pending_approve(args: argparse.Namespace) -> int:
     config = ArgusConfig.load(args.config) if args.config else ArgusConfig()
-    vault = Vault.open(_resolve_vault_dir(args, config))
+    try:
+        vault = _open_vault(args, config)
+    except PermissionError:
+        pending = _find_pending_loose(args, config, args.id)
+        if pending is None:
+            print(f"Error: no pending action matches '{args.id}'.",
+                  file=sys.stderr)
+            return EXIT_ERROR
+        return _via_service(
+            "approve-pending", pending_id=pending.id, sha256=pending.sha256
+        )
     history = History.open(_resolve_history_db(args, config))
     try:
         pending = _find_pending(vault, args.id)
@@ -744,7 +922,17 @@ def _cmd_pending_approve(args: argparse.Namespace) -> int:
 
 def _cmd_pending_reject(args: argparse.Namespace) -> int:
     config = ArgusConfig.load(args.config) if args.config else ArgusConfig()
-    vault = Vault.open(_resolve_vault_dir(args, config))
+    try:
+        vault = _open_vault(args, config)
+    except PermissionError:
+        pending = _find_pending_loose(args, config, args.id)
+        if pending is None:
+            print(f"Error: no pending action matches '{args.id}'.",
+                  file=sys.stderr)
+            return EXIT_ERROR
+        return _via_service(
+            "reject-pending", pending_id=pending.id, sha256=pending.sha256
+        )
     history = History.open(_resolve_history_db(args, config))
     try:
         pending = _find_pending(vault, args.id)
