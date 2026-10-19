@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -168,7 +169,15 @@ class SettingsPage(QWidget):
         layout.addWidget(self.excl_paths)
         excl_buttons = QHBoxLayout()
         add_path = QPushButton("Add file or folder…")
-        add_path.clicked.connect(self._add_exclusion_path)
+        # One button, both pickers: excluding a single FILE is just
+        # as common as excluding a folder, so the button offers a
+        # small menu rather than only ever opening the folder picker.
+        add_menu = QMenu(add_path)
+        add_file_action = add_menu.addAction("Add file…")
+        add_file_action.triggered.connect(self._add_exclusion_file)
+        add_folder_action = add_menu.addAction("Add folder…")
+        add_folder_action.triggered.connect(self._add_exclusion_path)
+        add_path.setMenu(add_menu)
         remove_path = QPushButton("Remove selected")
         remove_path.clicked.connect(
             lambda: self._remove_selected(self.excl_paths)
@@ -219,7 +228,12 @@ class SettingsPage(QWidget):
             self.watch_list.addItem(chosen)
 
     def _add_exclusion_path(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "Choose a file or folder to exclude")
+        chosen = QFileDialog.getExistingDirectory(self, "Choose a folder to exclude")
+        if chosen:
+            self.excl_paths.addItem(chosen)
+
+    def _add_exclusion_file(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(self, "Choose a file to exclude")
         if chosen:
             self.excl_paths.addItem(chosen)
 
@@ -259,10 +273,46 @@ class SettingsPage(QWidget):
         )
 
 
+class BenchWorker(QObject):
+    """Runs the rule test bench OFF the UI thread (same pattern as
+    the Scan page's worker): dissecting a file reads and analyses
+    the whole thing, and the window must never freeze doing it.
+
+    :meth:`execute` does the work synchronously (tests call it
+    directly); :meth:`run` is the thread entry point.
+    """
+
+    finished_bench = Signal(object)  # TestBenchResult
+    failed = Signal(str)
+
+    def __init__(self, backend: GuiBackend, path_text: str, parent=None):
+        super().__init__(parent)
+        self._backend = backend
+        self._path_text = path_text
+
+    def run(self) -> None:  # thread entry point
+        try:
+            result = self.execute()
+        except Exception as exc:  # surfaced, never swallowed
+            self.failed.emit(str(exc))
+            return
+        self.finished_bench.emit(result)
+
+    def execute(self):
+        db_path = Path(self._backend.config.signature_db)
+        with SignatureDB.open(db_path) as db:
+            return run_test_bench(
+                self._path_text, db, BUILTIN_RULES, self._backend.dev
+            )
+
+
 class DevToolkitPage(QWidget):
     def __init__(self, backend: GuiBackend, parent=None):
         super().__init__(parent)
         self._backend = backend
+        self._bench_thread: QThread | None = None
+        self._bench_worker: BenchWorker | None = None
+        self.last_bench = None
         dev = backend.dev
 
         scroll = QScrollArea(self)
@@ -485,16 +535,35 @@ class DevToolkitPage(QWidget):
         if not path_text:
             QMessageBox.warning(self, "Pick a file", "Choose a file to dissect first.")
             return
-        db_path = Path(self._backend.config.signature_db)
-        try:
-            with SignatureDB.open(db_path) as db:
-                result = run_test_bench(
-                    path_text, db, BUILTIN_RULES, self._backend.dev
-                )
-        except Exception as exc:
-            QMessageBox.critical(self, "Test bench problem", str(exc))
-            return
+        if self._bench_thread is not None:
+            return  # a dissection is already running
+        self.bench_run_button.setEnabled(False)
+        self.bench_verdict_label.setText("Dissecting…")
+        worker = BenchWorker(self._backend, path_text)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished_bench.connect(self._bench_done)
+        worker.failed.connect(self._bench_failed)
+        worker.finished_bench.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(self._bench_thread_done)
+        self._bench_worker = worker
+        self._bench_thread = thread
+        thread.start()
+
+    def _bench_done(self, result) -> None:
         self._show_bench(result)
+
+    def _bench_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "Test bench problem", message)
+
+    def _bench_thread_done(self) -> None:
+        if self._bench_thread is not None:
+            self._bench_thread.deleteLater()
+        self._bench_thread = None
+        self._bench_worker = None
+        self.bench_run_button.setEnabled(True)
 
     def _show_bench(self, result) -> None:
         self.last_bench = result
