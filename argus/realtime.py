@@ -135,6 +135,43 @@ def list_processes_procfs() -> list[ProcessInfo]:
     return processes
 
 
+def _declare_toolhelp_prototypes(kernel32, entry_type) -> None:
+    """Declare the ctypes signatures for the Toolhelp32 / process
+    APIs used below (split out so tests can verify them anywhere).
+
+    The handle-returning functions MUST have ``restype = c_void_p``:
+    with the default int restype a 64-bit handle is truncated to 32
+    bits, and the INVALID_HANDLE_VALUE comparison (and every handle
+    use after it) is wrong on 64-bit Windows.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.CreateToolhelp32Snapshot.argtypes = [
+        wintypes.DWORD, wintypes.DWORD,
+    ]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32FirstW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(entry_type),
+    ]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(entry_type),
+    ]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD,
+        wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+
 def list_processes_windows() -> list[ProcessInfo]:
     """Enumerate processes on Windows via Toolhelp32 (ctypes, no
     third-party modules). Best effort: any failure returns what was
@@ -162,6 +199,7 @@ def list_processes_windows() -> list[ProcessInfo]:
 
     processes: list[ProcessInfo] = []
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    _declare_toolhelp_prototypes(kernel32, PROCESSENTRY32W)
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if snapshot == INVALID_HANDLE_VALUE:
         return processes
