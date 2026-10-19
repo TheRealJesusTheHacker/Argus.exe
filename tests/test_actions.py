@@ -144,8 +144,11 @@ def test_ignore_is_safe_without_confirmation(env):
 def test_pending_approve_quarantine(env):
     target = _drop(env["root"], "evil.exe", EICAR)
     engine = env["engine"]
+    # A real queued action always carries the file's fingerprint —
+    # approval verifies against it (v1.0.4 approval safety).
     pending = engine.enqueue(
-        source="realtime", path=target, action="quarantine", info=_info()
+        source="realtime", path=target, action="quarantine",
+        info=_info(sha256=hashlib.sha256(EICAR).hexdigest()),
     )
     assert env["vault"].pending_count() == 1
     assert target.exists()  # queued != touched
@@ -161,7 +164,8 @@ def test_pending_approve_delete(env):
     target = _drop(env["root"], "evil.exe", EICAR)
     engine = env["engine"]
     pending = engine.enqueue(
-        source="realtime", path=target, action="delete", info=_info()
+        source="realtime", path=target, action="delete",
+        info=_info(sha256=hashlib.sha256(EICAR).hexdigest()),
     )
     engine.approve(pending.id)
     assert not target.exists()
