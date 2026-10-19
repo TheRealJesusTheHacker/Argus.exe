@@ -94,9 +94,14 @@ def _utcnow_iso() -> str:
 def init_db(path: Path | str, *, seed: bool = True) -> SignatureInfo:
     """Create a new signature database at *path*.
 
-    Creates parent directories as needed. With ``seed=True`` (the
-    default) the EICAR test signature is inserted so detection can be
-    verified immediately. Returns the database's info summary.
+    "Create a new database" is literal: any signatures already in the
+    file are cleared first, so re-initializing can never leave a
+    stale mix behind. Creates parent directories as needed. With
+    ``seed=True`` (the default) the EICAR test signature is inserted
+    so detection can be verified immediately. The recorded count is
+    read back from the table itself, so the integrity check in
+    :meth:`SignatureDB.open` always agrees with what was written.
+    Returns the database's info summary.
     """
     db_path = Path(path)
     if db_path.parent and not db_path.parent.exists():
@@ -105,14 +110,14 @@ def init_db(path: Path | str, *, seed: bool = True) -> SignatureInfo:
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(_SCHEMA)
-        count = 0
+        conn.execute("DELETE FROM hashes")
         if seed:
             conn.execute(
                 "INSERT OR REPLACE INTO hashes (sha256, name, family, severity)"
                 " VALUES (?, ?, ?, ?)",
                 (EICAR_SHA256, EICAR_NAME, EICAR_FAMILY, "high"),
             )
-            count = 1
+        count = int(conn.execute("SELECT COUNT(*) FROM hashes").fetchone()[0])
         built_at = _utcnow_iso()
         meta = {
             "schema_version": str(SCHEMA_VERSION),
@@ -134,6 +139,22 @@ def init_db(path: Path | str, *, seed: bool = True) -> SignatureInfo:
         count=count,
         schema_version=SCHEMA_VERSION,
     )
+
+
+def ensure_signature_db(path: Path | str) -> SignatureInfo | None:
+    """Create + seed the signature database at *path* if it is
+    missing; do nothing (and return None) when one is already there.
+
+    This is the first-run bootstrap: a fresh install has no database
+    yet, and protection must come up working rather than failing on a
+    file nobody was ever told to build. An *existing* file is never
+    touched here — if it is corrupt, :meth:`SignatureDB.open` says so
+    loudly instead of the damage being quietly papered over.
+    """
+    db_path = Path(path)
+    if db_path.is_file():
+        return None
+    return init_db(db_path, seed=True)
 
 
 class SignatureDB:
@@ -168,8 +189,11 @@ class SignatureDB:
             raise SignatureError(f"signature database not found: {db_path}")
 
         try:
+            # as_uri() percent-encodes the path properly — a plain
+            # f-string breaks on folders containing '#', '?' or '%'.
             conn = sqlite3.connect(
-                f"file:{db_path}?mode=ro", uri=True, check_same_thread=False
+                f"{db_path.absolute().as_uri()}?mode=ro",
+                uri=True, check_same_thread=False,
             )
         except sqlite3.Error as exc:
             raise SignatureError(f"could not open signature database: {exc}") from exc
