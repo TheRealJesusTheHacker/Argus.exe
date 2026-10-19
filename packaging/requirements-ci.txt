@@ -10,7 +10,20 @@
 # `pip install --no-deps ".[gui,windows]"` so these pins stay the
 # single source of truth (the pyproject extras are minimums for
 # end users installing from source, not for the release build).
+#
+# P1-27: EVERY build-relevant package is pinned here — not just
+# the four headline names. PyInstaller's own dependency tree
+# (hooks-contrib, pefile, altgraph, pywin32-ctypes, packaging,
+# setuptools) decides what the frozen exe contains and how its
+# analysis runs; leaving any of them floating means the release
+# build is not reproducible even with PyInstaller itself pinned.
 PySide6==6.12.0
 pywin32==312
 pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+pefile==2024.8.26
+altgraph==0.17.5
+pywin32-ctypes==0.2.3
+packaging==25.0
+setuptools==80.10.2
 pytest==9.1.1
