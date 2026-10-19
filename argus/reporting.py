@@ -29,6 +29,13 @@ from pathlib import Path
 
 log = logging.getLogger("argus.reporting")
 
+
+class HistoryError(Exception):
+    """Raised when the scan history database cannot be opened or
+    written. Callers treat history as bookkeeping: they report this,
+    never let it hide a scan result."""
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,8 +174,19 @@ class History:
             db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.executescript(_SCHEMA)
-        conn.commit()
+        try:
+            # The service, the GUI, and the CLI all write history,
+            # sometimes at once: WAL + a busy timeout keep concurrent
+            # writers from failing each other.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.executescript(_SCHEMA)
+            conn.commit()
+        except sqlite3.Error as exc:
+            conn.close()
+            raise HistoryError(
+                f"could not open scan history at {db_path}: {exc}"
+            ) from exc
         return cls(conn, db_path)
 
     def close(self) -> None:
@@ -201,31 +219,37 @@ class History:
         detections = detections or []
         now = _utcnow_iso()
         with self._lock:
-            cursor = self._conn.execute(
-                "INSERT INTO scans (kind, root, started_at, finished_at,"
-                " files_scanned, files_skipped, files_excluded,"
-                " bytes_scanned, detections_count)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    kind, root, started_at or now, finished_at or now,
-                    files_scanned, files_skipped, files_excluded,
-                    bytes_scanned, len(detections),
-                ),
-            )
-            scan_id = int(cursor.lastrowid)
-            self._conn.executemany(
-                "INSERT INTO detections (scan_id, recorded_at, path,"
-                " verdict, severity, score, name, reasons, sha256,"
-                " action_taken) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
+            try:
+                cursor = self._conn.execute(
+                    "INSERT INTO scans (kind, root, started_at, finished_at,"
+                    " files_scanned, files_skipped, files_excluded,"
+                    " bytes_scanned, detections_count)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        scan_id, now, d.path, d.verdict, d.severity, d.score,
-                        d.name, json.dumps(d.reasons), d.sha256, d.action_taken,
-                    )
-                    for d in detections
-                ],
-            )
-            self._conn.commit()
+                        kind, root, started_at or now, finished_at or now,
+                        files_scanned, files_skipped, files_excluded,
+                        bytes_scanned, len(detections),
+                    ),
+                )
+                scan_id = int(cursor.lastrowid)
+                self._conn.executemany(
+                    "INSERT INTO detections (scan_id, recorded_at, path,"
+                    " verdict, severity, score, name, reasons, sha256,"
+                    " action_taken) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            scan_id, now, d.path, d.verdict, d.severity,
+                            d.score, d.name, json.dumps(d.reasons), d.sha256,
+                            d.action_taken,
+                        )
+                        for d in detections
+                    ],
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                raise HistoryError(
+                    f"could not record the scan in history: {exc}"
+                ) from exc
         return scan_id
 
     def record_realtime_detection(
@@ -264,18 +288,23 @@ class History:
         that was ultimately taken (e.g. a pending action approved
         later). Bookkeeping only — newest match wins."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT id FROM detections WHERE path = ? AND sha256 IS ?"
-                " ORDER BY id DESC LIMIT 1",
-                (path, sha256),
-            ).fetchone()
-            if row is None:
-                return
-            self._conn.execute(
-                "UPDATE detections SET action_taken = ? WHERE id = ?",
-                (action_taken, row["id"]),
-            )
-            self._conn.commit()
+            try:
+                row = self._conn.execute(
+                    "SELECT id FROM detections WHERE path = ? AND sha256 IS ?"
+                    " ORDER BY id DESC LIMIT 1",
+                    (path, sha256),
+                ).fetchone()
+                if row is None:
+                    return
+                self._conn.execute(
+                    "UPDATE detections SET action_taken = ? WHERE id = ?",
+                    (action_taken, row["id"]),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                raise HistoryError(
+                    f"could not update the detection record: {exc}"
+                ) from exc
 
     # ------------------------------------------------------------------
     # Reading
