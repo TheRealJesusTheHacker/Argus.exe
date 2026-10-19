@@ -47,7 +47,16 @@ jobs:
       - name: Build the installer
         run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\argus.iss'
 
-      - name: Attach the installer and portable exes to the release
+      - name: Assemble the portable edition
+        run: |
+          New-Item -ItemType Directory -Force dist\ArgusPortable | Out-Null
+          Copy-Item dist\Argus.exe dist\ArgusPortable\
+          Copy-Item dist\ArgusService.exe dist\ArgusPortable\
+          Copy-Item packaging\portable\Argus-Portable.bat dist\ArgusPortable\
+          Copy-Item packaging\portable\README-PORTABLE.txt dist\ArgusPortable\
+          Compress-Archive -Path dist\ArgusPortable\* -DestinationPath dist\ArgusPortable.zip -Force
+
+      - name: Attach the installer, portable edition and exes to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload ${{ github.ref_name }} dist/ArgusSetup.exe dist/Argus.exe dist/ArgusService.exe --clobber
+        run: gh release upload ${{ github.ref_name }} dist/ArgusSetup.exe dist/ArgusPortable.zip dist/Argus.exe dist/ArgusService.exe --clobber
