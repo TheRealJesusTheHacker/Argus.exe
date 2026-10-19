@@ -292,8 +292,40 @@ class SettingsPage(QWidget):
         self.relaunch_button.setVisible(False)
         if self._protection is not None:
             self._protection.reload_config()
-        self.saved_label.setText(
-            "Settings saved. Running protection picked up the changes."
+        self.saved_label.setText(self._save_outcome_message())
+
+    def _save_outcome_message(self) -> str:
+        """Say what ACTUALLY happened to the saved settings, per
+        mode — one blanket "saved and applied" line lied whenever
+        protection was run by the service or wasn't running at all:
+
+        - service-managed: the file is saved; the running service
+          applies it when the service next (re)starts — this window
+          cannot reload a service it does not own;
+        - in-process and running: saved AND reloaded live;
+        - not running: saved; applies at the next start.
+        """
+        protection = self._protection
+        if protection is None:
+            return "Settings saved."
+        status = protection.status()
+        if protection.service_managed(
+            status
+        ) or protection.service_managed_stale(status):
+            return (
+                "Settings saved. Protection is run by the Argus "
+                "service, so the new settings apply when the "
+                "service restarts (restarting Windows is the "
+                "surest way)."
+            )
+        if protection.running:
+            return (
+                "Settings saved and applied — running protection "
+                "is using them now."
+            )
+        return (
+            "Settings saved. They will apply the next time "
+            "protection starts."
         )
 
     def _relaunch_as_admin(self) -> None:
@@ -333,8 +365,13 @@ class BenchWorker(QObject):
     def run(self) -> None:  # thread entry point
         try:
             result = self.execute()
-        except Exception as exc:  # surfaced, never swallowed
-            self.failed.emit(str(exc))
+        except Exception:  # surfaced, never swallowed, never raw
+            logging.getLogger("argus.gui").exception("test bench failed")
+            self.failed.emit(
+                "Argus couldn't examine that file — it may have "
+                "moved or be unavailable. Check the path and try "
+                "again."
+            )
             return
         self.finished_bench.emit(result)
 
@@ -342,7 +379,8 @@ class BenchWorker(QObject):
         db_path = Path(self._backend.config.signature_db)
         with SignatureDB.open(db_path) as db:
             return run_test_bench(
-                self._path_text, db, BUILTIN_RULES, self._backend.dev
+                self._path_text, db, BUILTIN_RULES, self._backend.dev,
+                exclusions=self._backend.config.exclusions,
             )
 
 
