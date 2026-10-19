@@ -187,3 +187,114 @@ def test_cli_clean_tree_still_exit_0(tmp_path, capsys):
     assert main(["sigdb", "init", str(db_path)]) == EXIT_CLEAN
     capsys.readouterr()
     assert main(["scan", str(tree), "--db", str(db_path)]) == EXIT_CLEAN
+
+
+# ----------------------------------------------------------------------
+# String extractor equivalence (v1.0.2 fix #16): the bulk regex
+# extractor must produce byte-identical results to the original
+# per-byte state machines it replaced — same strings, same order,
+# same truncation flag — over randomized hostile inputs and random
+# chunk splits.
+# ----------------------------------------------------------------------
+
+def test_string_extractor_matches_reference_byte_machine():
+    import random
+
+    from argus.heuristics.analyze import (
+        _MAX_STRING_CHARS,
+        _MIN_STRING_LEN,
+        _StringExtractor,
+    )
+    from argus.heuristics.signals import StringIndex
+
+    class ReferenceExtractor:
+        """The original per-byte implementation, kept as the oracle."""
+
+        def __init__(self):
+            self.index = StringIndex()
+            self._ascii_run = bytearray()
+            self._u16_run = []
+            self._u16_pending = None
+
+        def _flush_ascii(self):
+            if len(self._ascii_run) >= _MIN_STRING_LEN:
+                self._store(bytes(self._ascii_run).decode("ascii", "replace"))
+            self._ascii_run.clear()
+
+        def _flush_u16(self):
+            if len(self._u16_run) >= _MIN_STRING_LEN:
+                self._store(bytes(self._u16_run).decode("ascii", "replace"))
+            self._u16_run.clear()
+            self._u16_pending = None
+
+        def _store(self, value):
+            if len(self.index.strings) >= 20000:
+                self.index.truncated = True
+                return
+            self.index.add(value[:_MAX_STRING_CHARS])
+
+        def feed(self, chunk):
+            for byte in chunk:
+                printable = 0x20 <= byte <= 0x7E
+                if printable:
+                    if len(self._ascii_run) < _MAX_STRING_CHARS:
+                        self._ascii_run.append(byte)
+                else:
+                    self._flush_ascii()
+                if self._u16_pending is None:
+                    if printable:
+                        self._u16_pending = byte
+                    else:
+                        self._flush_u16()
+                elif byte == 0:
+                    self._u16_run.append(self._u16_pending)
+                    if len(self._u16_run) >= _MAX_STRING_CHARS:
+                        self._flush_u16()
+                    self._u16_pending = None
+                else:
+                    self._flush_u16()
+                    if printable:
+                        self._u16_pending = byte
+
+        def finish(self):
+            self._flush_ascii()
+            self._flush_u16()
+            return self.index
+
+    rng = random.Random(20261019)
+
+    def sample(n):
+        out = bytearray()
+        while len(out) < n:
+            r = rng.random()
+            if r < 0.35:
+                out += bytes(
+                    rng.choice(b" ABCDabcxyz09") for _ in range(rng.randint(1, 30))
+                )
+            elif r < 0.55:
+                out += b"".join(
+                    bytes([rng.choice(b"PQRS")]) + b"\x00"
+                    for _ in range(rng.randint(1, 20))
+                )
+            elif r < 0.7:
+                out += bytes([rng.choice([0, 1, 2, 0x7F, 0xFF, 9])]) * rng.randint(1, 5)
+            elif r < 0.8:
+                out += b"A" * rng.randint(4000, 9000)  # past the string cap
+            elif r < 0.9:
+                out += b"".join(b"B\x00" for _ in range(rng.randint(2000, 5000)))
+            else:
+                out += bytes(rng.randint(0, 255) for _ in range(rng.randint(1, 64)))
+        return bytes(out[:n])
+
+    for _trial in range(60):
+        data = sample(rng.randint(0, 3000))
+        new, ref = _StringExtractor(), ReferenceExtractor()
+        pos = 0
+        while pos < len(data):
+            step = rng.randint(1, 700)
+            new.feed(data[pos : pos + step])
+            ref.feed(data[pos : pos + step])
+            pos += step
+        new_index, ref_index = new.finish(), ref.finish()
+        assert new_index.strings == ref_index.strings
+        assert new_index.truncated == ref_index.truncated
