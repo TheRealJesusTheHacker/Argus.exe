@@ -208,6 +208,20 @@ class ActionEngine:
         if sha256 is None:
             sha256, _ = hash_file(target)
         if direct:
+            # A direct delete has no vault step to re-verify the
+            # file, so verify it HERE: the fingerprint the human
+            # approved must be the fingerprint of the file that is
+            # about to disappear. A mismatch means the file changed
+            # since the decision — deleting it would be deleting a
+            # different file than the one that was reviewed.
+            actual, _ = hash_file(target)
+            if actual.lower() != sha256.lower():
+                raise ActionError(
+                    f"{target} changed since it was reviewed (its "
+                    "fingerprint no longer matches the detection). "
+                    "Argus will not delete a file that is not the one "
+                    "you approved — scan it again."
+                )
             target.unlink()
             entry_id = None
         else:
@@ -381,6 +395,31 @@ class ActionEngine:
             sha256=pending.sha256,
         )
         try:
+            # Approval safety: the human approved a specific file,
+            # identified by the fingerprint recorded when it was
+            # queued. Without that fingerprint there is nothing to
+            # verify against — refuse rather than act on faith. And
+            # the file on disk must STILL be that file: re-hash it
+            # now, because a file swapped after the queueing must
+            # not inherit the approval. (The vault's own post-copy
+            # fingerprint check remains as a second layer.)
+            if pending.sha256 is None:
+                raise ActionError(
+                    "this queued action has no recorded fingerprint "
+                    "for the file, so Argus cannot verify it is the "
+                    "file that was flagged. It will not be carried "
+                    "out — reject it and scan the file again."
+                )
+            target = Path(pending.path)
+            if target.is_file():
+                current, _ = hash_file(target)
+                if current.lower() != pending.sha256.lower():
+                    raise ActionError(
+                        f"{target} changed since it was queued (its "
+                        "fingerprint no longer matches the detection). "
+                        "Argus will not act on a different file than "
+                        "the one you approved — scan it again."
+                    )
             if pending.action == QUARANTINE:
                 outcome = self.quarantine(pending.path, info, confirmed=True)
             elif pending.action == DELETE:
@@ -544,6 +583,10 @@ class ActionEngine:
         self.config.add_hash_exclusion(sha256)
         if self.config_path is not None:
             try:
+                # Merge the on-disk exclusions first: another Argus
+                # process may have vouched for files since this copy
+                # was loaded, and saving must never erase them.
+                self.config.absorb_disk_exclusions(self.config_path)
                 self.config.save(self.config_path)
             except OSError as exc:
                 raise ActionError(
