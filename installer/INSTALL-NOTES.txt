@@ -17,8 +17,11 @@ and Security Center registration are machine-wide settings.
 
 YOUR DATA
 ---------
-Argus keeps its quarantine vault, scan history, and settings
-under your user profile (Local AppData\Argus).
+Argus keeps its settings, signature database, quarantine vault,
+and scan history in one shared machine location:
+C:\ProgramData\Argus. The protection service, the Argus app, and
+the command line all use that same folder, so what one of them
+sees is what all of them see.
 
 If you ever uninstall: the program and service are removed, but
 the vault and history are KEPT unless you check "remove all
