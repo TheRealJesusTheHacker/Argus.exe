@@ -42,11 +42,15 @@ from typing import Callable
 from .config import ArgusConfig
 from .detections import Verdict
 from .rules import BUILTIN_RULES, Rule
-from .scanner import ScannedFile, scan_file
+from .scanner import ScannedFile, scan_file, scan_named_streams
 from .signatures import SignatureDB
 from .watcher import DirectoryWatcher
 
 log = logging.getLogger("argus.realtime")
+
+#: How many times a locked (unreadable) file is re-queued with
+#: backoff before Argus reports it as NotScanned and stops trying.
+MAX_LOCKED_RETRIES = 5
 
 
 def _utcnow_iso() -> str:
@@ -325,6 +329,14 @@ class _WorkItem:
     path: Path
     source: str  # "watch" | "process"
     process: ProcessInfo | None = None
+    #: Bypass the real-time size gate (a deferred full scan queued
+    #: by the oversize path — the file gets its full check once).
+    force: bool = False
+    #: The watcher force-reported this file at its dwell deadline
+    #: while it was still changing.
+    forced_dwell: bool = False
+    #: How many times this item has been re-queued (locked retries).
+    attempts: int = 0
 
 
 class RealtimeEngine:
@@ -363,8 +375,10 @@ class RealtimeEngine:
             poll_interval=config.poll_interval,
             stable_polls=config.stable_polls,
             on_ready=self._on_file_ready,
+            max_dwell_seconds=config.max_dwell_seconds,
         )
         self.process_monitor = ProcessMonitor(on_launch=self._on_process_launch)
+        self._retry_timers: list[threading.Timer] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -415,6 +429,9 @@ class RealtimeEngine:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        for timer in self._retry_timers:
+            timer.cancel()
+        self._retry_timers = []
         self._queue.put(None)  # wake the worker so it can exit
         for thread in self._threads:
             thread.join(timeout=timeout)
@@ -440,7 +457,13 @@ class RealtimeEngine:
     # Intake: watcher + process monitor feed the queue
     # ------------------------------------------------------------------
     def _on_file_ready(self, path: Path) -> None:
-        self._queue.put(_WorkItem(path=path, source="watch"))
+        self._queue.put(
+            _WorkItem(
+                path=path,
+                source="watch",
+                forced_dwell=self.watcher.consume_forced(path),
+            )
+        )
 
     def _on_process_launch(self, proc: ProcessInfo) -> None:
         with self._lock:
@@ -509,21 +532,48 @@ class RealtimeEngine:
             )
             return
 
-        if size > cfg.max_realtime_file_size:
-            with self._lock:
-                self.stats.files_oversized += 1
+        if item.forced_dwell:
             self._emit(
                 RealtimeEvent(
                     kind="info",
                     source=item.source,
                     path=str(path),
                     message=(
-                        f"{path.name} is {size / (1024 * 1024):.0f} MB — larger "
-                        f"than the {cfg.max_realtime_file_size // (1024 * 1024)} MB "
-                        "real-time limit, so it was not scanned automatically. "
-                        "Run a manual scan if you want it checked."
+                        f"{path.name} kept changing for more than "
+                        f"{cfg.max_dwell_seconds:.0f} seconds without "
+                        "settling, so Argus scanned it anyway (dwell "
+                        "deadline) — a file that never sits still does "
+                        "not get a free pass."
                     ),
                 )
+            )
+
+        if size > cfg.max_realtime_file_size and not item.force:
+            with self._lock:
+                self.stats.files_oversized += 1
+            # Detection-grade, not info-only: an unscanned oversized
+            # drop is exactly the kind of thing a user must SEE, and
+            # the file still gets a full (deferred) scan — being big
+            # must not be a way to dodge the scanner entirely.
+            self._emit(
+                RealtimeEvent(
+                    kind="detection",
+                    source=item.source,
+                    path=str(path),
+                    verdict=Verdict.SUSPICIOUS.value,
+                    severity="medium",
+                    message=(
+                        f"{path.name} is {size / (1024 * 1024):.0f} MB — "
+                        f"larger than the "
+                        f"{cfg.max_realtime_file_size // (1024 * 1024)} MB "
+                        "real-time limit. Argus has queued a full scan "
+                        "of it; until that finishes, treat it as "
+                        "unverified."
+                    ),
+                )
+            )
+            self._queue.put(
+                _WorkItem(path=path, source=item.source, force=True)
             )
             return
 
@@ -545,21 +595,81 @@ class RealtimeEngine:
         if not scanned.result.ok:
             with self._lock:
                 self.stats.scan_errors += 1
-            self._emit(
-                RealtimeEvent(
-                    kind="info",
-                    source=item.source,
-                    path=str(path),
-                    message=(
-                        f"Argus could not scan {path.name}: "
-                        f"{scanned.result.error}. The file may be locked by "
-                        "another program. It will be checked again if it changes."
-                    ),
+            if scanned.assessment.not_scanned:
+                self._handle_locked(item)
+            else:
+                self._emit(
+                    RealtimeEvent(
+                        kind="info",
+                        source=item.source,
+                        path=str(path),
+                        message=(
+                            f"Argus could not scan {path.name}: "
+                            f"{scanned.result.error}. The file may be locked by "
+                            "another program. It will be checked again if it changes."
+                        ),
+                    )
                 )
-            )
             return
 
         self._report(item, scanned)
+
+        if item.source == "watch":
+            # Named NTFS data streams on the file get the same
+            # treatment (Windows only; a no-op elsewhere).
+            for stream_scanned in scan_named_streams(
+                path, self.db, self.rules,
+                heuristics=cfg.heuristics, exclusions=cfg.exclusions,
+            ):
+                if stream_scanned.result.ok and not stream_scanned.excluded:
+                    self._report(
+                        _WorkItem(path=stream_scanned.path, source=item.source),
+                        stream_scanned,
+                    )
+
+    def _handle_locked(self, item: _WorkItem) -> None:
+        """A file Argus could not read (locked/denied): retry with
+        backoff a bounded number of times, then report it plainly
+        as NotScanned — never as scanned-and-clean."""
+        path = item.path
+        if item.attempts < MAX_LOCKED_RETRIES:
+            delay = min(2.0 ** item.attempts, 30.0)
+            retry = _WorkItem(
+                path=path,
+                source=item.source,
+                process=item.process,
+                force=item.force,
+                attempts=item.attempts + 1,
+            )
+            timer = threading.Timer(delay, self._requeue, args=(retry,))
+            timer.daemon = True
+            self._retry_timers.append(timer)
+            timer.start()
+            log.info(
+                "could not read %s (locked?) — retry %d/%d in %.0fs",
+                path, retry.attempts, MAX_LOCKED_RETRIES, delay,
+            )
+            return
+        self._emit(
+            RealtimeEvent(
+                kind="detection",
+                source=item.source,
+                path=str(path),
+                verdict=Verdict.NOT_SCANNED.value,
+                severity=None,
+                message=(
+                    f"Argus could not scan {path.name}: the file stayed "
+                    f"locked or unreadable through {MAX_LOCKED_RETRIES} "
+                    "retries. It has NOT been checked and is not known "
+                    "to be clean. Close the program using it and run a "
+                    "manual scan."
+                ),
+            )
+        )
+
+    def _requeue(self, item: _WorkItem) -> None:
+        if not self._stop.is_set():
+            self._queue.put(item)
 
     # ------------------------------------------------------------------
     # Reporting + response policy
