@@ -1,0 +1,18 @@
+[Unit]
+Description=ARGUS.EXE — Real-Time Protection
+Documentation=https://github.com/TheRealJesusTheHacker/Argus.exe
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/argus/argus --service
+Restart=on-failure
+RestartSec=5
+Environment=ARGUS_DATA_DIR=/var/lib/argus
+RuntimeDirectory=argus
+RuntimeDirectoryMode=0755
+UMask=0022
+
+[Install]
+WantedBy=multi-user.target
