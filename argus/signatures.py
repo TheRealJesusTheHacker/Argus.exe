@@ -31,21 +31,29 @@ Authenticity (v1.0.4)
 ---------------------
 The protection service runs as LocalSystem and enforces whatever
 this database says, so the database must be tamper-evident.
-``init_db`` / ``ensure_signature_db`` compute an HMAC-SHA256 tag
-over the canonical sorted list of hash digests, keyed by a random
-secret stored in ``<db name>.key`` next to the database (created
-owner-only, ``0600``). :meth:`SignatureDB.open` verifies the tag
-whenever both the tag and the key are available — a present tag
-that does not match is a loud refusal, never a silent "clean".
-Callers that pass ``require_auth=True`` (the service) also get a
-missing tag/key reported on :class:`SignatureInfo` so they can warn
-loudly without bricking protection.
+``init_db`` — and ONLY ``init_db``, inside its creation
+transaction — mints an HMAC-SHA256 tag over the canonical
+per-row form (digest + name + severity + family, sorted by
+digest, with unambiguous length-prefixed separators), keyed by
+a random secret (see :func:`key_path_for` for where the key
+lives; created owner-only, ``0600``). Nothing ever re-signs an
+existing database: bootstrap/ensure verify the tag READ-ONLY,
+so a drifted tag can never be quietly "refreshed" over tampered
+rows. :meth:`SignatureDB.open` verifies the tag whenever both
+the tag and the key are available — a present tag that does not
+match is a loud refusal, never a silent "clean". Callers that
+pass ``require_auth=True`` (the service) get enforcement, not
+just a report: a missing tag OR a missing key raises
+:class:`SignatureError`. With ``require_auth=False`` a missing
+tag/key is still only reported on :class:`SignatureInfo`
+(``auth_missing`` / ``auth_verified``).
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import sqlite3
@@ -55,7 +63,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .paths import data_dir
+from .paths import data_dir, default_vault_dir
+
+log = logging.getLogger("argus.signatures")
 
 SCHEMA_VERSION = 1
 DB_VERSION = "1.0"
@@ -120,6 +130,17 @@ class SignatureInfo:
     #: (no tag recorded, or no key file beside it). Surfaced so the
     #: service can warn loudly instead of bricking protection.
     auth_missing: bool = False
+    #: True when THIS process could not perform the auth check at
+    #: all because the auth key is not readable to it (v1.1.0 fix
+    #: round 2, FIX 3): the installed layout keeps the default
+    #: database's key inside the ACL'd vault subtree, which a
+    #: standard user's GUI/CLI process must never read. Bootstrap
+    #: then verifies the database's STRUCTURE only and defers the
+    #: HMAC verdict to the protection service — the key holder,
+    #: which verifies strictly (``require_auth=True``) and reports
+    #: tampering loudly in its status. A deferred check is NOT a
+    #: verified one; ``auth_verified`` stays False.
+    auth_deferred: bool = False
 
 
 def _utcnow_iso() -> str:
@@ -130,10 +151,61 @@ def _utcnow_iso() -> str:
 # Authenticity: HMAC key + tag
 # ----------------------------------------------------------------------
 
+def _canon_path(path: Path | str) -> str:
+    """Canonical comparison form for a path: fully RESOLVED
+    (symlinks/junctions followed) and platform case-folded.
+
+    Path-identity comparisons (auditor item g) must not be
+    fooled by spelling: the same database reached through a
+    symlinked directory, a ``.`` segment, or a case variant is
+    the same database, and its key belongs wherever the DEFAULT
+    database's key belongs. ``Path.absolute()`` does none of
+    that resolving, so it is never used for identity checks.
+    """
+    try:
+        return os.path.normcase(str(Path(path).resolve()))
+    except (OSError, RuntimeError):
+        return os.path.normcase(str(Path(path).absolute()))
+
+
+def _is_default_db_path(db_path: Path | str) -> bool:
+    """True when *db_path* IS the default signature database,
+    however it is spelled (links resolved on both sides)."""
+    try:
+        return _canon_path(db_path) == _canon_path(
+            default_signature_db_path()
+        )
+    except Exception:
+        return False
+
+
 def key_path_for(db_path: Path | str) -> Path:
     """The auth-key file that belongs to *db_path*
-    (``signatures.sigdb`` → ``signatures.sigdb.key``)."""
+    (``signatures.sigdb`` → ``signatures.sigdb.key``).
+
+    Installed layout (v1.1.0): when *db_path* IS the default
+    database (:func:`default_signature_db_path`), the key does
+    NOT sit beside the database — a database in the trusted data
+    root must not have its authentication secret in the same
+    user-readable place. It lives in the quarantine vault
+    directory (:func:`argus.paths.default_vault_dir`), which the
+    installer ACLs so standard users cannot read it at all.
+    Every other (custom / portable / dev) database keeps its key
+    beside the database file, as before. Portable mode
+    (``ARGUS_DATA_DIR`` set) still resolves through
+    :func:`argus.paths.data_dir` on both sides of the comparison,
+    so the installed-layout rule follows the override
+    automatically.
+
+    The default-database comparison is CANONICAL (v1.1.0 fix
+    round 2, auditor item g): both sides are fully resolved
+    before comparing, so a non-canonical spelling of the default
+    path in a custom config cannot smuggle the key back beside
+    the database in the user-readable root.
+    """
     path = Path(db_path)
+    if _is_default_db_path(path):
+        return default_vault_dir() / (path.name + ".key")
     return path.with_name(path.name + ".key")
 
 
@@ -182,24 +254,70 @@ def _load_or_create_key(db_path: Path) -> bytes:
     return key
 
 
-def _auth_tag(key: bytes, digests) -> str:
-    """HMAC-SHA256 over the canonical sorted hash list.
+def _auth_tag(key: bytes, rows) -> str:
+    """HMAC-SHA256 over the canonical per-row form (v1.1.0).
 
-    Canonical form: digests lower-cased, sorted ascending, each
-    followed by a newline. Two databases holding the same set of
-    hashes produce the same tag regardless of insertion order.
+    Each row contributes its digest, name, severity and family —
+    NOT just its digest (the pre-v1.1.0 form), so editing a row's
+    name, severity or family without touching its digest fails
+    verification exactly like editing the digest does. Rows are
+    sorted by (lower-cased) digest so insertion order never
+    matters, and every field is fed as ``<byte-length>:<utf-8
+    bytes>`` followed by a NUL separator, with a newline ending
+    each row — length prefixes make field boundaries unambiguous,
+    so no two different row sets can collide by sliding text
+    across a separator.
+
+    *rows* is an iterable of ``(sha256, name, family, severity)``
+    tuples as stored (note the table's column order); a bare
+    digest string is also accepted and treated as a row with
+    empty name/severity/family, for internal convenience.
     """
+    normalised: list[tuple[str, str, str, str]] = []
+    for row in rows:
+        if isinstance(row, str):
+            normalised.append((row.lower(), "", "", ""))
+        else:
+            digest, name, family, severity = row
+            normalised.append(
+                (str(digest).lower(), str(name), str(family), str(severity))
+            )
     mac = hmac.new(key, digestmod=hashlib.sha256)
-    for digest in sorted(d.lower() for d in digests):
-        mac.update(digest.encode("ascii"))
+    for digest, name, family, severity in sorted(
+        normalised, key=lambda r: r[0]
+    ):
+        # Canonical field order: digest + name + severity + family.
+        for field in (digest, name, severity, family):
+            encoded = field.encode("utf-8")
+            mac.update(str(len(encoded)).encode("ascii"))
+            mac.update(b":")
+            mac.update(encoded)
+            mac.update(b"\x00")
         mac.update(b"\n")
     return mac.hexdigest()
 
 
-def _refresh_auth_tag(conn: sqlite3.Connection, db_path: Path, key: bytes) -> str:
-    """Recompute the auth tag from the hashes table and store it."""
-    digests = [row[0] for row in conn.execute("SELECT sha256 FROM hashes")]
-    tag = _auth_tag(key, digests)
+def _auth_rows(conn: sqlite3.Connection) -> list[tuple[str, str, str, str]]:
+    """All signature rows in the table's column order."""
+    return [
+        (row[0], row[1], row[2], row[3])
+        for row in conn.execute(
+            "SELECT sha256, name, family, severity FROM hashes"
+        )
+    ]
+
+
+def _mint_auth_tag(conn: sqlite3.Connection, key: bytes) -> str:
+    """Compute the auth tag from the hashes table and store it.
+
+    This is called ONLY from :func:`init_db`, inside the creation
+    transaction, for a database that init just built. There is
+    deliberately no "refresh" path for existing databases
+    (v1.1.0 P1-1/2/3): re-signing an existing file would let any
+    tampered database launder itself back to "verified" on the
+    next bootstrap, which is the hole this replaces.
+    """
+    tag = _auth_tag(key, _auth_rows(conn))
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
         (_AUTH_META_KEY, tag),
@@ -207,32 +325,173 @@ def _refresh_auth_tag(conn: sqlite3.Connection, db_path: Path, key: bytes) -> st
     return tag
 
 
-def _try_refresh_auth(db_path: Path) -> None:
-    """Best-effort: bring an existing valid database's auth tag up
-    to date (creating the key file if needed).
+def _auth_status(
+    db_path: Path,
+    meta: dict,
+    rows: list[tuple[str, str, str, str]],
+    *,
+    require_auth: bool,
+) -> tuple[bool, bool]:
+    """Check the HMAC auth tag read-only. Returns ``(verified, missing)``.
 
-    Failures are swallowed by design: a standard-user process may
-    not have write access to the trusted data root, and refreshing
-    must never brick a working open. The service surfaces a missing
-    tag loudly through its status instead.
+    - A PRESENT tag that does not verify is always fatal
+      (:class:`SignatureError`) — tamper-evidence doing its job.
+    - A missing tag or a missing/unreadable key is ``missing``
+      when ``require_auth`` is False (reported, not bricked), and
+      is :class:`SignatureError` when ``require_auth`` is True —
+      enforcement, per the pinned v1.1.0 interface.
+    - A key of the wrong length is always fatal.
+    """
+    tag = meta.get(_AUTH_META_KEY)
+    key_file = key_path_for(db_path)
+    if tag is None:
+        if require_auth:
+            raise SignatureError(
+                f"signature database at {db_path} has no authentication "
+                "tag — an existing database that this build did not just "
+                "create cannot be authenticated. Rebuild it with "
+                "'argus sigdb init' from a trusted copy."
+            )
+        return False, True
+    if not key_file.is_file():
+        if require_auth:
+            raise SignatureError(
+                f"signature database at {db_path} cannot be authenticated: "
+                f"its auth key is missing (expected at {key_file}). "
+                "Rebuild it with 'argus sigdb init' from a trusted copy."
+            )
+        return False, True
+    try:
+        key = key_file.read_bytes()
+    except OSError as exc:
+        if require_auth:
+            raise SignatureError(
+                f"signature database at {db_path} cannot be authenticated: "
+                f"its auth key at {key_file} could not be read: {exc}"
+            ) from exc
+        return False, True
+    if len(key) != _KEY_BYTES:
+        raise SignatureError(
+            f"signature database key at {key_file} has the wrong length "
+            f"({len(key)} bytes, expected {_KEY_BYTES}) — cannot "
+            "authenticate the signature database"
+        )
+    expected = _auth_tag(key, rows)
+    if not hmac.compare_digest(expected, tag):
+        raise SignatureError(
+            f"signature database at {db_path} failed authentication: "
+            "its contents do not match the HMAC tag recorded when it "
+            "was built — it may have been tampered with. Rebuild it "
+            "with 'argus sigdb init' from a trusted copy."
+        )
+    return True, False
+
+
+def _verify_existing_auth(db_path: Path) -> bool:
+    """Verify an existing database's auth tag READ-ONLY.
+
+    Used by :func:`ensure_signature_db` for a structurally-ok
+    existing file. Never writes, never creates a key, never
+    re-signs.
+
+    Returns True when the auth check was DEFERRED (fix round 2,
+    FIX 3): the database is the DEFAULT database — whose key by
+    design lives in the ACL'd vault subtree — and the key is not
+    readable by THIS process (a standard user's GUI/CLI on an
+    installed machine). Bootstrap then vouches for the database's
+    structure only; the HMAC verdict belongs to the protection
+    service, the key holder, which opens with
+    ``require_auth=True`` and reports tampering loudly in its
+    status. Deferral is deliberately narrow:
+
+    - a key that IS readable is always used: a wrong tag, a
+      missing tag, or a wrong-length key raises exactly as
+      before, default database or not;
+    - a CUSTOM database never defers — portable/dev layouts keep
+      their key beside the database, readable by their owner, so
+      an unreadable/missing key there is the tamper signal it
+      has always been.
+
+    Everything else raises :class:`SignatureError`.
     """
     try:
-        key = _load_or_create_key(db_path)
-        conn = sqlite3.connect(db_path)
-        try:
-            current = _auth_tag(
-                key, [row[0] for row in conn.execute("SELECT sha256 FROM hashes")]
+        conn = sqlite3.connect(
+            f"{db_path.absolute().as_uri()}?mode=ro", uri=True
+        )
+    except sqlite3.Error as exc:
+        raise SignatureError(
+            f"could not open signature database at {db_path}: {exc}"
+        ) from exc
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta"))
+        rows = _auth_rows(conn)
+    except sqlite3.Error as exc:
+        raise SignatureError(
+            f"signature database at {db_path} failed verification: {exc}"
+        ) from exc
+    finally:
+        conn.close()
+    key_file = key_path_for(db_path)
+    key: bytes | None = None
+    try:
+        key = key_file.read_bytes()
+    except OSError:
+        key = None  # missing OR unreadable to this process
+    if key is not None:
+        if len(key) != _KEY_BYTES:
+            raise SignatureError(
+                f"signature database key at {key_file} has the wrong "
+                f"length ({len(key)} bytes, expected {_KEY_BYTES}) — "
+                "cannot authenticate the signature database"
             )
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key = ?", (_AUTH_META_KEY,)
-            ).fetchone()
-            if row is None or row[0] != current:
-                _refresh_auth_tag(conn, db_path, key)
-                conn.commit()
+        # The key is in hand: verify strictly, whatever this raises.
+        _auth_status(db_path, meta, rows, require_auth=True)
+        return False
+    if _is_default_db_path(db_path):
+        log.info(
+            "signature database auth deferred at %s: the auth key "
+            "at %s is not readable by this process (installed "
+            "layout) — structure verified; the protection service "
+            "performs the strict authentication check.",
+            db_path, key_file,
+        )
+        return True
+    # Custom database with an unavailable key: strict, as always.
+    _auth_status(db_path, meta, rows, require_auth=True)
+    return False
+
+
+def _structural_info(db_path: Path, *, auth_deferred: bool) -> SignatureInfo:
+    """Build a :class:`SignatureInfo` from structure alone (meta
+    table read-only, no auth verdict). Used for the deferred
+    bootstrap outcome (FIX 3): version/count are facts about the
+    file; ``auth_verified`` is False and ``auth_missing`` True
+    because THIS process performed no authentication."""
+    try:
+        conn = sqlite3.connect(
+            f"{db_path.absolute().as_uri()}?mode=ro", uri=True
+        )
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM meta"))
+            count = int(
+                conn.execute("SELECT COUNT(*) FROM hashes").fetchone()[0]
+            )
         finally:
             conn.close()
-    except (sqlite3.Error, SignatureError, OSError):
-        pass
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        raise SignatureError(
+            f"signature database at {db_path} failed structural "
+            f"verification: {exc}"
+        ) from exc
+    return SignatureInfo(
+        version=str(meta.get("version", "unknown")),
+        built_at=str(meta.get("built_at", "")),
+        count=count,
+        schema_version=int(meta.get("schema_version", 0) or 0),
+        auth_verified=False,
+        auth_missing=True,
+        auth_deferred=auth_deferred,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -289,14 +548,28 @@ def init_db(path: Path | str, *, seed: bool = True) -> SignatureInfo:
     ``sqlite3.Error`` leaking to callers, never silent.
     """
     db_path = Path(path)
-    if db_path.parent and not db_path.parent.exists():
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if db_path.parent and not db_path.parent.exists():
+            db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(db_path.parent) if str(db_path.parent) else ".",
-        prefix=db_path.name + ".",
-        suffix=".tmp",
-    )
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(db_path.parent) if str(db_path.parent) else ".",
+            prefix=db_path.name + ".",
+            suffix=".tmp",
+        )
+    except OSError as exc:
+        # Auditor item f: a data root this process may not write
+        # (e.g. the trusted root before the service has ever run)
+        # must surface as this module's one error type with a
+        # plain message — never a raw PermissionError traceback
+        # escaping to the GUI/CLI.
+        raise SignatureError(
+            f"could not create a temporary file beside the signature "
+            f"database at {db_path}: this account cannot write to "
+            f"that folder. If Argus is installed, the protection "
+            f"service creates the database; otherwise pick a "
+            f"location this account can write to."
+        ) from exc
     os.close(fd)
     tmp_path = Path(tmp_name)
     try:
@@ -326,7 +599,9 @@ def init_db(path: Path | str, *, seed: bool = True) -> SignatureInfo:
                     meta.items(),
                 )
                 key = _load_or_create_key(db_path)
-                _refresh_auth_tag(conn, db_path, key)
+                # The ONLY place an auth tag is ever minted: here,
+                # inside the creation transaction of a fresh build.
+                _mint_auth_tag(conn, key)
                 conn.commit()
             finally:
                 conn.close()
@@ -366,14 +641,28 @@ def ensure_signature_db(path: Path | str) -> SignatureInfo | None:
     * A missing file is created and seeded.
     * A zero-byte placeholder or a never-initialized SQLite file is
       (re)initialized — it is a database someone started, not data.
-    * A valid existing database is left as-is; its auth tag is
-      refreshed (best-effort) when it drifted or is missing.
+    * A valid existing database is left exactly as-is and its auth
+      tag is verified READ-ONLY (v1.1.0): a present-but-wrong tag
+      raises :class:`SignatureError`; a missing tag raises too —
+      whether or not a key file exists (with a key it looks like
+      tampering; without one, an existing database this init did
+      not create simply cannot be authenticated). Bootstrap NEVER
+      re-signs an existing database.
     * A file that exists but is not a database at all is NEVER
       touched — :meth:`SignatureDB.open` reports it loudly instead
       of the damage being quietly papered over.
+    * ONE exception to the strict verification above (fix round
+      2, FIX 3): the DEFAULT database whose key is not readable
+      BY THIS PROCESS — a standard user's GUI/CLI on an installed
+      machine, where the key lives in the ACL'd vault subtree by
+      design. Bootstrap then verifies structure only and returns
+      a :class:`SignatureInfo` with ``auth_deferred`` set: the
+      protection service (the key holder) is the strict verifier
+      and reports the verdict in its status.
 
-    Returns :class:`SignatureInfo` when a database was (re)built,
-    ``None`` when a valid one was already there.
+    Returns :class:`SignatureInfo` when a database was (re)built
+    OR when an existing database's auth check was deferred,
+    ``None`` when a valid verified one was already there.
     """
     db_path = Path(path)
     if not db_path.is_file():
@@ -382,7 +671,8 @@ def ensure_signature_db(path: Path | str) -> SignatureInfo | None:
     if state in ("empty", "no_tables"):
         return init_db(db_path, seed=True)
     if state == "ok":
-        _try_refresh_auth(db_path)
+        if _verify_existing_auth(db_path):
+            return _structural_info(db_path, auth_deferred=True)
     return None
 
 
@@ -407,9 +697,7 @@ def bootstrap_signature_db(path: Path | str) -> SignatureInfo | None:
     db_path = Path(path)
     if db_path.is_file():
         return ensure_signature_db(db_path)
-    if os.path.normcase(str(db_path.absolute())) == os.path.normcase(
-        str(default_signature_db_path().absolute())
-    ):
+    if _canon_path(db_path) == _canon_path(default_signature_db_path()):
         return init_db(db_path, seed=True)
     raise SignatureError(
         f"signature database not found at {db_path} — build it with "
@@ -446,10 +734,12 @@ class SignatureDB:
         SQLite's own integrity check, its recorded signature count
         does not match the actual row count — or its HMAC auth tag
         (when a tag and its key are both present) does not match its
-        contents. ``require_auth=True`` additionally guarantees the
-        outcome is *reported*: a database without a verifiable tag
-        still opens, but with ``info.auth_missing`` set, so the
-        caller can warn loudly instead of bricking protection.
+        contents. ``require_auth=True`` ENFORCES authentication
+        (pinned v1.1.0 interface): a missing tag or a missing key
+        raises :class:`SignatureError` too. With the default
+        ``require_auth=False``, a missing tag/key is only *reported*
+        — the database still opens with ``info.auth_missing`` set,
+        so the caller can warn loudly instead of bricking protection.
         """
         db_path = Path(path)
         if not db_path.is_file():
@@ -466,14 +756,19 @@ class SignatureDB:
             raise SignatureError(f"could not open signature database: {exc}") from exc
 
         try:
-            info = cls._verify(conn, db_path)
+            info = cls._verify(conn, db_path, require_auth=require_auth)
         except Exception:
             conn.close()
             raise
         return cls(conn, info)
 
     @staticmethod
-    def _verify(conn: sqlite3.Connection, db_path: Path) -> SignatureInfo:
+    def _verify(
+        conn: sqlite3.Connection,
+        db_path: Path,
+        *,
+        require_auth: bool = False,
+    ) -> SignatureInfo:
         try:
             tables = {
                 row[0]
@@ -514,7 +809,7 @@ class SignatureDB:
                     "truncated or tampered with"
                 )
             auth_verified, auth_missing = SignatureDB._verify_auth(
-                conn, db_path, meta
+                conn, db_path, meta, require_auth=require_auth
             )
         except SignatureError:
             raise
@@ -532,39 +827,22 @@ class SignatureDB:
 
     @staticmethod
     def _verify_auth(
-        conn: sqlite3.Connection, db_path: Path, meta: dict
+        conn: sqlite3.Connection,
+        db_path: Path,
+        meta: dict,
+        *,
+        require_auth: bool = False,
     ) -> tuple[bool, bool]:
         """Check the HMAC auth tag. Returns ``(verified, missing)``.
 
-        A PRESENT tag that does not verify is always fatal — that
-        is the tamper-evidence doing its job. A tag or key that is
-        simply absent is reported as ``missing`` (the service warns
-        loudly and keeps protecting) rather than bricking startup.
+        Delegates to :func:`_auth_status`: a PRESENT tag that does
+        not verify is always fatal; a missing tag/key is reported
+        as ``missing`` unless ``require_auth`` enforces it as
+        :class:`SignatureError`.
         """
-        tag = meta.get(_AUTH_META_KEY)
-        key_file = key_path_for(db_path)
-        if tag is None or not key_file.is_file():
-            return False, True
-        try:
-            key = key_file.read_bytes()
-        except OSError:
-            return False, True
-        if len(key) != _KEY_BYTES:
-            raise SignatureError(
-                f"signature database key at {key_file} has the wrong length "
-                f"({len(key)} bytes, expected {_KEY_BYTES}) — cannot "
-                "authenticate the signature database"
-            )
-        digests = [row[0] for row in conn.execute("SELECT sha256 FROM hashes")]
-        expected = _auth_tag(key, digests)
-        if not hmac.compare_digest(expected, tag):
-            raise SignatureError(
-                f"signature database at {db_path} failed authentication: "
-                "its contents do not match the HMAC tag recorded when it "
-                "was built — it may have been tampered with. Rebuild it "
-                "with 'argus sigdb init' from a trusted copy."
-            )
-        return True, False
+        return _auth_status(
+            db_path, meta, _auth_rows(conn), require_auth=require_auth
+        )
 
     # ------------------------------------------------------------------
     # Lookups
