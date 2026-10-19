@@ -102,19 +102,39 @@ Depth Argus grows into after the core product ships — pillar 1
       (e.g. abuse.ch MalwareBazaar) into the signature DB builder,
       with the same integrity checks as local builds
 
-## Phase 4 — Quarantine, actions & reporting
-- [ ] Per-severity **actions** on malicious files, matched to the
+## Phase 4 — Quarantine, actions & reporting ✅ (v0.5.0)
+- [x] Per-severity **actions** on malicious files, matched to the
       detection's severity:
   - **Quarantine** — move to the encrypted vault, reversible
-  - **Permanent delete** — for confirmed malicious files
+  - **Permanent delete** — for confirmed malicious files (routes
+        through the vault first, so the index keeps the audit record)
   - **Allow / ignore** — user vouches for a file; Argus stands down
-- [ ] Every action is **user-confirmed, never silent** — Argus never
-      deletes or quarantines anything behind the user's back
+- [x] Every action is **user-confirmed, never silent** — Argus never
+      deletes or quarantines anything behind the user's back. The
+      action layer raises without an explicit confirmation token;
+      **deletion is never automatic under any policy** (the most a
+      real-time policy may do unattended is quarantine a Critical
+      file, and only when the user configured exactly that).
   (Critical-severity pre-execution *blocking* in Phase 3 prevents a
   run; it does not remove the file.)
-- [ ] Restore / remove flows for quarantined files
-- [ ] Detection explanations in plain language
-- [ ] Scan history + audit log
+- [x] Encrypted quarantine vault — pure-stdlib authenticated
+      encryption (HMAC-SHA256 keystream, encrypt-then-MAC), opaque
+      blob names, streamed I/O, fail-safe ordering: the blob is
+      verified end-to-end before the original is removed, and a
+      tampered blob refuses to restore. Honest scope: neutralization-
+      grade, not a secrets vault.
+- [x] Restore / remove flows for quarantined files — restore never
+      overwrites a file that took the original's place (restores
+      beside it, clearly named)
+- [x] Pending-actions queue — real-time requests wait for a human
+      approve/reject under the default `ask` policy
+      (`realtime_default`: `ask` / `auto-quarantine-critical` /
+      `log-only`)
+- [x] Detection explanations in plain language — every history
+      record carries what was caught, why, and what happened to it
+- [x] Scan history + audit log — every scan (manual + real-time)
+      recorded in SQLite; `argus report` / `argus history` render
+      it in plain language (JSON export too)
 
 ## Phase 5 — Product: premium GUI, Dev Toolkit, install & default security app
 ### Premium GUI
