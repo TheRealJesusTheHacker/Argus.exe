@@ -31,7 +31,7 @@ from .quarantine import Vault
 from .realtime import RealtimeEngine, RealtimeEvent
 from .reporting import History
 from .rules import BUILTIN_RULES, Rule, load_rules
-from .signatures import SignatureDB, SignatureError
+from .signatures import SignatureDB, SignatureError, ensure_signature_db
 
 log = logging.getLogger("argus.service")
 
@@ -85,9 +85,13 @@ class ArgusService:
     def start(self) -> None:
         """Load config (unless overridden), open the DB, start the engine.
 
-        Raises :class:`SignatureError` if the signature database is
-        missing or fails verification — protection that cannot verify
-        its signatures must say so, not pretend.
+        A *missing* signature database is created and seeded on the
+        spot — a fresh install must come up protected, not fail on a
+        file nobody built yet. A database that exists but fails
+        verification raises :class:`SignatureError`: protection that
+        cannot verify its signatures must say so, not pretend. If
+        anything fails partway, whatever was opened is closed again —
+        a failed start leaves nothing half-open behind.
         """
         if self.state in ("running", "paused"):
             return
@@ -96,33 +100,18 @@ class ArgusService:
         for warning in self.config.load_warnings:
             log.warning("config: %s", warning)
 
-        self._db = SignatureDB.open(self.config.signature_db)
-        rules = self._load_rules()
-        # Phase 4 wiring: the vault, history, and action engine are
-        # opened BEFORE the engine starts, so every real-time event
-        # is routed through the action policy from the first second.
-        vault_dir = (
-            Path(self.config.vault_dir)
-            if self.config.vault_dir
-            else default_vault_dir()
-        )
-        history_path = (
-            Path(self.config.history_db)
-            if self.config.history_db
-            else default_history_db()
-        )
-        self.vault = Vault.open(vault_dir)
-        self.history = History.open(history_path)
-        self.actions = ActionEngine(
-            self.vault,
-            self.config,
-            config_path=self.config_path,
-            history=self.history,
-        )
-        self.engine = RealtimeEngine(
-            self.config, self._db, rules, on_event=self._dispatch_event
-        )
-        self.engine.start()
+        try:
+            stack = self._open_stack()
+        except Exception as exc:
+            self.last_error = str(exc)
+            raise
+        try:
+            stack[4].start()
+        except Exception as exc:
+            self._close_stack(stack)
+            self.last_error = str(exc)
+            raise
+        self._db, self.vault, self.history, self.actions, self.engine = stack
         self._started_at = _utcnow()
         self.state = "running"
         self.last_error = None
@@ -180,12 +169,43 @@ class ArgusService:
         Counters are carried over so the heartbeat keeps a truthful
         running total for the session. If no config path is set (pure
         defaults), reload simply re-applies the current config.
+
+        Fail-safe: the replacement stack (config, signature DB,
+        vault, history, engine) is fully opened and validated BEFORE
+        the running engine is touched. If the new setup cannot be
+        opened — a corrupt database, an unreadable vault — the old
+        engine keeps running untouched, the failure is logged and
+        recorded in ``last_error``, and the old configuration stays
+        in force.
         """
         was_running = self.state in ("running", "paused")
         if not was_running:
             if self._config_override is None:
                 self.config = ArgusConfig.load(self.config_path)
             return
+        was_paused = self.state == "paused"
+        old_config = self.config
+        if self._config_override is None:
+            new_config = ArgusConfig.load(self.config_path)
+            for warning in new_config.load_warnings:
+                log.warning("config: %s", warning)
+        else:
+            new_config = self._config_override
+        # _open_stack reads self.config — point it at the candidate
+        # while validating, and restore it if validation fails.
+        self.config = new_config
+        try:
+            stack = self._open_stack()
+        except Exception as exc:
+            self.config = old_config
+            self.last_error = (
+                f"configuration reload failed — the previous setup "
+                f"is still protecting you: {exc}"
+            )
+            log.error("%s", self.last_error)
+            return
+        # The new stack validates. Commit: fold the old engine's
+        # counters in, stop it, close its resources, swap, start.
         if self.engine is not None:
             self._fold_engine_stats()
             self.engine.stop()
@@ -200,10 +220,23 @@ class ArgusService:
         if self._db is not None:
             self._db.close()
             self._db = None
-        self.state = "stopped"
-        if self._config_override is None:
-            self.config = ArgusConfig.load(self.config_path)
-        self.start()
+        self._db, self.vault, self.history, self.actions, self.engine = stack
+        try:
+            self.engine.start()
+        except Exception as exc:
+            self._close_stack(stack)
+            self.engine = None
+            self.state = "stopped"
+            self.last_error = str(exc)
+            raise
+        self._started_at = _utcnow()
+        if was_paused:
+            self.engine.pause()
+            self.state = "paused"
+        else:
+            self.state = "running"
+        self.last_error = None
+        self.write_status()
         log.info("Argus service configuration reloaded")
 
     def run_forever(self, stop_event: threading.Event | None = None) -> None:
@@ -304,6 +337,72 @@ class ArgusService:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    def _open_stack(self):
+        """Open and validate every resource a running service needs,
+        WITHOUT starting the engine: the signature database (created
+        + seeded first if missing), the rules, the vault, the
+        history, and the action engine wired to all of them.
+
+        Returns ``(db, vault, history, actions, engine)``. On any
+        failure, whatever was already opened is closed again and the
+        exception propagates — callers never see a half-open stack.
+        """
+        ensure_signature_db(self.config.signature_db)
+        db = None
+        vault = None
+        history = None
+        try:
+            db = SignatureDB.open(self.config.signature_db)
+            rules = self._load_rules()
+            # Phase 4 wiring: the vault, history, and action engine
+            # are opened BEFORE the engine starts, so every real-time
+            # event is routed through the action policy from the
+            # first second.
+            vault_dir = (
+                Path(self.config.vault_dir)
+                if self.config.vault_dir
+                else default_vault_dir()
+            )
+            history_path = (
+                Path(self.config.history_db)
+                if self.config.history_db
+                else default_history_db()
+            )
+            vault = Vault.open(vault_dir)
+            history = History.open(history_path)
+            actions = ActionEngine(
+                vault,
+                self.config,
+                config_path=self.config_path,
+                history=history,
+            )
+            engine = RealtimeEngine(
+                self.config, db, rules, on_event=self._dispatch_event
+            )
+        except Exception:
+            for resource in (history, vault, db):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception:
+                        log.exception("cleanup after a failed open failed")
+            raise
+        return (db, vault, history, actions, engine)
+
+    @staticmethod
+    def _close_stack(stack) -> None:
+        """Close a stack returned by :meth:`_open_stack` (used when
+        the engine itself fails to start after validation passed).
+        The engine is not running yet at that point, so there is
+        nothing to stop — just the opened resources to release."""
+        db, vault, history, _actions, _engine = stack
+        for resource in (history, vault, db):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    log.exception("closing a failed service stack failed")
+
     def _load_rules(self) -> list[Rule]:
         if not self.config.rules_file:
             return BUILTIN_RULES
