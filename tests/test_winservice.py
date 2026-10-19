@@ -154,7 +154,7 @@ def test_register_command_uses_service_paths(monkeypatch, capsys):
 
     monkeypatch.setattr(winservice.sys, "platform", "win32")
     monkeypatch.setattr(winregister, "register_antivirus", fake_register)
-    from pathlib import PureWindowsPath
+    from pathlib import Path, PureWindowsPath
 
     monkeypatch.setattr(
         winservice, "service_exe_path",
@@ -162,12 +162,47 @@ def test_register_command_uses_service_paths(monkeypatch, capsys):
             r"C:\Program Files\Sentinel Safeguard\Argus\ArgusService.exe"
         ),
     )
+    # The register command verifies the product exe exists (fix
+    # #27) before registering: on this (non-Windows) test host the
+    # C:\ path cannot really exist, so existence of exactly that
+    # file is faked — the refusal half is covered by the next test.
+    real_exists = Path.exists
+    monkeypatch.setattr(
+        Path, "exists",
+        lambda self: str(self).endswith("Argus.exe") or real_exists(self),
+    )
     code = perform_service_command("register")
     assert code == 0
     assert seen["pathToSignedReportingExe"].endswith("ArgusService.exe")
     assert seen["pathToSignedProductExe"].endswith("Argus.exe")
     assert seen["instanceGuid"] == winregister.INSTANCE_GUID
     assert "Security Center" in capsys.readouterr().out
+
+
+def test_register_command_refuses_missing_product_exe(monkeypatch, capsys):
+    # Regression (fix #27): never tell Windows Security that a
+    # program which is not on disk is the machine's antivirus.
+    from argus import winregister
+
+    called = []
+    monkeypatch.setattr(winservice.sys, "platform", "win32")
+    monkeypatch.setattr(
+        winregister, "register_antivirus",
+        lambda properties, **kw: called.append(properties),
+    )
+    from pathlib import Path, PureWindowsPath
+
+    monkeypatch.setattr(
+        winservice, "service_exe_path",
+        lambda: PureWindowsPath(
+            r"C:\Program Files\Sentinel Safeguard\Argus\ArgusService.exe"
+        ),
+    )
+    monkeypatch.setattr(Path, "exists", lambda self: False)
+    code = perform_service_command("register")
+    assert code == 1
+    assert called == []  # Security Center was never touched
+    assert "not found" in capsys.readouterr().out
 
 
 def test_main_routes_and_reports(monkeypatch, capsys):
