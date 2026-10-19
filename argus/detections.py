@@ -9,6 +9,10 @@ combined into one :class:`Verdict` per file:
 - **Suspicious** — a rule matched but nothing proves the file is bad.
   Worth a closer look, not a verdict of guilt.
 - **Clean** — no signature and no rule matched.
+- **NotScanned** — Argus could not read the file at all (locked by
+  another program, permission denied). This is NOT "clean": Argus
+  says plainly that it does not know, and real-time protection
+  retries locked files instead of giving them a pass.
 
 Argus is honest about the difference: "suspicious" means "look closer",
 never "definitely malware". No scareware math.
@@ -49,13 +53,21 @@ class Verdict(Enum):
     CLEAN = "Clean"
     SUSPICIOUS = "Suspicious"
     MALICIOUS = "Malicious"
+    #: The file could not be read/scanned at all — an explicit
+    #: "we don't know", never folded into Clean.
+    NOT_SCANNED = "NotScanned"
 
     @property
     def rank(self) -> int:
         return _VERDICT_RANK[self]
 
 
-_VERDICT_RANK = {Verdict.CLEAN: 0, Verdict.SUSPICIOUS: 1, Verdict.MALICIOUS: 2}
+_VERDICT_RANK = {
+    Verdict.NOT_SCANNED: 0,
+    Verdict.CLEAN: 0,
+    Verdict.SUSPICIOUS: 1,
+    Verdict.MALICIOUS: 2,
+}
 
 #: Rule severities that, on their own, justify a Malicious verdict.
 _MALICIOUS_RULE_SEVERITIES = frozenset({"critical"})
@@ -111,6 +123,10 @@ class FileAssessment:
     score: int = 0
     heuristic_verdict: Verdict = Verdict.CLEAN
     notes: list[str] = field(default_factory=list)
+    #: True when the file could not be read at all (locked /
+    #: permission denied). The verdict is then NOT_SCANNED unless
+    #: something was still detected from what could be read.
+    not_scanned: bool = False
 
     @property
     def verdict(self) -> Verdict:
@@ -122,6 +138,8 @@ class FileAssessment:
                 worst = Verdict.MALICIOUS
             elif worst is Verdict.CLEAN:
                 worst = Verdict.SUSPICIOUS
+        if worst is Verdict.CLEAN and self.not_scanned:
+            return Verdict.NOT_SCANNED
         return worst
 
     @property
@@ -134,7 +152,10 @@ class FileAssessment:
 
     @property
     def flagged(self) -> bool:
-        return self.verdict is not Verdict.CLEAN
+        # NotScanned is not "flagged" — nothing was detected; it is
+        # surfaced separately (counts, retries, reports), never as
+        # a detection needing an action decision.
+        return self.verdict not in (Verdict.CLEAN, Verdict.NOT_SCANNED)
 
 
 def assess(
