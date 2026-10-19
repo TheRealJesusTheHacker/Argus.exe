@@ -318,6 +318,42 @@ class ProcessMonitor:
             stop_event.wait(interval)
 
 
+def _create_watcher(dirs, **kwargs) -> DirectoryWatcher:
+    """The watcher for this platform: on Linux, the inotify
+    backend (the kernel reports changes as they happen); anywhere
+    else — and on a Linux machine where inotify cannot be
+    initialised — the portable polling watcher.
+
+    The fallback is stated, not silent: it is logged here and the
+    engine's status snapshot reports ``watcher_backend`` so the
+    service heartbeat shows which backend is actually running.
+    Detection semantics are identical either way (same debounce,
+    same dwell deadline, same signatures); only notice latency
+    differs."""
+    if sys.platform.startswith("linux"):
+        try:
+            from .inotify_watcher import (
+                InotifyDirectoryWatcher,
+                InotifyUnavailable,
+            )
+
+            try:
+                return InotifyDirectoryWatcher(dirs, **kwargs)
+            except InotifyUnavailable as exc:
+                log.warning(
+                    "inotify is unavailable on this machine (%s) — "
+                    "real-time watch falls back to polling: same "
+                    "detection, slightly slower notice.",
+                    exc,
+                )
+        except Exception:
+            log.exception(
+                "the inotify watcher could not be constructed — "
+                "falling back to the polling watcher"
+            )
+    return DirectoryWatcher(dirs, **kwargs)
+
+
 # ----------------------------------------------------------------------
 # The engine
 # ----------------------------------------------------------------------
@@ -378,7 +414,7 @@ class RealtimeEngine:
         self._started_at: str | None = None
         self._lock = threading.Lock()
 
-        self.watcher = DirectoryWatcher(
+        self.watcher = _create_watcher(
             config.watch_dirs,
             poll_interval=config.poll_interval,
             stable_polls=config.stable_polls,
@@ -875,6 +911,7 @@ class RealtimeEngine:
         with self._lock:
             stats = self.stats
             snapshot = {
+                "watcher_backend": self.watcher.backend,
                 "files_watched": self.watcher.stats.files_tracked,
                 "scans_completed": stats.scans_completed,
                 "detections": stats.detections,
