@@ -16,6 +16,17 @@ only reported once its size and modification time have stayed
 identical across several consecutive polls: it is *stable*, finished,
 ready to judge.
 
+**Dwell deadline.** Stability alone has a hole: a file that NEVER
+sits still (a slow drip-feed download, malware appending to itself)
+would never be scanned at all. So a tracked file that has been
+changing for longer than ``max_dwell_seconds`` is reported anyway —
+flagged as force-scanned (:meth:`DirectoryWatcher.consume_forced`)
+so the scan result can say it judged a moving target.
+
+**Coverage note.** The watcher tracks base files only. Alternate
+data streams (Windows ADS) attached to a watched file are covered by
+the on-demand scanner, not by the watcher's change tracking.
+
 Hard rules, shared with the scanner:
 
 - **Symlinks are never followed.** Directory links are not descended
@@ -30,6 +41,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
@@ -45,6 +57,9 @@ class _Tracked:
     signature: Signature
     stable_polls: int = 1
     scanned_signature: Signature | None = None
+    #: Monotonic time the file was first tracked in its current
+    #: unscanned state — the dwell deadline is measured from here.
+    first_seen: float = 0.0
 
 
 @dataclass
@@ -75,14 +90,26 @@ class DirectoryWatcher:
         poll_interval: float = 1.0,
         stable_polls: int = 2,
         on_ready: Callable[[Path], None] | None = None,
+        max_dwell_seconds: float = 30.0,
     ) -> None:
         self.dirs = [Path(d) for d in dirs]
         self.poll_interval = poll_interval
         self.stable_polls = max(1, stable_polls)
         self.on_ready = on_ready
+        self.max_dwell_seconds = max(1.0, float(max_dwell_seconds))
         self.stats = WatcherStats()
         self._tracked: dict[Path, _Tracked] = {}
         self._warned_missing: set[Path] = set()
+        #: Paths whose latest report was a dwell-deadline force-scan.
+        self._forced: set[Path] = set()
+
+    def consume_forced(self, path: Path) -> bool:
+        """True (once) if *path*'s latest report was a force-scan:
+        the dwell deadline hit while the file was still changing."""
+        if path in self._forced:
+            self._forced.discard(path)
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Snapshot: what is on disk right now
@@ -142,17 +169,19 @@ class DirectoryWatcher:
         """
         self.stats.polls += 1
         snap = self.snapshot()
+        now = time.monotonic()
         ready: list[Path] = []
 
         # Forget files that are gone.
         for path in list(self._tracked):
             if path not in snap:
                 del self._tracked[path]
+                self._forced.discard(path)
 
         for path, signature in snap.items():
             tracked = self._tracked.get(path)
             if tracked is None:
-                tracked = _Tracked(signature=signature)
+                tracked = _Tracked(signature=signature, first_seen=now)
                 self._tracked[path] = tracked
             elif tracked.signature != signature:
                 # Still being written (or rewritten): restart the wait.
@@ -161,11 +190,21 @@ class DirectoryWatcher:
             else:
                 tracked.stable_polls += 1
 
-            if (
-                tracked.stable_polls >= self.stable_polls
-                and tracked.scanned_signature != tracked.signature
-            ):
+            if tracked.scanned_signature == tracked.signature:
+                continue  # this exact content was already reported
+            stable = tracked.stable_polls >= self.stable_polls
+            dwell_expired = (
+                tracked.first_seen > 0
+                and now - tracked.first_seen >= self.max_dwell_seconds
+            )
+            if stable or dwell_expired:
                 tracked.scanned_signature = tracked.signature
+                # The dwell clock restarts from this report: a file
+                # that keeps changing gets force-scanned once per
+                # dwell window, not on every poll.
+                tracked.first_seen = now
+                if dwell_expired and not stable:
+                    self._forced.add(path)
                 ready.append(path)
 
         self.stats.files_tracked = len(self._tracked)
