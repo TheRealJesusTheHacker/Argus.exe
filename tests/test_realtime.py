@@ -109,15 +109,22 @@ def test_excluded_path_is_never_flagged(engine_env, tmp_path):
     assert engine.stats.files_excluded >= 1
 
 
-def test_oversized_file_is_noted_not_scanned(engine_env):
+def test_oversized_file_is_flagged_and_deferred_scanned(engine_env):
+    # v1.0.4: oversize is detection-grade (not info-only) AND the
+    # file still gets a full deferred scan — being big is not a way
+    # to dodge the scanner.
     watched, config, engine, events = engine_env
     config.max_realtime_file_size = 10  # bytes — everything is oversized
     # Written *before* start so no poll can catch a mid-write state.
     (watched / "big.bin").write_bytes(b"x" * 100)
     engine.start()
-    assert _wait_for(lambda: any(e.kind == "info" for e in events))
+    assert _wait_for(
+        lambda: any(
+            e.kind == "detection" and e.verdict == "Suspicious" for e in events
+        )
+    )
+    assert _wait_for(lambda: engine.stats.scans_completed >= 1)
     assert engine.stats.files_oversized == 1
-    assert engine.stats.scans_completed == 0
 
 
 # ----------------------------------------------------------------------
