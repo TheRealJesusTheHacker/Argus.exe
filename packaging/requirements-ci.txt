@@ -1,0 +1,16 @@
+# CI dependency pins for the Windows release build (v1.0.4+).
+#
+# EXACT versions on purpose: the release pipeline must build with
+# the same libraries every time, never with whatever happens to be
+# newest on release day. Every version below exists on PyPI
+# (verified 2026-10-19). Bump deliberately, in review, never by
+# loosening a pin.
+#
+# The Argus package itself is installed separately with
+# `pip install --no-deps ".[gui,windows]"` so these pins stay the
+# single source of truth (the pyproject extras are minimums for
+# end users installing from source, not for the release build).
+PySide6==6.12.0
+pywin32==312
+pyinstaller==6.22.3
+pytest==9.1.1
