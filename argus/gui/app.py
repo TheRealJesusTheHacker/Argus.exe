@@ -66,7 +66,7 @@ def run_gui(argv: list[str] | None = None) -> int:
     app = QApplication(clean_argv)
     app.setApplicationName("ARGUS.EXE")
     app.setOrganizationName("Sentinel Safeguard LLC")
-    app.setStyleSheet(theme.STYLESHEET)
+    theme.apply_theme(app)
     app.setWindowIcon(make_app_icon())
 
     backend = GuiBackend()
@@ -78,11 +78,16 @@ def run_gui(argv: list[str] | None = None) -> int:
 
     apply_logging(backend.dev.verbose_logging)
 
+    start_protection = False
     if needs_onboarding(backend.config):
         wizard = OnboardingWizard(backend)
         wizard.exec()
+        # Finishing onboarding starts protection (the wizard's
+        # promise): the main window's controller owns how that
+        # start routes for this machine's layout.
+        start_protection = wizard.completed_accepted
 
-    window = MainWindow(backend)
+    window = MainWindow(backend, start_protection=start_protection)
     if start_page is not None:
         window.show_page(start_page)
     window.tray.show()
