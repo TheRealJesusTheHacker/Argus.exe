@@ -334,7 +334,19 @@ def init_db(path: Path | str, *, seed: bool = True) -> SignatureInfo:
             raise SignatureError(
                 f"could not build signature database at {db_path}: {exc}"
             ) from exc
-        os.replace(tmp_path, db_path)
+        try:
+            os.replace(tmp_path, db_path)
+        except OSError as exc:
+            # Windows refuses to replace a file that is still open
+            # anywhere (a live SignatureDB handle in this or another
+            # process) — WinError 5. Name the likely cause and keep
+            # the failure in this module's one error type instead of
+            # leaking a raw OSError to callers.
+            raise SignatureError(
+                f"could not publish signature database at {db_path}: "
+                f"{exc} — the existing database may still be open in "
+                "another Argus process or window; close it and retry"
+            ) from exc
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
