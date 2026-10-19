@@ -29,7 +29,8 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .signatures import SEVERITIES
+from .paths import data_dir
+from .signatures import DEFAULT_DB_NAME, SEVERITIES
 
 log = logging.getLogger("argus.config")
 
@@ -135,10 +136,20 @@ class ArgusConfig:
     )
     exclusions: Exclusions = field(default_factory=Exclusions)
     max_realtime_file_size: int = DEFAULT_MAX_REALTIME_FILE_SIZE
-    signature_db: str = "signatures.sigdb"
+    #: Absolute by default, under the shared data root: a bare
+    #: relative name resolved against whatever directory the process
+    #: happened to start in, so the service, GUI, and CLI each looked
+    #: in a different place on a fresh install and found nothing.
+    signature_db: str = field(
+        default_factory=lambda: str(data_dir() / DEFAULT_DB_NAME)
+    )
     rules_file: str | None = None
     heuristics: bool = True
-    status_file: str = DEFAULT_STATUS_FILE
+    #: Absolute for the same reason: the service, the GUI, and
+    #: ``argus watch-status`` must all read the SAME heartbeat file.
+    status_file: str = field(
+        default_factory=lambda: str(data_dir() / DEFAULT_STATUS_FILE)
+    )
     event_log_file: str | None = None
     heartbeat_interval: float = 5.0
     #: How real-time action requests are handled (see REALTIME_POLICIES).
@@ -210,7 +221,12 @@ class ArgusConfig:
         target = Path(path)
         if target.parent and not target.parent.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        # Atomic write (tmp file + rename, the same pattern the
+        # service heartbeat uses): a crash mid-write must never leave
+        # a half-written config behind for the next start to choke on.
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
         self.source_path = target
 
     # ------------------------------------------------------------------
