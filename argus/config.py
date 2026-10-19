@@ -147,6 +147,9 @@ class ArgusConfig:
     vault_dir: str | None = None
     #: Scan history database location (None = standard app-data home).
     history_db: str | None = None
+    #: True once the user has finished the first-run welcome wizard
+    #: (Phase 5 GUI). Stored in config so the wizard shows exactly once.
+    onboarding_completed: bool = False
     #: Problems found while loading (empty when the config was clean).
     load_warnings: list[str] = field(default_factory=list)
     #: Where the config was loaded from (None = pure defaults).
@@ -202,6 +205,7 @@ class ArgusConfig:
             "event_log_file": self.event_log_file,
             "vault_dir": self.vault_dir,
             "history_db": self.history_db,
+            "onboarding_completed": self.onboarding_completed,
         }
         target = Path(path)
         if target.parent and not target.parent.exists():
@@ -286,6 +290,12 @@ class ArgusConfig:
             self.heuristics = heur
         elif heur is not None:
             warn("'heuristics' must be true/false — keeping default")
+
+        onboarded = raw.get("onboarding_completed")
+        if isinstance(onboarded, bool):
+            self.onboarding_completed = onboarded
+        elif onboarded is not None:
+            warn("'onboarding_completed' must be true/false — keeping default")
 
         actions = raw.get("severity_actions")
         if actions is not None:
