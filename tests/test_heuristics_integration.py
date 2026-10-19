@@ -137,7 +137,7 @@ def test_cli_json_includes_signals_score_severity(tree, tmp_path, capsys):
     capsys.readouterr()
     assert main(["scan", str(tree), "--db", str(db_path), "--json"]) == EXIT_DETECTIONS
     payload = json.loads(capsys.readouterr().out)
-    by_name = {f["path"].split("/")[-1]: f for f in payload["files"]}
+    by_name = {f["path"].replace("\\", "/").split("/")[-1]: f for f in payload["files"]}
 
     injector = by_name["injector.exe"]
     assert injector["verdict"] == "Malicious"
