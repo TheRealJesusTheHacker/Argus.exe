@@ -122,8 +122,11 @@ class QuarantinePage(QWidget):
         entry = self._selected_entry()
         if entry is None:
             return
+        # Every action routes through the backend's action surface:
+        # the real engine, or the simulated one while Dev Toolkit
+        # simulation mode is on (then the buttons record intent and
+        # touch nothing — the vault is never reached directly here).
         engine = self._backend.actions()
-        vault = self._backend.vault()
         entry_name = Path(entry.original_path).name
         try:
             if action == "restore":
@@ -134,18 +137,17 @@ class QuarantinePage(QWidget):
                     "believe are safe.",
                 ):
                     return
-                restored_to = vault.restore(entry.id)
-                message = f"Restored to {restored_to}"
+                outcome = engine.restore_entry(entry.id, confirmed=True)
+                message = outcome.message
             elif action == "allow":
-                outcome = engine.allow_entry(entry.id, confirmed=True) \
-                    if _confirm(
-                        self, "Restore and allow this file?",
-                        f"{entry_name} will be put back AND "
-                        "its fingerprint excluded, so Argus stops "
-                        "flagging it. Only vouch for files you trust.",
-                    ) else None
-                if outcome is None:
+                if not _confirm(
+                    self, "Restore and allow this file?",
+                    f"{entry_name} will be put back AND "
+                    "its fingerprint excluded, so Argus stops "
+                    "flagging it. Only vouch for files you trust.",
+                ):
                     return
+                outcome = engine.allow_entry(entry.id, confirmed=True)
                 message = outcome.message
             else:  # delete
                 if not _confirm(
@@ -154,13 +156,16 @@ class QuarantinePage(QWidget):
                     "good. This cannot be undone.",
                 ):
                     return
-                vault.delete_permanent(entry.id)
-                message = f"{entry_name} deleted permanently."
+                outcome = engine.delete_entry(entry.id, confirmed=True)
+                message = outcome.message
         except Exception as exc:
             QMessageBox.critical(self, "That did not work", str(exc))
             return
-        self.status_label.setText(message)
+        # Refresh first: refresh() rewrites the status line with the
+        # queue summary, so the outcome message is set after it —
+        # otherwise the user would never see what just happened.
         self.refresh()
+        self.status_label.setText(message)
 
 
 class PendingPage(QWidget):
@@ -242,14 +247,26 @@ class PendingPage(QWidget):
                     f"({pending.detection_name or 'detection'}).",
                 ):
                     return
-                outcome = engine.approve(pending.id)
+                # approve() returns the ActionOutcome — its message
+                # says what was done.
+                message = engine.approve(pending.id).message
             else:
-                outcome = engine.reject(pending.id)
+                # reject() returns the decided PendingAction (it has
+                # no .message) — build the text from it.
+                decided = engine.reject(pending.id)
+                message = (
+                    f"Rejected — Argus will leave "
+                    f"{Path(decided.path).name} as it is "
+                    f"(the {decided.action} request was declined)."
+                )
         except Exception as exc:
             QMessageBox.critical(self, "That did not work", str(exc))
             return
-        self.status_label.setText(outcome.message)
+        # Refresh first: refresh() rewrites the status line with the
+        # queue summary, so the outcome message is set after it —
+        # otherwise the user would never see what just happened.
         self.refresh()
+        self.status_label.setText(message)
 
 
 class HistoryPage(QWidget):
