@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS entries (
     resolved_at    TEXT,
     restored_path  TEXT,
     note           TEXT,
-    mode           INTEGER
+    mode           INTEGER,
+    row_mac        TEXT
 );
 """
 
@@ -317,6 +318,9 @@ class QuarantineEntry:
     #: quarantine time so a restore can put them back. None for
     #: entries recorded before v1.0.4 (or where stat was unavailable).
     mode: int | None = None
+    #: HMAC over the identity fields (see Vault._entry_mac). Internal
+    #: integrity data — never published in to_dict().
+    row_mac: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -355,6 +359,7 @@ class QuarantineEntry:
             restored_path=row["restored_path"],
             note=row["note"],
             mode=row["mode"] if "mode" in row.keys() else None,
+            row_mac=row["row_mac"] if "row_mac" in row.keys() else None,
         )
 
 
@@ -448,11 +453,49 @@ def read_pending_db(path: Path | str) -> list[PendingAction]:
         rows = conn.execute(
             "SELECT * FROM pending_actions ORDER BY created_at"
         ).fetchall()
-        return [PendingAction._from_row(row) for row in rows]
+        out: list[PendingAction] = []
+        for row in rows:
+            try:
+                out.append(PendingAction._from_row(row))
+            except Exception:
+                log.warning(
+                    "skipping malformed pending row %s in %s",
+                    row["id"] if "id" in row.keys() else "?", db_path,
+                )
+        return out
     except sqlite3.Error:
         return []
     finally:
         conn.close()
+
+
+def read_pending_view(path: Path | str) -> list[PendingAction]:
+    """Read the service-published pending-view snapshot.
+
+    Parses ``{"generated_at": ..., "pending": [PendingAction.to_dict(),
+    ...]}``. Missing or corrupt input reads as an empty queue — the
+    snapshot is a display copy; the trusted queue itself lives with
+    the service.
+    """
+    view_path = Path(path)
+    try:
+        raw = json.loads(view_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, dict) or not isinstance(raw.get("pending"), list):
+        return []
+    known = set(PendingAction.__dataclass_fields__)  # type: ignore[attr-defined]
+    out: list[PendingAction] = []
+    for item in raw["pending"]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            out.append(
+                PendingAction(**{k: v for k, v in item.items() if k in known})
+            )
+        except Exception:
+            log.warning("skipping malformed pending-view item in %s", view_path)
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -537,6 +580,8 @@ class Vault:
             }
             if "mode" not in columns:
                 conn.execute("ALTER TABLE entries ADD COLUMN mode INTEGER")
+            if "row_mac" not in columns:
+                conn.execute("ALTER TABLE entries ADD COLUMN row_mac TEXT")
             pending_conn.executescript(_PENDING_SCHEMA)
             conn.commit()
             pending_conn.commit()
@@ -544,8 +589,14 @@ class Vault:
         except sqlite3.Error as exc:
             conn.close()
             pending_conn.close()
-            raise QuarantineError(f"could not open vault index: {exc}") from exc
+            log.warning("could not open the vault index: %r", exc)
+            raise QuarantineError(
+                "could not open the vault index — Argus's records "
+                "may be damaged. The technical detail was written "
+                "to the Argus log."
+            ) from exc
         vault = cls(root, key, conn, pending_conn, pending_path)
+        vault._adopt_legacy_entry_macs()
         cutoff = time.time() - STALE_TEMP_AGE_SECONDS
         for stale in blobs.glob("*.tmp"):
             try:
@@ -666,8 +717,9 @@ class Vault:
                 plain_sha = _encrypt_stream(src, dst, self._key, nonce)
         except OSError as exc:
             tmp_path.unlink(missing_ok=True)
+            log.warning("quarantine copy failed for %s: %r", source_path, exc)
             raise QuarantineError(
-                f"could not copy {source_path} into the vault: {exc}. "
+                f"could not copy {source_path} into the vault. "
                 "The original file has not been touched."
             ) from exc
         if sha256 is not None and sha256.lower() != plain_sha:
@@ -681,8 +733,9 @@ class Vault:
             os.replace(tmp_path, blob_path)
         except OSError as exc:
             tmp_path.unlink(missing_ok=True)
+            log.warning("quarantine move failed for %s: %r", source_path, exc)
             raise QuarantineError(
-                f"could not move {source_path} into the vault: {exc}. "
+                f"could not move {source_path} into the vault. "
                 "The original file has not been touched."
             ) from exc
         try:
@@ -713,15 +766,19 @@ class Vault:
         try:
             os.remove(source_path)
         except OSError as exc:
+            log.warning(
+                "quarantined %s but could not remove the original: %r",
+                source_path, exc,
+            )
             note = (
-                f"secured in the vault, but the original could not be "
-                f"removed: {exc}"
+                "secured in the vault, but the original could not be "
+                "removed (it may be open in another program)"
             )
             self._update_entry(entry.id, note=note)
             entry.note = note
             raise QuarantineError(
                 f"{source_path} is safely encrypted in the vault, but "
-                f"Argus could not remove the original file: {exc}. It "
+                "Argus could not remove the original file. It "
                 "may be open in another program."
             ) from exc
         log.info("quarantined %s as entry %s", source_path, entry_id)
@@ -735,14 +792,161 @@ class Vault:
             for chunk in _decrypt_stream(blob_path, self._key):
                 hasher.update(chunk)
         except OSError as exc:
+            log.warning("could not read vault blob %s: %r", blob_path.name, exc)
             raise QuarantineError(
-                f"could not verify vault blob {blob_path.name}: {exc}"
+                f"could not verify vault blob {blob_path.name} — "
+                "it could not be read."
             ) from exc
         if hasher.hexdigest() != expected_sha256:
             raise QuarantineError(
                 f"vault blob {blob_path.name} does not decrypt to the "
                 "expected file — refusing to trust it."
             )
+
+    # ------------------------------------------------------------------
+    # Entry index integrity (row MAC, P1-4)
+    # ------------------------------------------------------------------
+    def _entry_mac(
+        self, *, entry_id: str, original_path: str,
+        blob_name: str | None, sha256: str,
+    ) -> str:
+        msg = b"\x1f".join(
+            part.encode("utf-8")
+            for part in (
+                "argus-entry-mac-v1", entry_id, original_path,
+                blob_name or "", sha256,
+            )
+        )
+        return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
+
+    def _mac_for_entry(self, entry: QuarantineEntry) -> str:
+        return self._entry_mac(
+            entry_id=entry.id, original_path=entry.original_path,
+            blob_name=entry.blob_name, sha256=entry.sha256,
+        )
+
+    def _verify_entry_mac(self, entry: QuarantineEntry) -> None:
+        """Refuse a row whose covered fields do not match its MAC.
+
+        A NULL mac means a legacy row that could not be re-validated
+        at open (see :meth:`_adopt_legacy_entry_macs`) — it is refused
+        here too, as possible tampering, never trusted on sight.
+        """
+        expected = entry.row_mac
+        if not expected or not hmac.compare_digest(
+            expected, self._mac_for_entry(entry)
+        ):
+            raise QuarantineError(
+                f"vault entry {entry.id} failed its integrity check — "
+                "its index record may have been tampered with, so "
+                "Argus will not restore, delete, or allow it. "
+                "The record does not match the vault's tamper seal."
+            )
+
+    def verified_entry(self, entry_id: str) -> QuarantineEntry | None:
+        """get_entry + MAC verification (None when there is no row)."""
+        entry = self.get_entry(entry_id)
+        if entry is not None:
+            self._verify_entry_mac(entry)
+        return entry
+
+    def entry_content_matches(self, entry_id: str, sha256: str) -> bool:
+        """Provenance check for migration (fix round 2, FIX 2):
+        True only when the entry exists, passes its row-MAC
+        integrity check, has a live blob, and that blob DECRYPTS
+        (tamper tag verified) to bytes hashing exactly to
+        *sha256* — proof anchored in vault records and vault
+        cryptography that only the service could have written.
+        Any doubt is False; this never raises."""
+        try:
+            entry = self.verified_entry(entry_id)
+        except QuarantineError:
+            return False
+        if entry is None or not sha256:
+            return False
+        if entry.sha256.lower() != sha256.lower():
+            return False
+        if entry.blob_name is None:
+            return False
+        try:
+            blob_path = self._blob_path_for(entry)
+            if not blob_path.is_file():
+                return False
+            self._verify_blob(blob_path, entry.sha256)
+        except QuarantineError:
+            return False
+        return True
+
+    def _adopt_legacy_entry_macs(self) -> None:
+        """Verify-and-adopt legacy (NULL-mac) rows ONCE at open.
+
+        A row is adopted only when its blob exists, decrypts, and
+        hashes to the row's recorded sha256 — full re-validation,
+        not blind trust. Rows failing that keep a NULL mac and are
+        refused at execution time with a tamper error.
+        """
+        try:
+            with self._lock:
+                rows = self._conn.execute(
+                    "SELECT * FROM entries WHERE row_mac IS NULL"
+                ).fetchall()
+        except sqlite3.Error:
+            return
+        for row in rows:
+            try:
+                entry = QuarantineEntry._from_row(row)
+            except Exception:
+                log.warning("legacy vault row could not be parsed; not adopting it")
+                continue
+            if entry.blob_name is None:
+                continue  # terminal row with no blob left to verify
+            try:
+                blob_path = self._blob_path_for(entry)
+                if not blob_path.is_file():
+                    continue
+                self._verify_blob(blob_path, entry.sha256)
+            except QuarantineError:
+                log.warning(
+                    "legacy vault entry %s could not be re-validated; "
+                    "it will be refused as possibly tampered with",
+                    entry.id,
+                )
+                continue
+            mac = self._mac_for_entry(entry)
+            with self._lock:
+                try:
+                    self._conn.execute(
+                        "UPDATE entries SET row_mac = ? WHERE id = ? AND row_mac IS NULL",
+                        (mac, entry.id),
+                    )
+                    self._conn.commit()
+                except sqlite3.Error:
+                    log.warning("could not adopt a MAC for vault entry %s", entry.id)
+
+    # ------------------------------------------------------------------
+    # Blob-name validation (traversal guard, P1-4)
+    # ------------------------------------------------------------------
+    def _blob_path_for(self, entry: QuarantineEntry) -> Path:
+        """Resolve an entry's blob, refusing any blob_name that is
+        not the internal ``<32-hex>.blob`` format or that would
+        escape the blob store."""
+        import re as _re
+
+        blob_name = entry.blob_name or ""
+        if not _re.fullmatch(r"[0-9a-f]{32}\.blob", blob_name):
+            raise QuarantineError(
+                f"vault entry {entry.id} has an invalid blob name — "
+                "its index record may have been tampered with, so "
+                "Argus will not act on it."
+            )
+        resolved = (self.blobs_dir / blob_name).resolve()
+        if not resolved.is_relative_to(self.blobs_dir.resolve()):
+            raise QuarantineError(
+                f"vault entry {entry.id} points outside the vault — "
+                "its index record may have been tampered with, so "
+                "Argus will not act on it."
+            )
+        return resolved
 
     # ------------------------------------------------------------------
     # Restore / delete / allow bookkeeping
@@ -769,12 +973,52 @@ class Vault:
         Returns the path the file was restored to.
         """
         entry = self._require_entry(entry_id, live=True)
-        blob_path = self.blobs_dir / (entry.blob_name or "")
-        if entry.blob_name is None or not blob_path.is_file():
+        blob_path = self._blob_path_for(entry)
+        if not blob_path.is_file():
             raise QuarantineError(
                 f"the vault copy of {entry.original_path} is missing — "
                 "it cannot be restored."
             )
+        # Atomic status claim (P2): exactly one concurrent restore
+        # may proceed; the loser gets a clean error, not a second
+        # publish of the same bytes.
+        self._claim_entry_for_restore(entry.id)
+        try:
+            return self._restore_claimed(entry, blob_path, final_status=final_status)
+        except BaseException:
+            # Release the claim so a failed restore can be retried.
+            try:
+                current = self.get_entry(entry.id)
+                if current is not None and current.status == "restoring":
+                    self._update_entry(entry.id, status="quarantined")
+            except QuarantineError:
+                pass
+            raise
+
+    def _claim_entry_for_restore(self, entry_id: str) -> None:
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "UPDATE entries SET status = 'restoring'"
+                    " WHERE id = ? AND status = 'quarantined'",
+                    (entry_id,),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                log.warning("restore claim failed for %s: %r", entry_id, exc)
+                raise QuarantineError(
+                    "could not claim the vault entry for restore"
+                ) from exc
+            if cur.rowcount != 1:
+                raise QuarantineError(
+                    "this vault entry is already being restored — "
+                    "the other restore will finish it, or fail and "
+                    "make it available again."
+                )
+
+    def _restore_claimed(
+        self, entry: QuarantineEntry, blob_path: Path, *, final_status: str = "restored"
+    ) -> Path:
         tmp_path = self.blobs_dir / f"{entry.id}.restore.tmp"
         hasher = hashlib.sha256()
         try:
@@ -789,8 +1033,9 @@ class Vault:
             raise
         except OSError as exc:
             tmp_path.unlink(missing_ok=True)
+            log.warning("restore of %s failed: %r", entry.original_path, exc)
             raise QuarantineError(
-                f"could not restore {entry.original_path}: {exc}"
+                f"could not restore {entry.original_path}"
             ) from exc
         if hasher.hexdigest() != entry.sha256:
             tmp_path.unlink(missing_ok=True)
@@ -830,7 +1075,7 @@ class Vault:
         except QuarantineError as exc:
             note = (
                 f"restored to {destination}, but Argus could not update "
-                f"its records ({exc}); the vault copy is being kept so "
+                "its records; the vault copy is being kept so "
                 "nothing is lost — restoring again is safe."
             )
             try:
@@ -870,8 +1115,9 @@ class Vault:
                 os.fsync(dst.fileno())
         except OSError as exc:
             stage_path.unlink(missing_ok=True)
+            log.warning("restore publish failed for %s: %r", original, exc)
             raise QuarantineError(
-                f"could not put {original} back: {exc}"
+                f"could not put {original} back"
             ) from exc
         try:
             for candidate in self._restore_candidates(original):
@@ -887,8 +1133,12 @@ class Vault:
                     except FileExistsError:
                         continue
                     except OSError as exc:
+                        log.warning(
+                            "restore publish (copy) failed for %s: %r",
+                            original, exc,
+                        )
                         raise QuarantineError(
-                            f"could not put {original} back: {exc}"
+                            f"could not put {original} back"
                         ) from exc
                     return candidate
                 return candidate
@@ -938,17 +1188,18 @@ class Vault:
             counter += 1
 
     def delete_permanent(self, entry_id: str) -> None:
-        """Destroy a quarantined file for good: overwrite its blob,
-        unlink it, and mark the entry deleted. The index row stays as
-        the audit record — only the file itself is destroyed."""
+        """Destroy a quarantined file for good. Bookkeeping BEFORE
+        shred (P2, matching restore's ordering): the index is updated
+        first, and only then is the blob destroyed — if the update
+        fails the blob stays untouched. The index row stays as the
+        audit record."""
         entry = self._require_entry(entry_id, live=True)
-        if entry.blob_name:
-            blob_path = self.blobs_dir / entry.blob_name
-            if blob_path.is_file():
-                self._shred(blob_path)
+        blob_path = self._blob_path_for(entry) if entry.blob_name else None
         self._update_entry(
             entry.id, status="deleted", resolved_at=_utcnow_iso(), blob_name=None
         )
+        if blob_path is not None and blob_path.is_file():
+            self._shred(blob_path)
         log.info("permanently deleted vault entry %s (%s)", entry.id, entry.original_path)
 
     @staticmethod
@@ -1027,6 +1278,11 @@ class Vault:
         entry = self.get_entry(entry_id)
         if entry is None:
             raise QuarantineError(f"no vault entry with id {entry_id}")
+        # Integrity gates execution (restore/delete/allow all funnel
+        # through here with live=True; a non-live lookup for display
+        # does not need to hard-fail a tampered terminal row).
+        if live:
+            self._verify_entry_mac(entry)
         if live and entry.status != "quarantined":
             raise QuarantineError(
                 f"vault entry {entry_id} is already {entry.status} — "
@@ -1035,35 +1291,52 @@ class Vault:
         return entry
 
     def _insert_entry(self, entry: QuarantineEntry) -> None:
+        entry.row_mac = self._mac_for_entry(entry)
         with self._lock:
             try:
                 self._conn.execute(
                     "INSERT INTO entries (id, original_path, sha256, size,"
                     " quarantined_at, detection_name, severity, verdict,"
                     " reasons, status, blob_name, resolved_at, restored_path,"
-                    " note, mode)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " note, mode, row_mac)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         entry.id, entry.original_path, entry.sha256, entry.size,
                         entry.quarantined_at, entry.detection_name,
                         entry.severity, entry.verdict,
                         json.dumps(entry.reasons), entry.status, entry.blob_name,
                         entry.resolved_at, entry.restored_path, entry.note,
-                        entry.mode,
+                        entry.mode, entry.row_mac,
                     ),
                 )
                 self._conn.commit()
             except sqlite3.Error as exc:
                 raise QuarantineError(
-                    f"could not record the vault entry: {exc}"
+                    "could not record the vault entry"
                 ) from exc
 
     def _update_entry(self, entry_id: str, **fields) -> None:
         if not fields:
             return
-        assignments = ", ".join(f"{name} = ?" for name in fields)
         with self._lock:
             try:
+                # Recompute the row MAC over the POST-update row on
+                # every update (P1-4), so a covered field can never
+                # change without the seal changing with it — and a
+                # hand edit without the key breaks the seal.
+                row = self._conn.execute(
+                    "SELECT * FROM entries WHERE id = ?", (entry_id,)
+                ).fetchone()
+                if row is not None:
+                    merged = {k: row[k] for k in row.keys()}
+                    merged.update(fields)
+                    fields["row_mac"] = self._entry_mac(
+                        entry_id=entry_id,
+                        original_path=merged.get("original_path") or "",
+                        blob_name=merged.get("blob_name"),
+                        sha256=merged.get("sha256") or "",
+                    )
+                assignments = ", ".join(f"{name} = ?" for name in fields)
                 self._conn.execute(
                     f"UPDATE entries SET {assignments} WHERE id = ?",
                     (*fields.values(), entry_id),
@@ -1071,7 +1344,7 @@ class Vault:
                 self._conn.commit()
             except sqlite3.Error as exc:
                 raise QuarantineError(
-                    f"could not update the vault entry: {exc}"
+                    "could not update the vault entry"
                 ) from exc
 
     # ------------------------------------------------------------------
@@ -1119,16 +1392,48 @@ class Vault:
                 self._pending_conn.commit()
             except sqlite3.Error as exc:
                 raise QuarantineError(
-                    f"could not record the pending action: {exc}"
+                    "could not record the pending action"
                 ) from exc
         return pending
+
+    def import_pending(self, pending: PendingAction) -> None:
+        """Insert a pending row preserving its identity (used by
+        the service's one-time legacy migration, after the row has
+        been re-validated). INSERT OR IGNORE: an id already in the
+        trusted queue is never overwritten."""
+        with self._lock:
+            try:
+                self._pending_conn.execute(
+                    "INSERT OR IGNORE INTO pending_actions (id, created_at,"
+                    " decided_at, source, path, sha256, action, severity,"
+                    " verdict, detection_name, reasons, status, entry_id,"
+                    " error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        pending.id, pending.created_at, pending.decided_at,
+                        pending.source, pending.path, pending.sha256,
+                        pending.action, pending.severity, pending.verdict,
+                        pending.detection_name, json.dumps(pending.reasons),
+                        pending.status, pending.entry_id, pending.error,
+                    ),
+                )
+                self._pending_conn.commit()
+            except sqlite3.Error as exc:
+                raise QuarantineError(
+                    "could not import the pending action"
+                ) from exc
 
     def get_pending(self, pending_id: str) -> PendingAction | None:
         with self._lock:
             row = self._pending_conn.execute(
                 "SELECT * FROM pending_actions WHERE id = ?", (pending_id,)
             ).fetchone()
-        return PendingAction._from_row(row) if row else None
+        if row is None:
+            return None
+        try:
+            return PendingAction._from_row(row)
+        except Exception:
+            log.warning("skipping malformed pending row %s", pending_id)
+            return None
 
     def list_pending(self, status: str | None = "pending") -> list[PendingAction]:
         with self._lock:
@@ -1142,7 +1447,16 @@ class Vault:
                     " ORDER BY created_at",
                     (status,),
                 ).fetchall()
-        return [PendingAction._from_row(r) for r in rows]
+        out: list[PendingAction] = []
+        for r in rows:
+            try:
+                out.append(PendingAction._from_row(r))
+            except Exception:
+                log.warning(
+                    "skipping malformed pending row %s",
+                    r["id"] if "id" in r.keys() else "?",
+                )
+        return out
 
     def pending_count(self) -> int:
         with self._lock:
@@ -1169,5 +1483,5 @@ class Vault:
                 self._pending_conn.commit()
             except sqlite3.Error as exc:
                 raise QuarantineError(
-                    f"could not update the pending action: {exc}"
+                    "could not update the pending action"
                 ) from exc
