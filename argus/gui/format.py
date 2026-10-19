@@ -32,11 +32,16 @@ def protection_headline(status: dict | None) -> tuple[str, str, str]:
         )
     errors = status.get("last_error")
     if status.get("state") == "error" or errors:
+        # The engine's own error text is a technical record (it is
+        # in the status file and the log for support) — the person
+        # at the screen gets plain language and a next step, never
+        # a raw exception string.
         return (
             "Protection needs attention",
-            f"Something went wrong: {errors or 'unknown error'}. "
-            "Restart protection, and check the Dev Toolkit log if it "
-            "keeps happening.",
+            "Something went wrong while protection was running. "
+            "Turn protection off and back on — if it keeps "
+            "happening, contact Sentinel Safeguard and mention "
+            "what time it happened.",
             "attention",
         )
     watch_dirs = status.get("watch_dirs") or []
