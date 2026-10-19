@@ -388,3 +388,152 @@ found one evasion and six lesser items; all are closed here:
   parity-consistent payload at ANY offset is caught (placement
   independence above); only the self-corrupting layout escapes
   the folded views, and it escapes execution the same way.
+
+
+## Linux edition (v1.2.0) — the .deb for Kali Linux & Parrot OS
+
+The Windows design, translated to Debian-based Linux — not
+reinvented. The shared engine (scanner, signature DB, rules,
+heuristics, vault cipher, actions, reporting) is unchanged and
+pure standard library; only the platform layer is new code.
+Zero behaviour changes on Windows.
+
+### What shipped
+
+- **`argus/paths.py`** — the FHS layout beside the Windows
+  one: program `/usr/lib/argus/`, data `/var/lib/argus/`,
+  config `/etc/argus/`, logs `/var/log/argus/`, runtime
+  `/run/argus`. `data_dir()` resolves the installed data root
+  only when the installed layout is actually present; the
+  `ARGUS_DATA_DIR` override and per-user XDG behaviour are
+  untouched. (The Windows canonical-path helpers stay
+  platform-blind on purpose — setup tests pin their shape on
+  every OS.)
+- **`argus/linuxservice.py`** — the systemd sibling of
+  `winservice`: a generated unit (`argus-protection.service`,
+  `Type=simple` — the daemon runs in the foreground and the
+  heartbeat file is the readiness proof, as on Windows;
+  `Restart=on-failure`/`RestartSec=5` as the SCM failure-policy
+  analog; `RuntimeDirectory=argus` for the socket's home),
+  `systemctl` state queries behind the same injectable-runner
+  seam, setup-state detection from the layout's own proofs,
+  and the management CLI (`argus service status/start/stop/
+  restart`; install/uninstall belong to apt). The GUI and the
+  daemon share one config-path helper, so they can never read
+  different settings.
+- **`argus/socket_channel.py`** — the verified privileged
+  channel's Linux twin: a Unix domain socket
+  (`/run/argus/argus.sock` under systemd) where the service
+  verifies the peer from the kernel's own credentials
+  (SO_PEERCRED: pid AND uid) and then demands exactly the
+  pipe's proof — the peer's image must resolve to the canonical
+  installed program AND match the fingerprint recorded at
+  install. Sessions run through the SAME session core as the
+  pipe (`serve_pipe_stream`, with the verdict injected), so the
+  wire behaviour — nonces, refusal wording, designed errors —
+  is identical by construction. Root peers are admitted on the
+  kernel credential alone (root owns the machine already); a
+  squatter holding the socket name is refused without being
+  displaced, and a stale socket file is recovered. The file-drop
+  request channel stays UNPRIVILEGED-only in the installed
+  layout, the same rule as Windows.
+- **`argus/platform_dpkg.py`** — system-file trust, Linux
+  form: a file is a recognized system file when dpkg records
+  it as an installed package's payload AND its resolved path
+  is a system location (`/usr`, `/bin`, `/sbin`, `/lib*`;
+  `/usr/local` and user folders never qualify). The grant is
+  the Windows grant, no wider: the heuristic score is zeroed,
+  the findings stay listed with an explanatory note, and
+  signature-database / rule detections are never cleared. A
+  missing or failing dpkg fails closed. `analyze_file` applies
+  the gate on Linux for every routing kind, behind an
+  injectable-verifier seam mirroring the Authenticode one.
+- **`argus/inotify_watcher.py`** — the realtime watcher's
+  Linux backend: inotify via stdlib `ctypes` (no new
+  dependency), subclassing the polling watcher so debounce,
+  dwell deadline, and signatures are the parent's own code —
+  only the change FEED differs (kernel events + a cached
+  snapshot; structure changes and queue overflows fall back
+  to a full walk). If inotify is unavailable the watcher
+  degrades to the parent's polling and SAYS so: the engine
+  status (and therefore the service heartbeat) carries
+  `watcher_backend`, and it reports "polling", never
+  "inotify", when that is what is running.
+- **Self-trust** follows the same rules at the FHS address:
+  exclusion by the canonical path + the fingerprint the
+  package recorded at install (postinst writes
+  `self-identity.json` into the root-owned data root on every
+  configure, so upgrades re-key trust automatically); a file
+  named `argus` anywhere else still scans, and a hash mismatch
+  at the canonical path is a tamper signal, scanned + noted.
+- **Packaging** (`packaging/linux/`): a PyInstaller spec
+  producing the same one-file product (Qt bundled, the Linux
+  platform layer as hidden imports), `build-deb.sh` producing
+  `dist/Argus.deb` with dpkg-deb, and the Debian tree: control
+  (version substituted at build time from `argus.__version__`
+  — the source carries `@VERSION@`, never a stale literal),
+  postinst (data tree with the vault's permission design —
+  quarantine `0700`, request drop `1733` sticky, the rest
+  root-owned `0755`; fingerprint recording; enable + start),
+  prerm (stop + disable on remove only), postrm (data removed
+  only on purge). Desktop entry + icon (the Sentinel eye,
+  green on green-black) for Xfce/MATE menus. The checked-in
+  unit file is byte-identical to `render_unit()`'s output — a
+  test pins it, so the shipped unit cannot drift from the code.
+- **CI**: the release workflow gains a Linux job on the same
+  tag (full test suite offscreen, .deb build, packaged
+  `--self-check` / `--self-check-qt`, package inspection) and
+  a final checksums job that publishes ONE `SHA256SUMS.txt`
+  covering `Argus.exe`, `ArgusPortable.zip`, and `Argus.deb`.
+
+### Windows → Linux mapping
+
+| Windows | Linux (.deb edition) |
+|---|---|
+| SCM service `ArgusProtection` | systemd unit `argus-protection.service` |
+| SCM failure actions (restart w/ back-off) | `Restart=on-failure`, `RestartSec=5` |
+| Named pipe + `GetNamedPipeClientProcessId` caller proof | Unix socket + SO_PEERCRED (pid + uid) |
+| Canonical path `C:\Program Files\Sentinel Safeguard\Argus\Argus.exe` | `/usr/lib/argus/argus` |
+| `C:\ProgramData\Argus` (ACL'd data root) | `/var/lib/argus` (root-owned; quarantine `0700`, request drop `1733`) |
+| Authenticode: Microsoft signature + Windows-folder location | dpkg: package ownership + system location (`/usr`, `/bin`, `/sbin`, `/lib*`) |
+| SCM ImagePath as program locator | unit `ExecStart` as program locator (never a proof, same rule) |
+| Polling watcher (ReadDirectoryChangesW unused) | inotify via ctypes, honest polling fallback |
+| Self-installing `Argus.exe` + ARP registration | `apt install ./Argus.deb`; dpkg's database is the registration |
+| Windows Security Center registration | — (no Linux equivalent exists; not claimed) |
+
+### Verification status — read this before quoting it
+
+Verified on the project's Linux VM and CI: the full test
+suite (system 645 passed / 28 skipped; GUI 697 passed /
+1 skipped — the 48 new platform tests cover real SO_PEERCRED
+verification, dpkg decisions against fixtures AND the live
+package database, unit generation, maintainer scripts, and
+the inotify backend); the built `.deb` inspected
+(`dpkg-deb -I`/`-c`); the packaged binary passing
+`--self-check` (the frozen Linux census) and
+`--self-check-qt` offscreen; `systemd-analyze verify` on the
+unit; the packaged daemon running live (heartbeat reporting
+`watcher_backend: inotify`, socket listening, clean SIGTERM
+shutdown); and a real `dpkg --install` bringing the service
+up under systemd, followed by a full purge.
+
+**Still owed — the first real-hardware run** (nothing below is
+claimed until it happens on an actual Kali/Parrot machine):
+
+- `sudo apt install ./Argus.deb` on Kali (Xfce) and Parrot
+  (MATE): dependency resolution from the distro repos,
+  postinst service start on a booted system.
+- Service state across a real reboot (enabled at boot,
+  heartbeat fresh, `argus service status` agrees).
+- Socket verification as a STANDARD user: the GUI running
+  unprivileged requests a privileged action; the service
+  executes it only via the verified socket, and a forged
+  caller (a script, a renamed copy) is refused.
+- dpkg trust against the distro's genuine system files (no
+  heuristic suspicion on e.g. coreutils binaries; findings
+  still listed).
+- Menu/tray presence on Xfce and MATE, icon rendering, and
+  the onboarding wizard on a real display.
+- Windows Security Center registration remains Windows-only
+  (there is no Linux analog), and the Windows edition's
+  on-hardware checklist is unchanged by this release.
