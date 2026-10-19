@@ -252,7 +252,12 @@ def test_simulation_contrasts_with_real_engine(tmp_path):
         engine = ActionEngine(vault, ArgusConfig())
         target = tmp_path / "evil2.exe"
         target.write_bytes(b"MZ pretend malware")
-        info = DetectionInfo(name="Test", severity="high", verdict="Malicious")
+        import hashlib
+
+        info = DetectionInfo(
+            name="Test", severity="high", verdict="Malicious",
+            sha256=hashlib.sha256(b"MZ pretend malware").hexdigest(),
+        )
         with pytest.raises(Exception):
             engine.quarantine(target, info)  # unconfirmed: refused
         assert target.exists()
