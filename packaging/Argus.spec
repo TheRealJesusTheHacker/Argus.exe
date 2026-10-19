@@ -54,7 +54,7 @@ version_info = VSVersionInfo(
                         ),
                         StringStruct("OriginalFilename", "Argus.exe"),
                         StringStruct("ProductName", "ARGUS.EXE"),
-                        StringStruct("ProductVersion", "1.1.0"),
+                        StringStruct("ProductVersion", "1.1.1"),
                     ],
                 )
             ]
