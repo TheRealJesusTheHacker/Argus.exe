@@ -1,0 +1,845 @@
+"""The ARGUS.EXE quarantine vault.
+
+When Argus finds a malicious file and the user says "quarantine it"
+(or their real-time policy says so for Critical findings), the file
+comes here. Quarantine is a *reversible holding cell*, not a shredder:
+
+- the file is encrypted as it is copied in, so what sits in the vault
+  is inert — it cannot run, and its original name and extension are
+  gone (vault files are opaque ``<entry-id>.blob`` names);
+- an index remembers everything about it: where it lived, its
+  SHA-256 fingerprint, when it was taken, what detection caught it,
+  how severe it was, and the plain-language reasons;
+- the user can **restore** it (decrypted back to where it lived),
+  **allow** it (restored + vouched for), or **delete** it for good.
+
+**Fail-safe ordering is the whole point.** Quarantining streams the
+file into an encrypted blob, verifies the blob end-to-end (decrypt it
+back and compare fingerprints), and only *then* removes the original.
+If anything fails along the way, the original file stays exactly
+where it was and no vault entry is created. Restoring verifies the
+blob's tamper tag before a single byte is put back, and never
+overwrites a file that has since appeared at the original location.
+
+**Honest note on the encryption.** The vault cipher is a pure-stdlib
+construction (HMAC-SHA256 keystream, encrypt-then-MAC) keyed by a
+machine-local secret file. Its job is to *neutralize* threats and
+make tampering evident — it is obfuscation-grade protection for
+malware at rest, not a vault for your secrets, and it does not try
+to defeat an attacker who already owns the machine (they could read
+the key file). Never keep the only copy of anything in quarantine:
+if the key file is lost, vault contents cannot be restored.
+
+This module also stores the **pending actions** queue: actions that
+policy says Argus may take but a human has not approved yet
+(approve/reject lives in :mod:`argus.actions`).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+import os
+import sqlite3
+import struct
+import threading
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator
+
+log = logging.getLogger("argus.quarantine")
+
+CHUNK_SIZE = 1024 * 1024  # 1 MiB — streamed, flat memory, like the scanner
+MAGIC = b"ARGUSQ1\x00"  # 8 bytes, format marker at the head of every blob
+NONCE_SIZE = 16
+TAG_SIZE = 32  # HMAC-SHA256
+KEY_SIZE = 32
+KEY_FILENAME = "vault.key"
+DB_FILENAME = "vault.db"
+BLOBS_DIRNAME = "blobs"
+
+#: Statuses a vault entry can be in. ``quarantined`` is the only live
+#: state; the rest are terminal outcomes the audit trail keeps.
+ENTRY_STATUSES = ("quarantined", "restored", "deleted", "allowed")
+
+#: Statuses a pending action can be in.
+PENDING_STATUSES = ("pending", "approved", "rejected", "done", "failed")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS entries (
+    id             TEXT PRIMARY KEY,
+    original_path  TEXT NOT NULL,
+    sha256         TEXT NOT NULL,
+    size           INTEGER NOT NULL,
+    quarantined_at TEXT NOT NULL,
+    detection_name TEXT NOT NULL,
+    severity       TEXT,
+    verdict        TEXT,
+    reasons        TEXT NOT NULL DEFAULT '[]',
+    status         TEXT NOT NULL DEFAULT 'quarantined',
+    blob_name      TEXT,
+    resolved_at    TEXT,
+    restored_path  TEXT,
+    note           TEXT
+);
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id             TEXT PRIMARY KEY,
+    created_at     TEXT NOT NULL,
+    decided_at     TEXT,
+    source         TEXT NOT NULL,
+    path           TEXT NOT NULL,
+    sha256         TEXT,
+    action         TEXT NOT NULL,
+    severity       TEXT,
+    verdict        TEXT,
+    detection_name TEXT,
+    reasons        TEXT NOT NULL DEFAULT '[]',
+    status         TEXT NOT NULL DEFAULT 'pending',
+    entry_id       TEXT,
+    error          TEXT
+);
+"""
+
+
+class QuarantineError(Exception):
+    """Raised when a vault operation cannot be completed safely.
+
+    Callers can rely on this contract: when QuarantineError is raised,
+    nothing irreversible has happened — the original file (for
+    quarantine/restore) is still where it was.
+    """
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _new_id() -> str:
+    return uuid.uuid4().hex
+
+
+# ----------------------------------------------------------------------
+# Vault cipher (pure stdlib — see the honesty note in the docstring)
+# ----------------------------------------------------------------------
+class _Keystream:
+    """HMAC-SHA256 counter-mode keystream with an XOR interface."""
+
+    def __init__(self, enc_key: bytes, nonce: bytes) -> None:
+        self._enc_key = enc_key
+        self._nonce = nonce
+        self._counter = 0
+        self._buffer = b""
+
+    def _refill(self) -> None:
+        self._buffer = hmac.new(
+            self._enc_key,
+            self._nonce + struct.pack(">Q", self._counter),
+            hashlib.sha256,
+        ).digest()
+        self._counter += 1
+
+    def xor(self, data: bytes) -> bytes:
+        out = bytearray(len(data))
+        pos = 0
+        while pos < len(data):
+            if not self._buffer:
+                self._refill()
+            take = min(len(self._buffer), len(data) - pos)
+            piece = data[pos : pos + take]
+            stream = self._buffer[:take]
+            self._buffer = self._buffer[take:]
+            mixed = int.from_bytes(piece, "little") ^ int.from_bytes(stream, "little")
+            out[pos : pos + take] = mixed.to_bytes(take, "little")
+            pos += take
+        return bytes(out)
+
+
+def _derive_keys(master_key: bytes, nonce: bytes) -> tuple[bytes, bytes]:
+    enc_key = hmac.new(
+        master_key, b"argus-vault-enc\x00" + nonce, hashlib.sha256
+    ).digest()
+    mac_key = hmac.new(
+        master_key, b"argus-vault-mac\x00" + nonce, hashlib.sha256
+    ).digest()
+    return enc_key, mac_key
+
+
+def _load_or_create_key(vault_dir: Path) -> bytes:
+    """Read the vault key, creating it (0600 where supported) if absent."""
+    key_path = vault_dir / KEY_FILENAME
+    if key_path.is_file():
+        key = key_path.read_bytes()
+        if len(key) != KEY_SIZE:
+            raise QuarantineError(
+                f"vault key file {key_path} is damaged (expected {KEY_SIZE} "
+                f"bytes, found {len(key)}). Vault contents cannot be read "
+                "without the original key."
+            )
+        return key
+    key = os.urandom(KEY_SIZE)
+    try:
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:  # lost a creation race — read the winner's key
+        return _load_or_create_key(vault_dir)
+    try:
+        os.write(fd, key)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(key_path, 0o600)  # best effort (limited on Windows)
+    except OSError:
+        pass
+    return key
+
+
+def _encrypt_stream(source, dest, master_key: bytes, nonce: bytes) -> str:
+    """Encrypt *source* into *dest* (blob format); return plaintext SHA-256.
+
+    Layout: ``MAGIC | nonce | ciphertext | tag`` where the tag is
+    HMAC-SHA256 over everything before it (encrypt-then-MAC).
+    """
+    enc_key, mac_key = _derive_keys(master_key, nonce)
+    stream = _Keystream(enc_key, nonce)
+    mac = hmac.new(mac_key, digestmod=hashlib.sha256)
+    header = MAGIC + nonce
+    mac.update(header)
+    dest.write(header)
+    hasher = hashlib.sha256()
+    while True:
+        chunk = source.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        hasher.update(chunk)
+        cipher = stream.xor(chunk)
+        mac.update(cipher)
+        dest.write(cipher)
+    dest.write(mac.digest())
+    dest.flush()
+    os.fsync(dest.fileno())
+    return hasher.hexdigest()
+
+
+def _decrypt_stream(blob_path: Path, master_key: bytes) -> Iterator[bytes]:
+    """Yield plaintext chunks from a blob, verifying its tamper tag.
+
+    The tag sits at the end of the blob, so verification completes
+    only when the generator is exhausted: it raises
+    :class:`QuarantineError` at the end if the tag does not match.
+    Callers must treat any output as untrusted until the generator
+    has finished without raising (restore writes to a temp file for
+    exactly this reason).
+    """
+    size = blob_path.stat().st_size
+    header_size = len(MAGIC) + NONCE_SIZE
+    if size < header_size + TAG_SIZE:
+        raise QuarantineError(f"vault blob {blob_path.name} is truncated or corrupt")
+    with open(blob_path, "rb") as fh:
+        header = fh.read(header_size)
+        if header[: len(MAGIC)] != MAGIC:
+            raise QuarantineError(
+                f"vault blob {blob_path.name} is not an Argus quarantine file"
+            )
+        nonce = header[len(MAGIC) :]
+        enc_key, mac_key = _derive_keys(master_key, nonce)
+        stream = _Keystream(enc_key, nonce)
+        mac = hmac.new(mac_key, digestmod=hashlib.sha256)
+        mac.update(header)
+        remaining = size - header_size - TAG_SIZE
+        while remaining > 0:
+            chunk = fh.read(min(CHUNK_SIZE, remaining))
+            if not chunk:
+                raise QuarantineError(f"vault blob {blob_path.name} ended early")
+            remaining -= len(chunk)
+            mac.update(chunk)
+            yield stream.xor(chunk)
+        tag = fh.read(TAG_SIZE)
+        if len(tag) != TAG_SIZE or not hmac.compare_digest(mac.digest(), tag):
+            raise QuarantineError(
+                f"vault blob {blob_path.name} failed its tamper check — "
+                "it may have been modified or damaged, so Argus will not "
+                "restore it."
+            )
+
+
+# ----------------------------------------------------------------------
+# Records
+# ----------------------------------------------------------------------
+@dataclass
+class QuarantineEntry:
+    """One file in the vault, and everything known about it."""
+
+    id: str
+    original_path: str
+    sha256: str
+    size: int
+    quarantined_at: str
+    detection_name: str
+    severity: str | None
+    verdict: str | None
+    reasons: list[str] = field(default_factory=list)
+    status: str = "quarantined"
+    blob_name: str | None = None
+    resolved_at: str | None = None
+    restored_path: str | None = None
+    note: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "original_path": self.original_path,
+            "sha256": self.sha256,
+            "size": self.size,
+            "quarantined_at": self.quarantined_at,
+            "detection_name": self.detection_name,
+            "severity": self.severity,
+            "verdict": self.verdict,
+            "reasons": list(self.reasons),
+            "status": self.status,
+            "blob_name": self.blob_name,
+            "resolved_at": self.resolved_at,
+            "restored_path": self.restored_path,
+            "note": self.note,
+        }
+
+    @classmethod
+    def _from_row(cls, row: sqlite3.Row) -> "QuarantineEntry":
+        return cls(
+            id=row["id"],
+            original_path=row["original_path"],
+            sha256=row["sha256"],
+            size=row["size"],
+            quarantined_at=row["quarantined_at"],
+            detection_name=row["detection_name"],
+            severity=row["severity"],
+            verdict=row["verdict"],
+            reasons=json.loads(row["reasons"] or "[]"),
+            status=row["status"],
+            blob_name=row["blob_name"],
+            resolved_at=row["resolved_at"],
+            restored_path=row["restored_path"],
+            note=row["note"],
+        )
+
+
+@dataclass
+class PendingAction:
+    """An action policy requested but a human has not decided yet."""
+
+    id: str
+    created_at: str
+    source: str
+    path: str
+    action: str  # "quarantine" | "delete"
+    sha256: str | None = None
+    severity: str | None = None
+    verdict: str | None = None
+    detection_name: str | None = None
+    reasons: list[str] = field(default_factory=list)
+    status: str = "pending"
+    decided_at: str | None = None
+    entry_id: str | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "created_at": self.created_at,
+            "decided_at": self.decided_at,
+            "source": self.source,
+            "path": self.path,
+            "sha256": self.sha256,
+            "action": self.action,
+            "severity": self.severity,
+            "verdict": self.verdict,
+            "detection_name": self.detection_name,
+            "reasons": list(self.reasons),
+            "status": self.status,
+            "entry_id": self.entry_id,
+            "error": self.error,
+        }
+
+    @classmethod
+    def _from_row(cls, row: sqlite3.Row) -> "PendingAction":
+        return cls(
+            id=row["id"],
+            created_at=row["created_at"],
+            decided_at=row["decided_at"],
+            source=row["source"],
+            path=row["path"],
+            sha256=row["sha256"],
+            action=row["action"],
+            severity=row["severity"],
+            verdict=row["verdict"],
+            detection_name=row["detection_name"],
+            reasons=json.loads(row["reasons"] or "[]"),
+            status=row["status"],
+            entry_id=row["entry_id"],
+            error=row["error"],
+        )
+
+
+# ----------------------------------------------------------------------
+# The vault
+# ----------------------------------------------------------------------
+class Vault:
+    """An opened quarantine vault (directory + key + SQLite index)."""
+
+    def __init__(self, vault_dir: Path, key: bytes, conn: sqlite3.Connection) -> None:
+        self.dir = vault_dir
+        self.blobs_dir = vault_dir / BLOBS_DIRNAME
+        self._key = key
+        self._conn = conn
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Opening
+    # ------------------------------------------------------------------
+    @classmethod
+    def open(cls, vault_dir: Path | str) -> "Vault":
+        """Open (creating if needed) the vault at *vault_dir*.
+
+        Also sweeps stale ``*.tmp`` files out of the blob store —
+        leftovers from an interrupted quarantine or restore. A temp
+        file is never a live blob, so removing one cannot lose a
+        quarantined file.
+        """
+        root = Path(vault_dir)
+        blobs = root / BLOBS_DIRNAME
+        blobs.mkdir(parents=True, exist_ok=True)
+        key = _load_or_create_key(root)
+        conn = sqlite3.connect(root / DB_FILENAME, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.executescript(_SCHEMA)
+            conn.commit()
+        except sqlite3.Error as exc:
+            conn.close()
+            raise QuarantineError(f"could not open vault index: {exc}") from exc
+        vault = cls(root, key, conn)
+        for stale in blobs.glob("*.tmp"):
+            try:
+                stale.unlink()
+            except OSError:
+                log.warning("could not remove stale vault temp file %s", stale)
+        return vault
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    def __enter__(self) -> "Vault":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Quarantine
+    # ------------------------------------------------------------------
+    def quarantine_file(
+        self,
+        path: Path | str,
+        *,
+        detection_name: str,
+        severity: str | None = None,
+        verdict: str | None = None,
+        reasons: list[str] | None = None,
+        sha256: str | None = None,
+    ) -> QuarantineEntry:
+        """Move *path* into the vault. Returns the new entry.
+
+        Order of operations is the safety guarantee: stream-encrypt
+        to a temp blob → verify the blob decrypts back to the exact
+        same fingerprint → publish the blob → record the entry → and
+        only then remove the original. Any failure before the last
+        step raises :class:`QuarantineError` with the original file
+        untouched and nothing recorded.
+        """
+        source_path = Path(path)
+        if not source_path.is_file():
+            raise QuarantineError(f"nothing to quarantine at {source_path}")
+        entry_id = _new_id()
+        blob_name = f"{entry_id}.blob"
+        blob_path = self.blobs_dir / blob_name
+        tmp_path = self.blobs_dir / f"{entry_id}.encrypt.tmp"
+        nonce = os.urandom(NONCE_SIZE)
+        try:
+            size = source_path.stat().st_size
+            with open(source_path, "rb") as src, open(tmp_path, "wb") as dst:
+                plain_sha = _encrypt_stream(src, dst, self._key, nonce)
+        except OSError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise QuarantineError(
+                f"could not copy {source_path} into the vault: {exc}. "
+                "The original file has not been touched."
+            ) from exc
+        if sha256 is not None and sha256.lower() != plain_sha:
+            tmp_path.unlink(missing_ok=True)
+            raise QuarantineError(
+                f"{source_path} changed while it was being quarantined "
+                "(its fingerprint no longer matches the scan). Argus left "
+                "it alone — scan it again."
+            )
+        os.replace(tmp_path, blob_path)
+        try:
+            self._verify_blob(blob_path, plain_sha)
+        except QuarantineError:
+            blob_path.unlink(missing_ok=True)
+            raise
+
+        entry = QuarantineEntry(
+            id=entry_id,
+            original_path=str(source_path),
+            sha256=plain_sha,
+            size=size,
+            quarantined_at=_utcnow_iso(),
+            detection_name=detection_name,
+            severity=severity,
+            verdict=verdict,
+            reasons=list(reasons or []),
+            status="quarantined",
+            blob_name=blob_name,
+        )
+        try:
+            self._insert_entry(entry)
+        except QuarantineError:
+            blob_path.unlink(missing_ok=True)
+            raise
+        try:
+            os.remove(source_path)
+        except OSError as exc:
+            note = (
+                f"secured in the vault, but the original could not be "
+                f"removed: {exc}"
+            )
+            self._update_entry(entry.id, note=note)
+            entry.note = note
+            raise QuarantineError(
+                f"{source_path} is safely encrypted in the vault, but "
+                f"Argus could not remove the original file: {exc}. It "
+                "may be open in another program."
+            ) from exc
+        log.info("quarantined %s as entry %s", source_path, entry_id)
+        return entry
+
+    def _verify_blob(self, blob_path: Path, expected_sha256: str) -> None:
+        """Decrypt *blob_path* in memory (streamed) and check both the
+        tamper tag and the plaintext fingerprint."""
+        hasher = hashlib.sha256()
+        try:
+            for chunk in _decrypt_stream(blob_path, self._key):
+                hasher.update(chunk)
+        except OSError as exc:
+            raise QuarantineError(
+                f"could not verify vault blob {blob_path.name}: {exc}"
+            ) from exc
+        if hasher.hexdigest() != expected_sha256:
+            raise QuarantineError(
+                f"vault blob {blob_path.name} does not decrypt to the "
+                "expected file — refusing to trust it."
+            )
+
+    # ------------------------------------------------------------------
+    # Restore / delete / allow bookkeeping
+    # ------------------------------------------------------------------
+    def restore(
+        self, entry_id: str, *, final_status: str = "restored"
+    ) -> Path:
+        """Decrypt an entry back to its original location.
+
+        The blob's tamper tag is verified *while* decrypting into a
+        temp file inside the vault; the temp file is only moved into
+        place after verification passes, so a damaged blob restores
+        nothing. If a file now exists at the original location it is
+        **never overwritten** — the restored file lands next to it as
+        ``name (restored by Argus).ext`` (numbered if needed).
+        Returns the path the file was restored to.
+        """
+        entry = self._require_entry(entry_id, live=True)
+        blob_path = self.blobs_dir / (entry.blob_name or "")
+        if entry.blob_name is None or not blob_path.is_file():
+            raise QuarantineError(
+                f"the vault copy of {entry.original_path} is missing — "
+                "it cannot be restored."
+            )
+        tmp_path = self.blobs_dir / f"{entry.id}.restore.tmp"
+        hasher = hashlib.sha256()
+        try:
+            with open(tmp_path, "wb") as dst:
+                for chunk in _decrypt_stream(blob_path, self._key):
+                    hasher.update(chunk)
+                    dst.write(chunk)
+                dst.flush()
+                os.fsync(dst.fileno())
+        except QuarantineError:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        except OSError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise QuarantineError(
+                f"could not restore {entry.original_path}: {exc}"
+            ) from exc
+        if hasher.hexdigest() != entry.sha256:
+            tmp_path.unlink(missing_ok=True)
+            raise QuarantineError(
+                f"the restored copy of {entry.original_path} does not "
+                "match its fingerprint — Argus removed it rather than "
+                "hand you a damaged file."
+            )
+        destination = self._restore_destination(Path(entry.original_path))
+        try:
+            if destination.parent and not destination.parent.exists():
+                destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(tmp_path, destination)
+        except OSError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise QuarantineError(
+                f"could not put {entry.original_path} back: {exc}"
+            ) from exc
+        blob_path.unlink(missing_ok=True)
+        self._update_entry(
+            entry.id,
+            status=final_status,
+            resolved_at=_utcnow_iso(),
+            restored_path=str(destination),
+            blob_name=None,
+        )
+        log.info("restored entry %s to %s", entry.id, destination)
+        return destination
+
+    @staticmethod
+    def _restore_destination(original: Path) -> Path:
+        if not original.exists():
+            return original
+        stem, suffix = original.stem, original.suffix
+        candidate = original.with_name(f"{stem} (restored by Argus){suffix}")
+        counter = 2
+        while candidate.exists():
+            candidate = original.with_name(
+                f"{stem} (restored by Argus {counter}){suffix}"
+            )
+            counter += 1
+        return candidate
+
+    def delete_permanent(self, entry_id: str) -> None:
+        """Destroy a quarantined file for good: overwrite its blob,
+        unlink it, and mark the entry deleted. The index row stays as
+        the audit record — only the file itself is destroyed."""
+        entry = self._require_entry(entry_id, live=True)
+        if entry.blob_name:
+            blob_path = self.blobs_dir / entry.blob_name
+            if blob_path.is_file():
+                self._shred(blob_path)
+        self._update_entry(
+            entry.id, status="deleted", resolved_at=_utcnow_iso(), blob_name=None
+        )
+        log.info("permanently deleted vault entry %s (%s)", entry.id, entry.original_path)
+
+    @staticmethod
+    def _shred(blob_path: Path) -> None:
+        """Best-effort overwrite before unlink. (On SSDs and journaled
+        filesystems overwriting is not a guarantee — this is hygiene,
+        not a promise.)"""
+        try:
+            size = blob_path.stat().st_size
+            with open(blob_path, "r+b") as fh:
+                remaining = size
+                while remaining > 0:
+                    piece = os.urandom(min(CHUNK_SIZE, remaining))
+                    fh.write(piece)
+                    remaining -= len(piece)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError:
+            log.warning("could not overwrite %s before deleting it", blob_path)
+        blob_path.unlink(missing_ok=True)
+
+    def mark_allowed(self, entry_id: str, restored_path: Path | str) -> None:
+        """Record that an entry was allowed (restored + vouched for)."""
+        self._update_entry(
+            entry_id,
+            status="allowed",
+            resolved_at=_utcnow_iso(),
+            restored_path=str(restored_path),
+        )
+
+    # ------------------------------------------------------------------
+    # Entry access
+    # ------------------------------------------------------------------
+    def get_entry(self, entry_id: str) -> QuarantineEntry | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM entries WHERE id = ?", (entry_id,)
+            ).fetchone()
+        return QuarantineEntry._from_row(row) if row else None
+
+    def find_entry_by_sha256(self, sha256: str) -> QuarantineEntry | None:
+        """Most recent live entry for a fingerprint, if any."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM entries WHERE sha256 = ? AND status = 'quarantined'"
+                " ORDER BY quarantined_at DESC LIMIT 1",
+                (sha256.lower(),),
+            ).fetchone()
+        return QuarantineEntry._from_row(row) if row else None
+
+    def list_entries(self, status: str | None = None) -> list[QuarantineEntry]:
+        with self._lock:
+            if status is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM entries ORDER BY quarantined_at DESC"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM entries WHERE status = ?"
+                    " ORDER BY quarantined_at DESC",
+                    (status,),
+                ).fetchall()
+        return [QuarantineEntry._from_row(r) for r in rows]
+
+    def count(self, status: str | None = None) -> int:
+        with self._lock:
+            if status is None:
+                row = self._conn.execute("SELECT COUNT(*) FROM entries").fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM entries WHERE status = ?", (status,)
+                ).fetchone()
+        return int(row[0])
+
+    def _require_entry(self, entry_id: str, *, live: bool) -> QuarantineEntry:
+        entry = self.get_entry(entry_id)
+        if entry is None:
+            raise QuarantineError(f"no vault entry with id {entry_id}")
+        if live and entry.status != "quarantined":
+            raise QuarantineError(
+                f"vault entry {entry_id} is already {entry.status} — "
+                "there is no live file to act on."
+            )
+        return entry
+
+    def _insert_entry(self, entry: QuarantineEntry) -> None:
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO entries (id, original_path, sha256, size,"
+                    " quarantined_at, detection_name, severity, verdict,"
+                    " reasons, status, blob_name, resolved_at, restored_path,"
+                    " note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry.id, entry.original_path, entry.sha256, entry.size,
+                        entry.quarantined_at, entry.detection_name,
+                        entry.severity, entry.verdict,
+                        json.dumps(entry.reasons), entry.status, entry.blob_name,
+                        entry.resolved_at, entry.restored_path, entry.note,
+                    ),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                raise QuarantineError(
+                    f"could not record the vault entry: {exc}"
+                ) from exc
+
+    def _update_entry(self, entry_id: str, **fields) -> None:
+        if not fields:
+            return
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE entries SET {assignments} WHERE id = ?",
+                (*fields.values(), entry_id),
+            )
+            self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Pending actions queue (decisions live in argus.actions)
+    # ------------------------------------------------------------------
+    def add_pending(
+        self,
+        *,
+        source: str,
+        path: Path | str,
+        action: str,
+        sha256: str | None = None,
+        severity: str | None = None,
+        verdict: str | None = None,
+        detection_name: str | None = None,
+        reasons: list[str] | None = None,
+    ) -> PendingAction:
+        pending = PendingAction(
+            id=_new_id(),
+            created_at=_utcnow_iso(),
+            source=source,
+            path=str(path),
+            action=action,
+            sha256=sha256.lower() if sha256 else None,
+            severity=severity,
+            verdict=verdict,
+            detection_name=detection_name,
+            reasons=list(reasons or []),
+        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO pending_actions (id, created_at, decided_at,"
+                " source, path, sha256, action, severity, verdict,"
+                " detection_name, reasons, status, entry_id, error)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pending.id, pending.created_at, pending.decided_at,
+                    pending.source, pending.path, pending.sha256,
+                    pending.action, pending.severity, pending.verdict,
+                    pending.detection_name, json.dumps(pending.reasons),
+                    pending.status, pending.entry_id, pending.error,
+                ),
+            )
+            self._conn.commit()
+        return pending
+
+    def get_pending(self, pending_id: str) -> PendingAction | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM pending_actions WHERE id = ?", (pending_id,)
+            ).fetchone()
+        return PendingAction._from_row(row) if row else None
+
+    def list_pending(self, status: str | None = "pending") -> list[PendingAction]:
+        with self._lock:
+            if status is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM pending_actions ORDER BY created_at"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM pending_actions WHERE status = ?"
+                    " ORDER BY created_at",
+                    (status,),
+                ).fetchall()
+        return [PendingAction._from_row(r) for r in rows]
+
+    def pending_count(self) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM pending_actions WHERE status = 'pending'"
+            ).fetchone()
+        return int(row[0])
+
+    def update_pending(
+        self,
+        pending_id: str,
+        *,
+        status: str,
+        entry_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE pending_actions SET status = ?, decided_at = ?,"
+                " entry_id = ?, error = ? WHERE id = ?",
+                (status, _utcnow_iso(), entry_id, error, pending_id),
+            )
+            self._conn.commit()
