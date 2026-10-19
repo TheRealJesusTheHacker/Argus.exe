@@ -773,16 +773,42 @@ def test_rule_wildcard_density_rejected(tmp_path):
     assert [r.name for r in rules] == ["Good"]
 
 
+class _FakeClock:
+    """Deterministic stand-in for ``time.monotonic``: time stands
+    still until the test advances it, so budget behavior never
+    depends on the host clock's resolution."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 def test_rule_match_time_budget_notes_and_stops():
     rules = [
         Rule.from_dict(_rule_spec(f"R{i}", {"text": f"needle-{i}"}))
         for i in range(50)
     ]
-    # The budget is checked between chunks: the first feed starts
-    # the clock, a later feed past the budget stops matching and
-    # flags the partial coverage.
-    matcher = RuleMatcher(rules, time_budget=0.0)
+    # The budget is polled as matching proceeds: the first feed
+    # starts the clock, and once elapsed time passes the budget,
+    # matching stops and the partial coverage is flagged. Driven
+    # by a fake clock via the matcher's clock seam: the original
+    # version used a 0.0 budget with the real clock and passed
+    # only if time.monotonic() ticked between two adjacent calls
+    # — true on Linux's nanosecond-resolution clock, but on
+    # Windows the two calls can land on the same tick, elapsed
+    # reads exactly 0.0, and the budget never "expires" (that is
+    # the v1.0.4 Windows CI failure this rewrite removes).
+    clock = _FakeClock()
+    matcher = RuleMatcher(rules, time_budget=2.0)
+    matcher._clock = clock
     matcher.feed(b"some content ")
+    assert matcher.budget_exceeded is False
+    clock.advance(3.0)  # past the 2s budget
     matcher.feed(b"needle-1 and more")
     assert matcher.budget_exceeded is True
     # A generous budget matches normally.
