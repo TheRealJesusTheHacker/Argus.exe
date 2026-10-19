@@ -240,6 +240,7 @@ def serve_pipe_stream(
     canonical_exe: Path | str,
     recorded_sha256: str | None,
     execute,
+    caller_verdict: CallerVerdict | None = None,
 ) -> dict | None:
     """Run one pipe session over an abstract message stream.
 
@@ -249,6 +250,14 @@ def serve_pipe_stream(
     verifies. Returns the response written (None when the client
     sent nothing usable, in which case a refusal is written so
     the genuine client never hangs on a half-open pipe).
+
+    ``caller_verdict`` (v1.2.0) lets a transport whose kernel
+    credentials carry MORE than a pid — the Linux socket
+    channel's SO_PEERCRED also proves the peer's uid — supply
+    the verdict it computed from those credentials. Transports
+    that pass nothing (the Windows pipe, every existing caller)
+    get exactly the historical behaviour: the verdict is
+    computed here from the pid via :func:`verify_pipe_client`.
     """
     try:
         request = stream.read_message()
@@ -263,12 +272,14 @@ def serve_pipe_stream(
         except Exception:
             pass
         return None
-    verdict = verify_pipe_client(
-        client_pid,
-        identity_provider=identity_provider,
-        canonical_exe=canonical_exe,
-        recorded_sha256=recorded_sha256,
-    )
+    verdict = caller_verdict
+    if verdict is None:
+        verdict = verify_pipe_client(
+            client_pid,
+            identity_provider=identity_provider,
+            canonical_exe=canonical_exe,
+            recorded_sha256=recorded_sha256,
+        )
     if not verdict.ok:
         log.warning(
             "pipe: refusing privileged request kind=%r from pid %s: %s",
