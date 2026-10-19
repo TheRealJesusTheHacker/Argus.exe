@@ -55,6 +55,14 @@ QUARANTINE = "quarantine"
 DELETE = "delete"
 ALLOW = "allow"
 IGNORE = "ignore"
+RESTORE = "restore"
+
+#: Cap on remembered real-time detection contexts (see
+#: :attr:`ActionEngine._rt_context`). Contexts exist only so a
+#: following action event can borrow its detection's richer reasons;
+#: a bounded FIFO keeps a busy watch folder from growing the map
+#: without limit when detections never produce action events.
+_RT_CONTEXT_LIMIT = 512
 
 
 class ActionError(Exception):
@@ -254,6 +262,51 @@ class ActionEngine:
             ),
         )
 
+    def restore_entry(
+        self, entry_id: str, *, confirmed: bool = False
+    ) -> ActionOutcome:
+        """Put a quarantined file back where it lived (the vault
+        never overwrites a file that has since taken its place)."""
+        _require_confirmed(confirmed, "Restoring a quarantined file")
+        entry = self.vault.get_entry(entry_id)
+        if entry is None:
+            raise ActionError(f"no vault entry with id {entry_id}")
+        restored = self.vault.restore(entry_id)
+        return ActionOutcome(
+            action=RESTORE,
+            path=entry.original_path,
+            done=True,
+            entry_id=entry.id,
+            restored_path=str(restored),
+            message=f"{restored.name} has been restored to {restored}.",
+        )
+
+    def delete_entry(
+        self, entry_id: str, *, confirmed: bool = False
+    ) -> ActionOutcome:
+        """Permanently destroy a quarantined file. The vault index
+        row stays as the audit record."""
+        _require_confirmed(confirmed, "Permanently deleting a quarantined file")
+        entry = self.vault.get_entry(entry_id)
+        if entry is None:
+            raise ActionError(f"no vault entry with id {entry_id}")
+        self.vault.delete_permanent(entry_id)
+        if self.history is not None:
+            self.history.update_detection_action(
+                sha256=entry.sha256, path=entry.original_path,
+                action_taken="deleted",
+            )
+        return ActionOutcome(
+            action=DELETE,
+            path=entry.original_path,
+            done=True,
+            entry_id=entry.id,
+            message=(
+                f"{Path(entry.original_path).name} has been "
+                "permanently deleted from the quarantine vault."
+            ),
+        )
+
     def allow_file(
         self, path: Path | str, *, confirmed: bool = False
     ) -> ActionOutcome:
@@ -391,7 +444,16 @@ class ActionEngine:
         under any policy.
         """
         if event.kind == "detection" and event.path:
-            self._rt_context[event.path] = event
+            # Remember the detection as context ONLY when its
+            # severity's configured action can actually produce a
+            # following action event — and keep the map bounded
+            # (FIFO) either way. Detections are recorded in history
+            # regardless; the context is purely an optimisation for
+            # richer action reasons, so dropping the oldest is safe.
+            if self.config.action_for(event.severity) in (QUARANTINE, DELETE):
+                self._rt_context[event.path] = event
+                while len(self._rt_context) > _RT_CONTEXT_LIMIT:
+                    self._rt_context.pop(next(iter(self._rt_context)))
             if self.history is not None:
                 self.history.record_realtime_detection(
                     path=event.path,
