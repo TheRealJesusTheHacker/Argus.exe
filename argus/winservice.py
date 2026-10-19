@@ -102,6 +102,47 @@ def _load_pywin():
     return win32serviceutil, win32service, win32event
 
 
+#: Service Control Manager state names, by numeric code
+#: (win32service.SERVICE_* constants), for query_service_state().
+_SCM_STATE_NAMES = {
+    1: "stopped",
+    2: "start_pending",
+    3: "stop_pending",
+    4: "running",
+    5: "continue_pending",
+    6: "pause_pending",
+    7: "paused",
+}
+
+
+def query_service_state(name: str = SERVICE_NAME) -> str | bool:
+    """Ask the Service Control Manager for a service's state.
+
+    Returns the state name (``"running"``, ``"stopped"``, …) when
+    the SCM answered. Returns ``False`` when the state cannot be
+    determined — not Windows, no pywin32, or the query failed —
+    so callers treat the heartbeat file as unverified rather than
+    trusting it. A heartbeat can be forged by anything that can
+    write the status file; the SCM cannot.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import win32service  # type: ignore[import-not-found]
+        import win32serviceutil  # type: ignore[import-not-found]
+    except ImportError:
+        return False
+    try:
+        status = win32serviceutil.QueryServiceStatus(name)
+    except Exception:
+        return False
+    try:
+        code = status[1]
+    except (TypeError, IndexError):
+        return False
+    return _SCM_STATE_NAMES.get(code, f"unknown ({code})")
+
+
 def service_exe_path() -> Path:
     """The executable the SCM should launch. In the packaged product
     this is ArgusService.exe (``sys.executable`` under PyInstaller);
