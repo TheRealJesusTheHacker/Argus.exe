@@ -112,11 +112,14 @@ def service_exe_path() -> Path:
 
 
 def default_service_config_path() -> Path | None:
-    """Where the installed service looks for its config:
-    ``%PROGRAMDATA%\\Argus\\argus-config.json`` when it exists (the
-    per-machine location a LocalSystem service can always read), else
-    None (Argus defaults)."""
-    program_data = os.environ.get("PROGRAMDATA")
+    """Where the installed service looks for its config.
+
+    Argus's shared state lives machine-wide under
+    ``%PROGRAMDATA%\\Argus`` (see :mod:`argus.paths`), so the
+    service, the GUI, and the CLI all read the same
+    ``argus-config.json`` there. Returns that path when the file
+    exists, else None (Argus defaults)."""
+    program_data = os.environ.get("ProgramData")
     if not program_data:
         return None
     candidate = Path(program_data) / "Argus" / "argus-config.json"
@@ -176,7 +179,23 @@ if HAS_PYWIN32:  # pragma: no cover - exercised only on Windows
             servicemanager.LogInfoMsg(
                 "ARGUS.EXE real-time protection service starting"
             )
-            core = _ArgusService(config_path=self.config_path)
+            # Config resolution: an explicit path set by main()
+            # wins; otherwise the shared machine config under
+            # %PROGRAMDATA%\Argus when one exists; otherwise that
+            # same standard location is named anyway (ArgusConfig
+            # tolerates a missing file and uses defaults), so the
+            # service and the GUI agree on where settings live.
+            config_path = self.config_path
+            if config_path is None:
+                found = default_service_config_path()
+                if found is not None:
+                    config_path = str(found)
+                else:
+                    from .config import DEFAULT_CONFIG_NAME
+                    from .paths import data_dir
+
+                    config_path = str(data_dir() / DEFAULT_CONFIG_NAME)
+            core = _ArgusService(config_path=config_path)
             self._core = core
             try:
                 core.start()
@@ -242,12 +261,25 @@ def perform_service_command(
 
         if command == "register":
             exe = service_exe_path()
+            product_exe = exe.with_name("Argus.exe")
+            # Never tell Windows Security that a program which is
+            # not actually on disk is the machine's antivirus.
+            if not Path(product_exe).exists():
+                print(
+                    "argus service: cannot register ARGUS.EXE with "
+                    f"Windows Security Center — {product_exe} was "
+                    "not found on this machine. Reinstall ARGUS.EXE, "
+                    "then run: argus service register"
+                )
+                return 1
             properties = winregister.antivirus_product_properties(
-                product_exe=exe.with_name("Argus.exe"),
+                product_exe=product_exe,
                 reporting_exe=exe,
                 instance_guid=winregister.INSTANCE_GUID,
             )
-            winregister.register_antivirus(properties)
+            winregister.register_antivirus(
+                properties, require_existing_exe=True
+            )
             print(
                 "Registered ARGUS.EXE with Windows Security Center "
                 "as this machine's antivirus provider."
