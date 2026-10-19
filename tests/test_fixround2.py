@@ -356,8 +356,12 @@ def test_fix1_pending_details_returns_service_row(svc_env, tmp_path):
 
 
 def test_fix1_client_rejects_response_with_wrong_nonce(monkeypatch):
+    # The transport seam is the platform verified-channel resolver
+    # (v1.2.0: the Windows pipe or the Linux socket, chosen by
+    # _verified_roundtrip) — the client logic under test (nonce
+    # gate, stage messages) is transport-agnostic.
     monkeypatch.setattr(
-        action_requests.pipe_channel, "pipe_roundtrip",
+        action_requests, "_verified_roundtrip",
         lambda payload, timeout=30.0: {
             "id": payload["id"], "ok": True,
             "message": "done", "nonce": "not-the-request-nonce",
@@ -377,7 +381,7 @@ def test_fix1_pipe_unreachable_never_falls_back_to_file(
     def _boom(payload, timeout=30.0):
         raise pipe_channel.PipeUnavailableError("connect", "no pipe")
 
-    monkeypatch.setattr(action_requests.pipe_channel, "pipe_roundtrip", _boom)
+    monkeypatch.setattr(action_requests, "_verified_roundtrip", _boom)
     monkeypatch.setattr(action_requests, "pipe_channel_required", lambda: True)
     result = action_requests.submit_and_wait(
         "restore", entry_id="e1", sha256="a" * 64,
@@ -393,7 +397,7 @@ def test_fix1_pipe_lost_mid_exchange_message_differs(monkeypatch):
     def _boom(payload, timeout=30.0):
         raise pipe_channel.PipeUnavailableError("read", "gone quiet")
 
-    monkeypatch.setattr(action_requests.pipe_channel, "pipe_roundtrip", _boom)
+    monkeypatch.setattr(action_requests, "_verified_roundtrip", _boom)
     result = action_requests._submit_via_pipe(
         "restore", entry_id="e1", pending_id=None,
         sha256="a" * 64, requested_by="test", timeout=5.0,
