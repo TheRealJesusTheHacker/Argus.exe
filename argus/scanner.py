@@ -19,6 +19,9 @@ Hard rules learned from real-world scanner bugs:
   entropy, string extraction) makes its own streamed pass over
   executables and scripts, capped at 64 MB, and merges into the same
   per-file assessment — worst verdict wins, every reason shown.
+- **Exclusions honoured.** User-configured exclusions (by path or by
+  SHA-256) short-circuit scanning in both on-demand and real-time
+  scans — the file is left alone and the skip is noted, never hidden.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
+from .config import Exclusions
 from .detections import FileAssessment, Verdict, assess
 from .heuristics.analyze import analyze_file
 from .rules import MAX_RULE_SCAN_SIZE, Rule, RuleMatcher
@@ -62,6 +66,10 @@ class ScannedFile:
     result: FileResult
     assessment: FileAssessment
     rules_skipped_reason: str | None = None
+    #: True when user-configured exclusions told Argus to leave this
+    #: file alone (by path or by hash). Excluded files are not scanned
+    #: and always carry an explanatory note on the assessment.
+    excluded: bool = False
 
     @property
     def path(self) -> Path:
@@ -77,6 +85,7 @@ class ScanStats:
     files_seen: int = 0
     files_scanned: int = 0
     files_skipped: int = 0  # read errors (permissions, vanished files, ...)
+    files_excluded: int = 0  # left alone by user-configured exclusions
     dirs_skipped: int = 0  # unreadable dirs + dir symlinks not followed
     bytes_scanned: int = 0
 
@@ -173,6 +182,7 @@ def scan_file(
     chunk_size: int = CHUNK_SIZE,
     *,
     heuristics: bool = True,
+    exclusions: Exclusions | None = None,
 ) -> ScannedFile:
     """Scan one file: hash it, check signatures, evaluate rules, and
     (unless ``heuristics=False``) run Phase 2 heuristic analysis.
@@ -181,6 +191,11 @@ def scan_file(
     ``MAX_RULE_SCAN_SIZE`` get hash/signature checks only; the skip is
     noted on the result rather than hidden. Heuristic results merge
     into the same assessment: worst verdict wins, all reasons kept.
+
+    ``exclusions`` (user configuration) wins over everything: a path
+    exclusion returns before the file is even read, and a hash
+    exclusion returns a clean, noted result right after hashing —
+    Argus leaves excluded files alone, everywhere, always.
     """
     result = FileResult(path=path)
     matcher = RuleMatcher(rules)
@@ -192,6 +207,14 @@ def scan_file(
         result.error = f"could not read file: {exc.strerror or exc}"
         return ScannedFile(result=result, assessment=FileAssessment(),
                            rules_skipped_reason="file could not be read")
+
+    if exclusions is not None and exclusions.is_path_excluded(path):
+        result.size = size
+        assessment = FileAssessment()
+        assessment.notes.append(
+            "excluded by your configuration (path) — Argus left this file alone"
+        )
+        return ScannedFile(result=result, assessment=assessment, excluded=True)
 
     rule_scan = size <= MAX_RULE_SCAN_SIZE
     if not rule_scan:
@@ -219,6 +242,14 @@ def scan_file(
 
     result.size = read_size
     result.sha256 = hasher.hexdigest()
+
+    if exclusions is not None and exclusions.is_hash_excluded(result.sha256):
+        assessment = FileAssessment()
+        assessment.notes.append(
+            "excluded by your configuration (file fingerprint) — "
+            "Argus left this file alone"
+        )
+        return ScannedFile(result=result, assessment=assessment, excluded=True)
 
     signature_hit = db.lookup(result.sha256)
     rule_hits = matcher.finish() if rule_scan else []
@@ -256,6 +287,7 @@ def scan_path(
     rules: list[Rule],
     *,
     heuristics: bool = True,
+    exclusions: Exclusions | None = None,
 ) -> ScanReport:
     """Scan a file or directory tree and return a full report."""
     root_path = Path(root)
@@ -263,8 +295,11 @@ def scan_path(
     report = ScanReport(root=root_path, stats=stats)
 
     for path in iter_files(root_path, stats):
-        scanned = scan_file(path, db, rules, heuristics=heuristics)
-        if scanned.result.ok:
+        scanned = scan_file(path, db, rules, heuristics=heuristics,
+                            exclusions=exclusions)
+        if scanned.excluded:
+            stats.files_excluded += 1
+        elif scanned.result.ok:
             stats.files_scanned += 1
             stats.bytes_scanned += scanned.result.size or 0
         else:

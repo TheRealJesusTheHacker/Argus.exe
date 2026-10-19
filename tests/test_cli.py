@@ -97,3 +97,38 @@ def test_scan_missing_target_exit_2(tmp_path, capsys):
 def test_no_command_prints_help_exit_2(capsys):
     assert main([]) == EXIT_ERROR
     assert "usage" in capsys.readouterr().out.lower()
+
+
+def test_scan_respects_config_exclusions(tmp_path, capsys):
+    """Exclusions are honoured in on-demand scans, not just real-time."""
+    import hashlib
+    import json as json_mod
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "eicar.com").write_bytes(EICAR)
+    db = tmp_path / "sigs.sigdb"
+    assert main(["sigdb", "init", str(db)]) == EXIT_CLEAN
+    capsys.readouterr()
+
+    # Exclude the folder by path via a config file.
+    config_path = tmp_path / "argus-config.json"
+    config_path.write_text(json_mod.dumps({
+        "exclusions": {"paths": [str(tree)], "hashes": []},
+    }), encoding="utf-8")
+    assert main(["scan", str(tree), "--db", str(db),
+                 "--config", str(config_path)]) == EXIT_CLEAN
+    out = capsys.readouterr().out
+    assert "Detections: none" in out
+    assert "Excluded by you: 1" in out
+
+    # Exclude by hash instead — same result.
+    digest = hashlib.sha256(EICAR).hexdigest()
+    config_path.write_text(json_mod.dumps({
+        "exclusions": {"paths": [], "hashes": [digest]},
+    }), encoding="utf-8")
+    assert main(["scan", str(tree), "--db", str(db),
+                 "--config", str(config_path), "--json"]) == EXIT_CLEAN
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stats"]["files_excluded"] == 1
+    assert payload["files"][0]["excluded"] is True
