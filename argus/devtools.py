@@ -37,10 +37,15 @@ from typing import TYPE_CHECKING
 from .detections import Verdict
 from .heuristics.analyze import analyze_file
 from .heuristics.signals import Signal
-from .paths import write_text_atomic
-from .rules import Rule, RuleMatcher
-from .scanner import hash_file, scan_file
-from .scoring import CRITICAL_COMBINATIONS, SIGNED_DISCOUNT
+from .paths import shared_dir, write_text_atomic
+from .rules import Rule, RuleMatcher  # noqa: F401  (RuleMatcher kept for compat)
+from .scanner import hash_file, scan_file  # noqa: F401
+from .scoring import (
+    CRITICAL_COMBINATIONS,
+    HOT_POCKET_SIGNAL_NAMES,
+    SIGNED_DISCOUNT,
+    score_signals,
+)
 from .signatures import EICAR_NAME, SignatureDB, init_db
 
 if TYPE_CHECKING:  # runtime import would be circular via actions->scanner
@@ -57,6 +62,67 @@ EICAR_BYTES = (
 
 #: Default file name for the Dev Toolkit settings JSON.
 DEVTOOLS_FILENAME = "argus-devtools.json"
+
+
+def default_devtools_path() -> Path:
+    """The default Dev Toolkit settings location: the SHARED folder.
+
+    The shared folder is user-writable, which is what fixes the
+    installed-layout save PermissionError (the trusted root is not
+    user-writable). That is safe here — see DevSettings: simulation
+    mode is a UX safety, not a security boundary; it can only make
+    Argus do LESS, never more.
+    """
+    return shared_dir() / DEVTOOLS_FILENAME
+
+
+_SIM_CORRUPT_WARNING = (
+    "Argus could not read its developer settings file, so "
+    "simulation mode is being treated as ON (fail-safe): actions "
+    "will be simulated, never carried out, until the settings "
+    "file is readable again."
+)
+
+
+def simulation_status(
+    path: Path | None = None,
+) -> tuple[bool, str | None]:
+    """The ONE simulation-settings reader (fix round 2, FIX 6):
+    returns ``(simulation_on, warning)`` from the persisted
+    devtools settings, and BOTH the actions seam and the GUI
+    banner read through it — they can never disagree again.
+
+    Fail-SAFE: a settings file that exists but cannot be parsed
+    — corrupt JSON, the wrong shape, a non-boolean flag — is
+    treated as simulation ON plus a human-readable warning. The
+    old readers failed OPEN (a corrupt file silently meant REAL
+    actions) while a surface could still be displaying
+    "simulation ON" from an earlier good read. A MISSING file is
+    the only "off, no warning" default."""
+    target = path if path is not None else default_devtools_path()
+    if not target.is_file():
+        return False, None
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return True, _SIM_CORRUPT_WARNING
+    if not isinstance(data, dict):
+        return True, _SIM_CORRUPT_WARNING
+    value = data.get("simulation_mode")
+    if value is None:
+        return False, None
+    if not isinstance(value, bool):
+        return True, _SIM_CORRUPT_WARNING
+    return value, None
+
+
+def simulation_mode_enabled() -> bool:
+    """True when simulation mode is on — delegates to
+    :func:`simulation_status`, the single reader, so the actions
+    seam honours exactly what the banner shows (fail-safe ON
+    when the settings file is unreadable)."""
+    state, _warning = simulation_status()
+    return state
 
 
 # ----------------------------------------------------------------------
@@ -207,6 +273,12 @@ class DevSettings:
     itself depends on. Loading is tolerant, like
     :class:`~argus.config.ArgusConfig`: bad values fall back per key
     and are reported in ``load_warnings``.
+
+    The default location is the user-writable shared folder. That
+    user-writability is safe: simulation mode is a UX safety, not a
+    security boundary — turning it on (even by tampering with this
+    file) can only make Argus do LESS (record intent, touch
+    nothing), never make it act on anything it otherwise wouldn't.
     """
 
     #: 0 (relaxed) .. 100 (paranoid); 50 = the engine's own thresholds.
@@ -338,6 +410,11 @@ class Evaluation:
     short_circuit: bool
     suspicious_threshold: int
     malicious_threshold: int
+    #: Mirrors scoring.ScoredSignals: a recognised Windows
+    #: system file's PE-CONTENT heuristic score was zeroed —
+    #: protected signals (filename/masquerade, oversize, tamper)
+    #: kept their points (see scoring.TRUST_PROTECTED_SIGNAL_NAMES).
+    trusted_system_file: bool = False
 
     @property
     def verdict(self) -> Verdict:
@@ -361,15 +438,35 @@ class Evaluation:
 
 
 def evaluate_signals(
-    signals: list[Signal], settings: DevSettings, *, signed: bool = False
+    signals: list[Signal],
+    settings: DevSettings,
+    *,
+    signed: bool = False,
+    trusted_system_file: bool = False,
 ) -> Evaluation:
     """Score *signals* under toolkit settings.
 
-    Mirrors :func:`argus.scoring.score_signals` — same critical
-    combinations, same signature discount that lowers but never
-    erases — with the toolkit's per-signal on/off + weight steering
-    and sensitivity thresholds applied. Disabled signals contribute
-    nothing and cannot complete a critical combination.
+    Delegates the scoring semantics to
+    :func:`argus.scoring.score_signals` — this function adds only
+    the toolkit's per-signal on/off + weight steering (applied to
+    the signal list first) and its sensitivity thresholds (applied
+    to the signed trim's never-erase floor and the verdict). The
+    semantics themselves are the engine's, not a mirror:
+
+    - *signed* means the signed trim was EARNED (P1-20): callers
+      pass ``report.signed_trim_eligible`` — a DER-parsed PKCS#7
+      SignedData with an extracted signer — never the mere
+      structural presence of a certificate table.
+    - *trusted_system_file* zeroes only PE-content signals
+      (P0-3): filename/masquerade signals, the oversize floor, and
+      the tamper indicator
+      (:data:`argus.scoring.TRUST_PROTECTED_SIGNAL_NAMES`) keep
+      their full points under trust, exactly as the engine scores
+      them. Detections decided elsewhere are untouched, and every
+      signal stays listed either way.
+
+    Disabled signals contribute nothing and cannot complete a
+    critical combination.
     """
     entries: list[EvaluatedSignal] = []
     for sig in signals:
@@ -380,16 +477,47 @@ def evaluate_signals(
                 signal=sig, enabled=override.enabled, adjusted_points=adjusted
             )
         )
-    counted_names = {e.signal.name for e in entries if e.enabled}
-    short_circuit = any(combo <= counted_names for combo in CRITICAL_COMBINATIONS)
-    raw = sum(e.adjusted_points for e in entries)
-    score = raw
+    counted = [
+        replace(e.signal, points=e.adjusted_points)
+        for e in entries
+        if e.enabled
+    ]
+    # The shared scoring path performs the trust partition and the
+    # combination check. It is called WITHOUT the trim so its
+    # result is the pure partition; the trim is then applied here
+    # with the toolkit's own thresholds as its floor (at the
+    # default sensitivity those are scoring's thresholds exactly).
+    base = score_signals(
+        counted, signed=False, trusted_system_file=trusted_system_file
+    )
+    raw = base.raw_score
+    short_circuit = base.short_circuit
     suspicious, malicious = settings.thresholds()
-    if signed and raw > 0:
-        score = raw - SIGNED_DISCOUNT
-        if raw >= malicious:
+    if trusted_system_file:
+        score = base.score  # protected signals' points, nothing else
+    else:
+        score = raw
+        if signed and raw > 0:
+            score = raw - SIGNED_DISCOUNT
+            if raw >= malicious:
+                # Lowers, never erases (toolkit thresholds).
+                score = max(score, suspicious)
+            score = max(score, 0)
+            # Hot-pocket floor, as in scoring: the trim may not
+            # dilute a high-entropy pocket's contribution to zero.
+            pocket_points = sum(
+                sig.points
+                for sig in counted
+                if sig.name in HOT_POCKET_SIGNAL_NAMES
+            )
+            if pocket_points:
+                score = max(score, min(pocket_points, raw))
+        if any(
+            sig.name == "oversize_not_fully_analyzed" for sig in counted
+        ):
+            # The oversize signal's own contract: at least
+            # Suspicious — no trim talks it back under the line.
             score = max(score, suspicious)
-        score = max(score, 0)
     return Evaluation(
         entries=entries,
         raw_score=raw,
@@ -398,6 +526,7 @@ def evaluate_signals(
         short_circuit=short_circuit,
         suspicious_threshold=suspicious,
         malicious_threshold=malicious,
+        trusted_system_file=trusted_system_file,
     )
 
 
@@ -486,64 +615,95 @@ def run_test_bench(
     db: SignatureDB,
     rules: list[Rule],
     settings: DevSettings | None = None,
+    *,
+    exclusions=None,
+    self_exclusions=None,
 ) -> TestBenchResult:
     """Dissect one file: every fact and every point behind its verdict.
 
-    Runs the same pieces the scanner runs — fingerprint + signature
-    lookup, pattern rules, heuristic analysis — then scores the
-    signals under *settings* (engine defaults when omitted), so the
-    bench shows both what the engine sees and what the user's tuning
-    does with it.
+    The file analysis goes through the ONE scanner seam,
+    :func:`argus.scanner.scan_file` (P2) — so the bench honours
+    user exclusions, Argus's self-trust, and the scanner's size
+    caps exactly like a real scan, and cannot produce a verdict a
+    real scan of the same file would contradict. The bench's
+    sensitivity / signal-weight overrides are then applied at the
+    scoring layer, over the signals scan_file produced, the same
+    way the GUI scan worker applies them over its scans. Display
+    facts (PE structure, entropy) still come from the heuristic
+    report — they describe the file; they never decide the verdict.
     """
     settings = settings or DevSettings()
     target = Path(path)
-    try:
-        sha256, size = hash_file(target)
-    except OSError as exc:
+    scanned = scan_file(
+        target, db, rules,
+        exclusions=exclusions, self_exclusions=self_exclusions,
+    )
+    if scanned.result.error:
         return TestBenchResult(
             path=str(target), size=None, sha256=None, kind="file",
             signature_name=None, signature_family=None,
             signature_severity=None, rule_hits=[], signals=[],
             entropy_whole=None, entropy_max_window=None, pe_facts=None,
             signed=False, raw_score=0, score=0, short_circuit=False,
-            verdict=Verdict.CLEAN.value, notes=[],
-            error=f"could not read the file: {exc.strerror or exc}",
+            verdict=scanned.verdict.value,
+            notes=list(scanned.assessment.notes),
+            error=f"could not read the file: {scanned.result.error}",
         )
+    sha256, size = scanned.result.sha256, scanned.result.size
 
-    hit = db.lookup(sha256)
-
-    matcher = RuleMatcher(rules)
-    try:
-        with open(target, "rb") as fh:
-            while True:
-                chunk = fh.read(1024 * 1024)
-                if not chunk:
-                    break
-                matcher.feed(chunk)
-        rule_hits = matcher.finish()
-    except OSError:
-        rule_hits = []
+    sig_dets = [d for d in scanned.assessment.detections if d.kind == "signature"]
+    rule_dets = [d for d in scanned.assessment.detections if d.kind == "rule"]
+    hit = sig_dets[0] if sig_dets else None
     rule_dicts = [
-        {
-            "name": h.rule.name,
-            "severity": h.rule.severity,
-            "description": h.rule.description,
-        }
-        for h in rule_hits
+        {"name": d.name, "severity": d.severity, "description": d.reason}
+        for d in rule_dets
     ]
 
-    report = analyze_file(target, size)
-    evaluation = evaluate_signals(report.signals, settings, signed=report.signed)
-    verdict = evaluation.verdict
-    if hit is not None:
-        verdict = Verdict.MALICIOUS
-    elif any(h.rule.severity == "critical" for h in rule_hits):
-        verdict = Verdict.MALICIOUS
-    elif rule_hits and verdict is Verdict.CLEAN:
-        verdict = Verdict.SUSPICIOUS
+    # Display facts only — verdict/score come from scan_file.
+    report = None
+    if size is not None and not scanned.excluded:
+        try:
+            report = analyze_file(target, size)
+        except Exception:
+            report = None
+    signed = bool(report.signed) if report is not None else False
+    # The trim is earned by a DER-parsed PKCS#7 with an extracted
+    # signer (P1-20) — the same eligibility the scanner passes to
+    # scoring — not by the structural presence of a cert table.
+    trim_eligible = (
+        bool(getattr(report, "signed_trim_eligible", report.signed))
+        if report is not None
+        else False
+    )
+    trusted = bool(report.trusted_system_file) if report is not None else False
+    evaluation = evaluate_signals(
+        list(scanned.assessment.signals), settings,
+        signed=trim_eligible, trusted_system_file=trusted,
+    )
+    if scanned.excluded:
+        # scan_file already decided: excluded files are left alone.
+        verdict = scanned.verdict
+    elif scanned.assessment.not_scanned:
+        verdict = scanned.verdict
+    else:
+        verdict = evaluation.verdict
+        if hit is not None:
+            verdict = Verdict.MALICIOUS
+        elif any(d.severity == "critical" for d in rule_dets):
+            verdict = Verdict.MALICIOUS
+        elif rule_dets and verdict is Verdict.CLEAN:
+            verdict = Verdict.SUSPICIOUS
+        # With default toolkit settings the scoring layer is the
+        # engine's own, so this must agree with the real scan —
+        # guard the seam: if evaluation somehow lands softer than
+        # scan_file's own combined verdict for a non-excluded file
+        # under default settings, scan_file wins.
+        if not settings.signal_overrides and settings.sensitivity == 50:
+            if scanned.verdict.rank > verdict.rank:
+                verdict = scanned.verdict
 
     pe_facts: dict | None = None
-    if report.pe is not None:
+    if report is not None and report.pe is not None:
         pe = report.pe
         pe_facts = {
             "machine": pe.machine,
@@ -576,31 +736,39 @@ def run_test_bench(
         )
         for entry in evaluation.entries
     ]
+    notes = list(scanned.assessment.notes)
+    if report is not None:
+        for note in report.notes:
+            if note not in notes:
+                notes.append(note)
+    if scanned.rules_skipped_reason:
+        notes.append(scanned.rules_skipped_reason)
     return TestBenchResult(
         path=str(target),
         size=size,
         sha256=sha256,
-        kind=report.kind,
+        kind=report.kind if report is not None else "file",
         signature_name=hit.name if hit else None,
         signature_family=hit.family if hit else None,
         signature_severity=hit.severity if hit else None,
         rule_hits=rule_dicts,
         signals=breakdown,
         entropy_whole=(
-            report.entropy.whole_entropy if report.entropy is not None else None
+            report.entropy.whole_entropy
+            if report is not None and report.entropy is not None else None
         ),
         entropy_max_window=(
             report.entropy.max_window_entropy
-            if report.entropy is not None
+            if report is not None and report.entropy is not None
             else None
         ),
         pe_facts=pe_facts,
-        signed=report.signed,
+        signed=signed,
         raw_score=evaluation.raw_score,
         score=evaluation.score,
         short_circuit=evaluation.short_circuit,
         verdict=verdict.value,
-        notes=list(report.notes),
+        notes=notes,
     )
 
 
