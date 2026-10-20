@@ -59,7 +59,50 @@ TEXT_COLORS = [
     theme.TEXT_FAINT,
     theme.GREEN_DIM,
     theme.GREEN,
+    theme.ACCENT,
 ]
+
+
+def test_namesake_palette_constants_are_the_spec_values():
+    """The Argus namesake palette (PALETTES.md, 2026-10-20) is
+    pinned value-for-value: abyssal teal-black base, peacock
+    emerald primary, eye-bronze accent, fleet danger red. A drift
+    in any constant fails here, not on the owner's screen."""
+    assert theme.BG == "#05100e"
+    assert theme.PANEL == "#0a1a16"
+    assert theme.BORDER == theme.PANEL_BORDER == "#1c3530"
+    assert theme.INPUT_BG == "#081511"
+    assert theme.GREEN == theme.PRIMARY == "#25cc8a"
+    assert theme.ACCENT == "#cfa93f"
+    assert theme.TEXT == "#e6f2ec"
+    assert theme.TEXT_DIM == "#8fb3a5"
+    assert theme.TEXT_FAINT == theme.DISABLED_TEXT == "#7d9c90"
+    assert theme.PRIMARY_TEXT == theme.PRIMARY_DARK_TEXT == "#03130c"
+    assert theme.RED == theme.DANGER_BG == "#b03a2e"
+    assert theme.RED_TEXT == theme.DANGER_TEXT == "#ffffff"
+
+
+def test_spec_pair_set_meets_aa():
+    """The palette spec's standard pair set, computed over the
+    pairs the stylesheet actually renders: TEXT / TEXT_DIM
+    (spec TEXT_FAINT) / PRIMARY / ACCENT on BG / PANEL / INPUT_BG,
+    PRIMARY_DARK_TEXT on PRIMARY, RED_TEXT on RED, and
+    DISABLED_TEXT on BG / PANEL (plus PANEL_RAISED, the derived
+    fourth tier the stylesheet also renders text on)."""
+    pairs = []
+    for fg in (theme.TEXT, theme.TEXT_DIM, theme.PRIMARY,
+               theme.ACCENT, theme.DISABLED_TEXT):
+        for bg in (theme.BG, theme.PANEL, theme.INPUT_BG,
+                   theme.PANEL_RAISED):
+            pairs.append((fg, bg))
+    pairs += [
+        (theme.PRIMARY_DARK_TEXT, theme.PRIMARY),
+        (theme.RED_TEXT, theme.RED),
+    ]
+    for fg, bg in pairs:
+        assert _contrast(fg, bg) >= AA_NORMAL_TEXT, (
+            f"{fg} on {bg} is {_contrast(fg, bg):.2f}:1 — below WCAG AA"
+        )
 
 
 @pytest.mark.parametrize("fg", TEXT_COLORS)
@@ -95,16 +138,29 @@ def test_fill_text_pairs_meet_aa():
         )
 
 
+def test_indicator_meets_nontext_contrast_on_every_tier():
+    """Checkbox/radio outlines are non-text: the WCAG floor is
+    3:1, on every tier including INPUT_BG."""
+    for bg in TIERS + [theme.INPUT_BG]:
+        assert _contrast(theme.INDICATOR, bg) >= 3.0, (
+            f"INDICATOR on {bg} is {_contrast(theme.INDICATOR, bg):.2f}:1"
+        )
+
+
 def test_no_purple_anywhere_in_palette():
     """Brand law: no purple. A color counts as purple when its hue
     sits in the violet band with real saturation."""
     constants = [
         theme.BG, theme.PANEL, theme.PANEL_RAISED, theme.BORDER,
+        theme.INPUT_BG,
         theme.GREEN, theme.GREEN_HOVER, theme.GREEN_DEEP,
-        theme.GREEN_DIM, theme.TEXT, theme.TEXT_DIM, theme.TEXT_FAINT,
+        theme.GREEN_DIM, theme.ACCENT, theme.TEXT, theme.TEXT_DIM,
+        theme.TEXT_FAINT, theme.INDICATOR,
         theme.PRIMARY_TEXT, theme.PRIMARY_DISABLED_BG,
+        theme.RED, theme.RED_TEXT,
         theme.DANGER_BG, theme.DANGER_BORDER, theme.DANGER_TEXT,
         *theme.SEVERITY_COLORS.values(),
+        *theme.VERDICT_COLORS.values(),
     ]
     for hex_color in constants:
         raw = hex_color.lstrip("#")
