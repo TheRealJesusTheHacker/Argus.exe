@@ -1,4 +1,12 @@
-"""Sentinel green/black premium theme for the ARGUS.EXE GUI.
+"""Argus namesake premium theme for the ARGUS.EXE GUI.
+
+The palette is Argus's own namesake identity (fleet namesake
+palette program, 2026-10-20): Argus Panoptes, the all-seeing
+giant whose eyes became the peacock's tail — an abyssal
+teal-black base, peacock-emerald primary, and a bronze "eye"
+accent. Danger stays the fleet red (#b03a2e, white text) shared
+by every Sentinel tool, so destructive / malicious / failure
+states read identically across the suite.
 
 ONE palette, ONE stylesheet, ONE application point. Every surface
 of the app — all seven pages, scroll areas and their viewports,
@@ -29,7 +37,9 @@ light-text-on-white failure mode is therefore impossible by
 construction: there is no light background anywhere in the app
 for text to land on.
 
-Brand law: greens + black/near-black only. **No purple anywhere.**
+Brand law: abyssal teal-black + peacock emerald + eye bronze
+only. **No purple anywhere** (the single fleet exception is
+Beerus, granted by the owner — it does not extend to Argus).
 Severity colors (red/orange/yellow/blue) are reserved for meaning
 — verdicts and severities — never decoration.
 
@@ -46,7 +56,7 @@ tests so the indicator can never fade into the panel again.
 Combo-box and spin-box arrows ARE styled: a styled drop-down
 button suppresses Fusion's own glyph, so the stylesheet draws the
 triangle itself with the border trick (asset-free) — a visible
-affordance in brand green on every combo and spin control.
+affordance in peacock emerald on every combo and spin control.
 """
 
 from __future__ import annotations
@@ -58,41 +68,69 @@ from __future__ import annotations
 # tier are noted per color; tests/test_gui_theme.py recomputes and
 # pins every one of them.
 # ----------------------------------------------------------------------
-BG = "#060a07"            # app background — green-black
-PANEL = "#0c130d"         # cards / panels / tables
-PANEL_RAISED = "#111a12"  # raised surfaces, buttons, hover
-BORDER = "#1e3323"        # hairline borders
+BG = "#05100e"            # app background — abyssal teal-black
+PANEL = "#0a1a16"         # cards / panels / tables
+PANEL_RAISED = "#132823"  # raised surfaces, buttons, hover — the
+#   midpoint of PANEL and BORDER, a derived tier (the palette spec
+#   names three surface tiers; this is the fourth the stylesheet
+#   has always needed, derived from the spec pair, not invented)
+BORDER = "#1c3530"        # hairline borders (spec PANEL_BORDER)
+INPUT_BG = "#081511"      # text/value input background (spec)
 
-GREEN = "#2ee06f"         # Sentinel green — primary accent
-#   as text: 11.39 on BG · 10.77 on PANEL · 10.17 on PANEL_RAISED
-GREEN_HOVER = "#4be884"   # primary-button hover fill
-GREEN_DEEP = "#14532d"    # deep green fills (selections, pressed)
-#   white text on GREEN_DEEP: 9.11 · TEXT on GREEN_DEEP: 7.95
-GREEN_DIM = "#8fd6a4"     # secondary green text on dark
-#   11.69 on BG · 11.06 on PANEL · 10.44 on PANEL_RAISED
+GREEN = "#25cc8a"         # peacock emerald — the primary (spec
+#   PRIMARY). Kept under its long-standing name: every page,
+#   widget and test in the app reads theme.GREEN.
+#   as text: 9.28 on BG · 8.60 on PANEL · 7.44 on PANEL_RAISED
+GREEN_HOVER = "#42d299"   # primary-button hover fill — GREEN
+#   lightened 15% toward TEXT (derived, pinned by the theme tests)
+GREEN_DEEP = "#0e4531"    # deep emerald fills (selections,
+#   pressed) — GREEN mixed 28% over BG (derived, pinned)
+#   white text on GREEN_DEEP: 10.97 · TEXT on GREEN_DEEP: 9.55
+GREEN_DIM = "#69d9ac"     # secondary emerald text on dark — GREEN
+#   lightened 35% toward TEXT (derived, pinned)
+#   11.15 on BG · 10.34 on PANEL · 8.94 on PANEL_RAISED
+ACCENT = "#cfa93f"        # eye bronze — the accent (spec)
+#   as text: 8.65 on BG · 8.02 on PANEL · 6.93 on PANEL_RAISED
 
-TEXT = "#e8f2ea"          # primary text
-#   17.38 on BG · 16.44 on PANEL · 15.52 on PANEL_RAISED
-TEXT_DIM = "#9db3a4"      # secondary text
-#   8.93 on BG · 8.45 on PANEL · 7.98 on PANEL_RAISED
-TEXT_FAINT = "#7d927f"    # tertiary text + disabled text
-#   5.97 on BG · 5.64 on PANEL · 5.33 on PANEL_RAISED — the dimmest
+TEXT = "#e6f2ec"          # primary text
+#   16.82 on BG · 15.59 on PANEL · 13.48 on PANEL_RAISED
+TEXT_DIM = "#8fb3a5"      # secondary text (spec TEXT_FAINT role)
+#   8.43 on BG · 7.81 on PANEL · 6.76 on PANEL_RAISED
+TEXT_FAINT = "#7d9c90"    # tertiary text + disabled text (spec
+#   DISABLED_TEXT role — in this app the two are one role: the
+#   disabled group, placeholders and :disabled selectors all
+#   read this constant)
+#   6.47 on BG · 6.00 on PANEL · 5.19 on PANEL_RAISED — the dimmest
 #   text in the app and still AA on every tier. (Before the theme
 #   overhaul this was #5f7263 at 3.45–3.86:1 — sub-AA everywhere;
 #   disabled buttons washed out. Never lower it again.)
 
-INDICATOR = "#54855f"     # checkbox/radio indicator outline (Fusion
-#   draws indicators from the palette Mid/Midlight roles): 4.65 on
-#   BG · 4.39 on PANEL · 4.15 on PANEL_RAISED — ≥ 3:1 non-text
+INDICATOR = "#527a6c"     # checkbox/radio indicator outline (Fusion
+#   draws indicators from the palette Mid/Midlight roles): 4.01 on
+#   BG · 3.72 on PANEL · 3.22 on PANEL_RAISED — ≥ 3:1 non-text
 #   contrast on every tier, where BORDER (1.3:1) was invisible.
 
-PRIMARY_TEXT = "#04160a"  # near-black text on GREEN fills: 10.68
-SELECTION_TEXT = "#ffffff"  # on GREEN_DEEP: 9.11
-PRIMARY_DISABLED_BG = "#17301f"  # dimmed green; TEXT_DIM on it: 6.37
+PRIMARY_TEXT = "#03130c"  # near-black text on GREEN fills: 9.15
+#   (spec PRIMARY_DARK_TEXT; on GREEN_HOVER: 9.90)
+SELECTION_TEXT = "#ffffff"  # on GREEN_DEEP: 10.97
+PRIMARY_DISABLED_BG = "#0a2a20"  # dimmed emerald — GREEN_DEEP
+#   mixed 50% over BG (derived, pinned); TEXT_DIM on it: 6.71
 
-DANGER_BG = "#3d1113"
-DANGER_BORDER = "#6e1d20"
-DANGER_TEXT = "#ffb3b3"   # on DANGER_BG: 9.59
+# Spec-name aliases — the palette spec (PALETTES.md, namesake
+# program) names these roles PRIMARY / PANEL_BORDER / INPUT_BG /
+# DISABLED_TEXT / PRIMARY_DARK_TEXT; the aliases keep the spec
+# pair list readable in the tests without renaming the constants
+# the whole app already reads.
+PRIMARY = GREEN
+PANEL_BORDER = BORDER
+DISABLED_TEXT = TEXT_FAINT
+PRIMARY_DARK_TEXT = PRIMARY_TEXT
+
+RED = "#b03a2e"           # fleet danger red (spec, every tool)
+RED_TEXT = "#ffffff"      # on RED: 6.02
+DANGER_BG = RED
+DANGER_BORDER = "#7b2920"  # RED darkened 30% (derived, pinned)
+DANGER_TEXT = RED_TEXT     # on DANGER_BG: 6.02
 
 #: Background tiers, darkest first. Every surface in the app sits
 #: on one of these (or on GREEN_DEEP / DANGER_BG fills, which pair
@@ -100,10 +138,10 @@ DANGER_TEXT = "#ffb3b3"   # on DANGER_BG: 9.59
 BACKGROUND_TIERS = (BG, PANEL, PANEL_RAISED)
 
 SEVERITY_COLORS = {
-    "critical": "#ff4d4d",  # 6.09 on BG · 5.76 on PANEL · 5.44 on PANEL_RAISED
-    "high": "#ff8a3d",      # 8.49 · 8.03 · 7.59
-    "medium": "#ffd23d",    # 13.79 · 13.04 · 12.32
-    "low": "#7fd0ff",       # 11.73 · 11.10 · 10.48
+    "critical": "#ff4d4d",  # 5.91 on BG · 5.48 on PANEL · 4.74 on PANEL_RAISED
+    "high": "#ff8a3d",      # 8.24 · 7.64 · 6.61
+    "medium": "#ffd23d",    # 13.38 · 12.40 · 10.73
+    "low": "#7fd0ff",       # 11.38 · 10.55 · 9.13
 }
 VERDICT_COLORS = {
     "Malicious": "#ff4d4d",
@@ -270,6 +308,7 @@ QLabel#Subhead {{
 QLabel#StatValue {{
     font-size: 24px;
     font-weight: 700;
+    color: {ACCENT};
 }}
 QLabel#StatLabel {{
     font-size: 11px;
@@ -347,7 +386,7 @@ QPushButton#Danger:disabled {{
 /* ---- text + value inputs: every state ------------------------- */
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit, QTextEdit,
 QDateTimeEdit, QDateEdit, QTimeEdit {{
-    background: {BG};
+    background: {INPUT_BG};
     border: 1px solid {BORDER};
     border-radius: 8px;
     padding: 6px 8px;
