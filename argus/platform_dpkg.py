@@ -16,6 +16,17 @@ The mapping, kept as conservative as the Windows three legs:
   answers for the exact resolved path (the file is a recorded
   payload of an installed package — not a claim the file makes,
   but a record the system keeps).
+- Windows: WinVerifyTrust checks the signed digest (the file's
+  CONTENT is what the signature covers) → Linux: when dpkg also
+  recorded an MD5 checksum for the file (``/var/lib/dpkg/info/
+  <package>.md5sums`` — recorded for ordinary package payloads),
+  the file's current MD5 must still match it. Ownership is a
+  statement about a PATH; the checksum is what binds the trust
+  to the bytes actually sitting there, so a payload replaced in
+  place — same path, different content — earns no trust. When
+  dpkg recorded no checksum for the file (generated files, some
+  symlinks and alternatives), the checksum leg has no opinion
+  and ownership + location decide, exactly as before.
 - Windows: the signer is Microsoft → Linux: the owning package is
   whatever dpkg names; the trust is in the *database*, so this
   leg is the dpkg answer itself. (Any package counts — a standard
@@ -47,6 +58,7 @@ the whole gate is testable off a live dpkg system.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import subprocess
@@ -93,6 +105,25 @@ DpkgVerifier = Callable[[Path], DpkgTrustResult]
 #: A runner executes argv and returns (returncode, stdout, stderr)
 #: as text. Tests inject fakes; production runs dpkg-query.
 DpkgRunner = Callable[[list[str]], tuple[int, str, str]]
+
+
+#: Where dpkg-query lives on a Debian-based system. The scanner
+#: asks this question from inside a root-owned service, so the
+#: binary is named by absolute path whenever it exists there —
+#: a PATH inherited from elsewhere must never get to substitute
+#: a different "dpkg-query" for the trust decision. The bare name
+#: (PATH lookup) is only the fallback for layouts without one.
+_DPKG_QUERY_CANDIDATES = ("/usr/bin/dpkg-query", "/bin/dpkg-query")
+
+#: dpkg's per-package records (ownership checksums live here).
+DPKG_INFO_DIR = Path("/var/lib/dpkg/info")
+
+
+def _dpkg_query_program() -> str:
+    for candidate in _DPKG_QUERY_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return "dpkg-query"
 
 
 def _default_runner(argv: list[str]) -> tuple[int, str, str]:
@@ -166,7 +197,7 @@ def dpkg_owner(
     run = runner or _default_runner
     try:
         returncode, stdout, stderr = run(
-            ["dpkg-query", "-S", "--", str(path)]
+            [_dpkg_query_program(), "-S", "--", str(path)]
         )
     except FileNotFoundError:
         return DpkgTrustResult(
@@ -186,6 +217,68 @@ def dpkg_owner(
     return DpkgTrustResult(
         STATUS_TRUSTED, package, f"owned by dpkg package {package}"
     )
+
+
+def recorded_md5(package: str, resolved_path: Path | str) -> str | None:
+    """The MD5 checksum dpkg recorded for *resolved_path* as a
+    payload of *package* (from ``/var/lib/dpkg/info/
+    <package>.md5sums``, including the ``<package>:<arch>``
+    spelling), or None when dpkg recorded no checksum for it —
+    generated files and link payloads legitimately have none,
+    and None means "no opinion", never "mismatch"."""
+    info_dir = DPKG_INFO_DIR
+    candidates = [info_dir / f"{package}.md5sums"]
+    try:
+        candidates.extend(sorted(info_dir.glob(f"{package}:*.md5sums")))
+    except OSError:
+        pass
+    target = str(resolved_path).lstrip("/")
+    for sums_path in candidates:
+        try:
+            lines = sums_path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if not line or line.startswith("\\"):
+                continue  # escaped-name record: no safe opinion
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            digest, recorded = parts[0].strip().lower(), parts[1].strip()
+            if recorded.startswith("*"):
+                recorded = recorded[1:]  # md5sum binary-mode marker
+            if recorded == target:
+                return digest or None
+    return None
+
+
+def recorded_content_matches(
+    path: Path | str, package: str
+) -> bool | None:
+    """The content leg: does the file at the RESOLVED *path*
+    still hash (MD5, dpkg's own recorded algorithm) to the
+    checksum dpkg recorded for it under *package*?
+
+    True — the bytes are the bytes the package installed.
+    False — dpkg recorded a checksum and the current content
+    does NOT match it (or cannot even be read): the payload was
+    replaced in place, and path ownership alone must not carry
+    trust for it. None — no checksum was recorded, so this leg
+    has no opinion."""
+    resolved = os.path.realpath(str(path))
+    expected = recorded_md5(package, resolved)
+    if expected is None:
+        return None
+    digest = hashlib.md5()
+    try:
+        with open(resolved, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return False
+    return digest.hexdigest() == expected
 
 
 def decide_trust(
@@ -241,6 +334,32 @@ def verify_dpkg(path: Path | str) -> DpkgTrustResult:
         _cache.move_to_end(key)
         return cached
     result = decide_trust(target, dpkg_owner(target))
+    if result.status == STATUS_TRUSTED and result.package:
+        # The content leg (hunt #2): ownership vouches for the
+        # PATH, but trust is spent on the BYTES. When dpkg
+        # recorded a checksum for this payload and the content
+        # no longer matches it, the file was replaced in place —
+        # withdraw the trust the path alone would have granted.
+        # No recorded checksum = no opinion = ownership stands.
+        try:
+            intact = recorded_content_matches(target, result.package)
+        except Exception:  # a broken content check fails CLOSED
+            log.warning(
+                "dpkg content check for %s raised — treating the "
+                "file as untrusted",
+                target,
+            )
+            intact = False
+        if intact is False:
+            result = DpkgTrustResult(
+                STATUS_UNTRUSTED,
+                result.package,
+                f"owned by dpkg package {result.package}, but the "
+                "file's contents do not match the checksum the "
+                "package manager recorded for it — the file may "
+                "have been replaced, so no system-file trust is "
+                "granted",
+            )
     if result.status != STATUS_TRUSTED:
         log.debug("dpkg trust not granted for %s: %s", target, result.detail)
     _cache[key] = result
