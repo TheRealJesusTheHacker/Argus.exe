@@ -33,6 +33,31 @@ Two adjustments keep the model honest:
   heuristic score — a signature-database match or a pattern-rule
   detection on the same file still decides the verdict on its
   own, and every signal stays listed on the report.
+- **A hash-verified Sentinel sibling gets the same treatment.**
+  Inside the Technician's Toolkit bundle, a file whose SHA-256
+  matches the bundle's own integrity record (see
+  :mod:`argus.bundletrust`) is family, proven by fingerprint —
+  never by name: its PE-content heuristic score is zeroed
+  exactly as a system file's is, with the same never-zeroed
+  exceptions, and the same signature/rule independence.
+- **Packaging traits corroborate; they cannot convict alone.**
+  A small family of signals describes how a program is PACKAGED,
+  not what it DOES: the in-memory-loader import combination and
+  its ordinal-hidden shadow, debugger-detection imports, and
+  packer section names. Every PyInstaller-built program on Earth
+  carries them — the calibration audit behind v1.2.4 measured
+  them on the whole Sentinel kit and on ordinary legitimate
+  bootloader-shaped binaries: summed together they reached 75
+  points, over the Malicious line, on files whose only offence
+  was their runtime. When a file's ENTIRE profile is packaging
+  traits, its score is held just below the Malicious line
+  (Suspicious — "worth a closer look" is the honest verdict for
+  a packed, injection-capable stranger). The moment ANY other
+  signal is present — persistence, credential access, a
+  high-entropy executable section, a download-and-execute pair,
+  anything behavioural or structural — full arithmetic applies
+  and the same traits corroborate at full weight; the critical
+  combinations short-circuit exactly as before.
 
 Every point in a score traces back to a named signal with a
 plain-language explanation. No opaque math, no scareware inflation.
@@ -85,6 +110,23 @@ HOT_POCKET_SIGNAL_NAMES = frozenset({
     "high_entropy_outside_sections",
 })
 
+#: Packaging-trait signals (v1.2.4 calibration): properties of a
+#: program's RUNTIME/packaging rather than its behaviour. Each is
+#: honest evidence — worth points, worth listing — but they are
+#: ubiquitous in legitimate software (every PyInstaller
+#: bootloader imports the in-memory-loader combination and
+#: debugger-detection APIs; packer section names ship with whole
+#: toolchains). A profile consisting ONLY of these corroborates
+#: suspicion; it cannot carry a file over the Malicious line by
+#: itself. Any signal outside this set lifts the cap and full
+#: arithmetic applies.
+CORROBORATION_ONLY_SIGNAL_NAMES = frozenset({
+    "process_injection_combo",
+    "ordinal_hidden_combo_suspect",
+    "anti_debug_imports",
+    "packer_section_name",
+})
+
 
 @dataclass
 class ScoredSignals:
@@ -99,6 +141,10 @@ class ScoredSignals:
     #: system file: the heuristic score was zeroed in full (raw
     #: score and signals are still recorded — nothing is hidden).
     trusted_system_file: bool = False
+    #: True when the file was recognised as a hash-verified
+    #: Sentinel sibling from the bundle's own integrity record:
+    #: the heuristic score was zeroed on the same terms.
+    trusted_bundle_sibling: bool = False
 
     @property
     def verdict(self) -> Verdict:
@@ -129,6 +175,7 @@ def score_signals(
     *,
     signed: bool = False,
     trusted_system_file: bool = False,
+    trusted_bundle_sibling: bool = False,
 ) -> ScoredSignals:
     """Combine heuristic *signals* into a score and verdict.
 
@@ -152,12 +199,17 @@ def score_signals(
     their points and can still carry the verdict. Only the
     HEURISTIC score is affected either way; signature and rule
     detections are combined elsewhere and never cleared here.
+
+    ``trusted_bundle_sibling`` is the same statement for a
+    hash-verified Sentinel tool from the bundle's own integrity
+    record (:mod:`argus.bundletrust`): identical zeroing terms,
+    recorded separately so reports can say WHICH trust applied.
     """
     raw = sum(sig.points for sig in signals)
     names = {sig.name for sig in signals}
     short_circuit = any(combo <= names for combo in CRITICAL_COMBINATIONS)
 
-    if trusted_system_file:
+    if trusted_system_file or trusted_bundle_sibling:
         protected = sum(
             sig.points
             for sig in signals
@@ -175,7 +227,8 @@ def score_signals(
             short_circuit=any(
                 combo <= protected_names for combo in CRITICAL_COMBINATIONS
             ),
-            trusted_system_file=True,
+            trusted_system_file=trusted_system_file,
+            trusted_bundle_sibling=trusted_bundle_sibling,
         )
 
     score = raw
@@ -198,6 +251,20 @@ def score_signals(
         # fully analysed is rated AT LEAST Suspicious — no trim
         # may talk it back under the line it promises.
         score = max(score, SUSPICIOUS_THRESHOLD)
+    if (
+        score >= MALICIOUS_THRESHOLD
+        and not short_circuit
+        and names
+        and names <= CORROBORATION_ONLY_SIGNAL_NAMES
+    ):
+        # Calibration (v1.2.4): a profile made ONLY of packaging
+        # traits — the bootloader shape shared by every
+        # PyInstaller-built program — corroborates suspicion but
+        # cannot convict alone. Held at the top of Suspicious:
+        # the file is still flagged for a closer look, its
+        # signals still listed at full weight, and any single
+        # behavioural or structural signal lifts this cap.
+        score = MALICIOUS_THRESHOLD - 1
 
     return ScoredSignals(
         signals=list(signals),
@@ -206,4 +273,5 @@ def score_signals(
         signed=signed,
         short_circuit=short_circuit,
         trusted_system_file=trusted_system_file,
+        trusted_bundle_sibling=trusted_bundle_sibling,
     )
