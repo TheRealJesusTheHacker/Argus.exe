@@ -185,11 +185,20 @@ jobs:
 
       - name: Check the build for missing lazy imports (warn file)
         run: |
-          warn="build/linux-work/argus/warn-argus.txt"
-          if [ ! -f "$warn" ]; then
-            echo "PyInstaller warn file not found at $warn — cannot verify the lazy-import watchlist."
+          # PyInstaller names the warn file after the spec that
+          # produced it (build/linux-work/<spec>/warn-<spec>.txt —
+          # today Argus-linux/warn-Argus-linux.txt). Locate the
+          # file the build ACTUALLY produced instead of hardcoding
+          # a name: v1.2.1's build died here because this step
+          # looked for build/linux-work/argus/warn-argus.txt, which
+          # never exists, and the release shipped incomplete. The
+          # gate stays a gate — no warn file at all still fails.
+          warn="$(find build/linux-work -name 'warn-*.txt' -print -quit 2>/dev/null)"
+          if [ -z "$warn" ] || [ ! -f "$warn" ]; then
+            echo "PyInstaller warn file not found under build/linux-work — cannot verify the lazy-import watchlist."
             exit 1
           fi
+          echo "Checking the lazy-import watchlist against $warn"
           if grep -E "PySide6" "$warn"; then
             echo "PyInstaller could not find modules on the lazy-import watchlist (above)."
             exit 1
