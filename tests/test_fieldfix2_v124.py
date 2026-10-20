@@ -29,6 +29,20 @@ still decisive wherever a record exists.
 The sibling-profile fixture below reproduces the measured field
 profile exactly (injection combo + anti-debug + packer section =
 75 raw points on the pre-fix scoring).
+
+CORRECTION (v1.2.5): the sentence above is the v1.2.4 crew's
+measurement error, kept visible rather than rewritten away.
+The REAL field profile — measured on the published bundle
+binaries, pinned verbatim in tests/test_fieldfix_v125.py —
+carries no import combination at all: it is the one-file
+packaging family (huge overlay, high-entropy data outside the
+sections, a flooded string table, VM names from the bundled
+runtimes, an unsigned elevation manifest). The fixture below
+models a different, also-real profile class — named-injection-
+import PEs — and the tests here remain valid for what they
+actually exercise: the trust mechanics, and the cap applied to
+the import-combination family. The calibration's corrected aim
+lives in the v1.2.5 file.
 """
 
 from __future__ import annotations
@@ -69,8 +83,11 @@ def _sha(data: bytes) -> str:
 def bootloader_profile_pe() -> bytes:
     """A PyInstaller-bootloader-shaped PE: the in-memory-loader
     import combination + debugger-detection imports + a packer
-    section name, over ordinary low-entropy code. This is the
-    measured profile of the bundle's own tools."""
+    section name, over ordinary low-entropy code. (v1.2.5
+    correction: this is a crafted named-injection-import
+    profile, a real class — NOT the bundle tools' measured
+    profile, which is the one-file packaging family pinned in
+    tests/test_fieldfix_v125.py.)"""
     return (
         PEBuilder()
         .add_section(".text", code_bytes(4096), TEXT_CHARS)
@@ -433,9 +450,29 @@ def test_calibration_ordinal_shadow_is_also_corroboration_class():
             _sig("vm_evasion_strings", 15, "medium"),
         ]
     )
-    # vm_evasion_strings is NOT a packaging trait: with it the
-    # profile is behavioural too, so the cap does not apply.
-    assert scored.score == 67
+    # v1.2.5 CORRECTION — this test originally asserted the
+    # opposite: that vm_evasion_strings is NOT a packaging trait
+    # and the profile convicts at 67. The real measurement (the
+    # published kit's own binaries, pinned in
+    # tests/test_fieldfix_v125.py) proved VM-environment names
+    # ride inside the runtimes every one-file tool bundles —
+    # they are packaging, and the corrected class includes them.
+    # The profile is now corroboration-only: held at 59.
+    assert scored.score == 59
+    assert scored.verdict is Verdict.SUSPICIOUS
+    # The shadow itself still corroborates at full weight the
+    # moment behaviour joins it: same profile plus an AMSI-
+    # bypass string convicts outright.
+    scored = score_signals(
+        [
+            _sig("ordinal_hidden_combo_suspect", 22, "medium"),
+            _sig("anti_debug_imports", 15, "medium"),
+            _sig("packer_section_name", 15, "medium"),
+            _sig("vm_evasion_strings", 15, "medium"),
+            _sig("amsi_bypass_strings", 25, "high"),
+        ]
+    )
+    assert scored.score == 92
     assert scored.verdict is Verdict.MALICIOUS
 
 
