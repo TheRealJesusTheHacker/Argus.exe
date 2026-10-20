@@ -22,8 +22,13 @@ from . import theme
 
 
 #: Alpha of a badge's tinted background (the old "26" hex alpha:
-#: 0x26 / 255 ≈ 0.15) — expressed honestly as rgba() now.
-BADGE_TINT_ALPHA = 0.15
+#: 0x26 / 255 ≈ 0.15) — expressed honestly as rgba() now. Raised
+#: 0.15 → 0.18 with the v1.2.6 namesake palette: the abyssal-teal
+#: PANEL pulls the yellow "medium" tint's rendered hue 30° toward
+#: green at 0.15 (the P1-24 hue pin allows 25°); at 0.18 every
+#: severity tint stays in band (worst: medium, 23.9°) and every
+#: severity text keeps ≥ 4.5:1 on its tint (worst: critical, 4.53).
+BADGE_TINT_ALPHA = 0.18
 
 
 def badge_tint_rgba(color: str) -> str:
@@ -188,7 +193,7 @@ class ToggleSwitch(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawRoundedRect(0, 2, 46, 22, 11, 11)
         knob_x = 24 if self._checked else 2
-        painter.setBrush(QColor("#ffffff" if self._checked else theme.TEXT_DIM))
+        painter.setBrush(QColor(theme.SELECTION_TEXT if self._checked else theme.TEXT_DIM))
         painter.drawEllipse(knob_x, 4, 18, 18)
         painter.end()
 
