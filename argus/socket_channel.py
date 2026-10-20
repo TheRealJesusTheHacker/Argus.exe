@@ -82,6 +82,16 @@ _MAX_MESSAGE_BYTES = 256 * 1024
 #: hold its session hostage.
 _SESSION_TIMEOUT_SECONDS = 10.0
 
+#: Concurrent sessions the listener will serve at once. Each
+#: session is a thread in a root-owned daemon, and the socket is
+#: connectable by any local user (verification gates execution,
+#: not connection) — without a cap, a local process could open
+#: connections in a loop and grow the protection service's
+#: thread count without bound (hunt #2). The genuine client
+#: holds at most a couple of sessions at a time; connections
+#: past the cap are closed on arrival, never queued.
+_MAX_CONCURRENT_SESSIONS = 64
+
 _SO_PEERCRED = 17  # asm-generic/socket.h — stable Linux ABI
 _PEERCRED_STRUCT = struct.Struct("iII")  # pid, uid, gid
 
@@ -222,7 +232,14 @@ class _UnixStream:
             if not chunk:
                 return None
             self._buffer += chunk
-        line, _, _rest = self._buffer.partition(b"\n")
+        line, _, rest = self._buffer.partition(b"\n")
+        # Consume the message: bytes past the newline belong to
+        # the NEXT message. The protocol exchanges one message
+        # per connection today, but a stream that re-reads its
+        # first line forever (or grows its buffer unboundedly)
+        # is a bug waiting for a second message to matter
+        # (hunt #2).
+        self._buffer = rest
         try:
             parsed = json.loads(line.decode("utf-8").strip())
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -269,6 +286,9 @@ class UnixSocketServer:
         self._session_handler = session_handler
         self._path = Path(path) if path is not None else socket_path()
         self._session_timeout = session_timeout
+        self._session_slots = threading.BoundedSemaphore(
+            _MAX_CONCURRENT_SESSIONS
+        )
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._listener: socket.socket | None = None
@@ -401,6 +421,20 @@ class UnixSocketServer:
                     break
                 log.exception("socket accept failed")
                 continue
+            if not self._session_slots.acquire(blocking=False):
+                # Every session slot is busy: refuse the excess
+                # connection outright rather than queueing a
+                # thread for it (see _MAX_CONCURRENT_SESSIONS).
+                log.warning(
+                    "socket: refusing a connection — all %d "
+                    "session slots are busy",
+                    _MAX_CONCURRENT_SESSIONS,
+                )
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
             worker = threading.Thread(
                 target=self._serve_session,
                 args=(conn,),
@@ -448,6 +482,7 @@ class UnixSocketServer:
         finally:
             watchdog.cancel()
             _close_once()
+            self._session_slots.release()
 
 
 # ----------------------------------------------------------------------
