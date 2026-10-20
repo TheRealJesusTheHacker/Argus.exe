@@ -30,6 +30,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -775,6 +776,11 @@ def run_test_bench(
 # ----------------------------------------------------------------------
 # EICAR self-test
 # ----------------------------------------------------------------------
+#: Pause before the self-test's one retry of a blocked read (see
+#: run_self_test): long enough for another program's on-access
+#: scan of the test file to finish, short enough that the wizard
+#: does not feel stuck. Tests set this to 0.
+_SELF_TEST_RETRY_PAUSE_SECONDS = 1.0
 @dataclass
 class SelfTestStep:
     name: str
@@ -786,12 +792,30 @@ class SelfTestStep:
 class SelfTestResult:
     passed: bool
     steps: list[SelfTestStep]
+    #: True when the test could not be completed because another
+    #: program on the machine stopped Argus reading the test file
+    #: (the field failure of 2026-10-20). That is an environment
+    #: outcome, not an engine failure, and the summary says so —
+    #: the test proved nothing either way, and must not pretend
+    #: otherwise in either direction.
+    blocked: bool = False
 
     def summary(self) -> str:
         if self.passed:
             return (
                 "Self-test passed: Argus caught the industry-standard "
                 "EICAR test file end to end. Detection is working."
+            )
+        if self.blocked:
+            return (
+                "Self-test could not be completed: another program "
+                "on this computer stopped Argus from reading the "
+                "test file — most often this computer's other "
+                "antivirus software, which is built to grab this "
+                "exact test file. That does not show Argus is "
+                "broken. Run the test again; if it keeps happening, "
+                "check the other antivirus's history for the test "
+                "file."
             )
         failed = [s.name for s in self.steps if not s.ok]
         return (
@@ -834,6 +858,7 @@ def run_self_test(work_dir: Path | str | None = None) -> SelfTestResult:
                     )
                 ],
             )
+    blocked = False
     artifacts = [scratch / "selftest.sigdb", scratch / "eicar-test-file.txt"]
     # The signature DB's HMAC key file is created beside it (v1.0.4)
     # and is equally ours to clean up.
@@ -862,28 +887,75 @@ def run_self_test(work_dir: Path | str | None = None) -> SelfTestResult:
         )
         with SignatureDB.open(db_path) as db:
             scanned = scan_file(target, db, [], heuristics=False)
+            retried = False
+            if scanned.result.error is not None:
+                # Something on this computer stopped Argus reading
+                # the test file back. The usual suspect is the
+                # machine's OTHER antivirus: grabbing this exact
+                # file is what the EICAR test file is for, and a
+                # second antivirus watching the same folder can
+                # hold it, block the read, or take the file in the
+                # moment between Argus writing it and Argus reading
+                # it. Wait a moment and try once more with a
+                # freshly written file — a brief hold must not fail
+                # the test. A lasting block is reported below as
+                # what it is, not as an Argus engine failure.
+                retried = True
+                time.sleep(_SELF_TEST_RETRY_PAUSE_SECONDS)
+                target.write_bytes(EICAR_BYTES)
+                scanned = scan_file(target, db, [], heuristics=False)
+        blocked = scanned.result.error is not None
         sha_ok = scanned.result.sha256 is not None
-        steps.append(
-            SelfTestStep(
-                "fingerprinting",
-                sha_ok,
-                "Argus read and fingerprinted the file"
-                if sha_ok
-                else f"fingerprinting failed: {scanned.result.error}",
+        if blocked:
+            steps.append(
+                SelfTestStep(
+                    "fingerprinting",
+                    False,
+                    "Argus could not read the test file "
+                    f"({scanned.result.error}). Another program on "
+                    "this computer stopped the read — most often "
+                    "this computer's other antivirus software, "
+                    "which is designed to grab this exact test "
+                    "file.",
+                )
             )
-        )
-        names = [d.name for d in scanned.assessment.detections]
-        caught = EICAR_NAME in names and scanned.verdict is Verdict.MALICIOUS
-        steps.append(
-            SelfTestStep(
-                "detection",
-                caught,
-                f"flagged as {EICAR_NAME} with a Malicious verdict"
-                if caught
-                else f"expected a Malicious EICAR verdict, got "
-                f"{scanned.verdict.value} ({names or 'no detections'})",
+            steps.append(
+                SelfTestStep(
+                    "detection",
+                    False,
+                    "not checked — the test file could not be "
+                    "read, so this test cannot prove detection "
+                    "either way",
+                )
             )
-        )
+        else:
+            steps.append(
+                SelfTestStep(
+                    "fingerprinting",
+                    sha_ok,
+                    "Argus read and fingerprinted the file"
+                    + (
+                        " (on a second try — another program had "
+                        "the file briefly)"
+                        if retried
+                        else ""
+                    )
+                    if sha_ok
+                    else f"fingerprinting failed: {scanned.result.error}",
+                )
+            )
+            names = [d.name for d in scanned.assessment.detections]
+            caught = EICAR_NAME in names and scanned.verdict is Verdict.MALICIOUS
+            steps.append(
+                SelfTestStep(
+                    "detection",
+                    caught,
+                    f"flagged as {EICAR_NAME} with a Malicious verdict"
+                    if caught
+                    else f"expected a Malicious EICAR verdict, got "
+                    f"{scanned.verdict.value} ({names or 'no detections'})",
+                )
+            )
     except Exception as exc:  # the self-test must report, never crash
         steps.append(SelfTestStep("self-test run", False, f"error: {exc}"))
     finally:
@@ -908,7 +980,7 @@ def run_self_test(work_dir: Path | str | None = None) -> SelfTestResult:
             )
     steps.append(SelfTestStep("cleanup", removed, cleanup_detail))
     return SelfTestResult(
-        passed=all(step.ok for step in steps), steps=steps
+        passed=all(step.ok for step in steps), steps=steps, blocked=blocked
     )
 
 
