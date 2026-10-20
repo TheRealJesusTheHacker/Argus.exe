@@ -76,25 +76,43 @@ from .heuristics.signals import Signal
 from .rules import MAX_RULE_SCAN_SIZE, Rule, RuleMatcher
 from .scoring import score_signals
 from .selftrust import SelfExclusions, default_self_exclusions
+from . import bundletrust
 from .signatures import SignatureDB
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
 
-#: Errnos that mean "the file exists but Argus could not read it"
-#: (locked by another process, permission denied, busy). These map
-#: to the explicit NotScanned outcome; a vanished file (ENOENT) is
-#: just gone and is reported as a plain read error instead.
-_LOCKED_ERRNOS = frozenset(
-    {errno.EACCES, errno.EPERM, errno.EAGAIN, errno.EBUSY}
-)
+#: Errnos that mean "there is no file to read at this path" —
+#: it vanished between the walk and the scan (ENOENT), or the
+#: path crosses something that is not a folder (ENOTDIR). These
+#: stay plain read errors: there is nothing to retry, nothing
+#: being withheld from the scanner, and the error is still
+#: recorded on the result for callers to see.
+_NOT_THERE_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
 
 #: Cap on named data streams scanned per file (abuse-proofing).
 MAX_STREAMS_PER_FILE = 32
 
 
 def _is_scan_blocked(exc: OSError) -> bool:
-    """True when *exc* means 'could not read it' (locked/denied)."""
-    return isinstance(exc, PermissionError) or exc.errno in _LOCKED_ERRNOS
+    """True when *exc* means 'could not read it' (locked/denied).
+
+    EVERY read failure on a file that is there counts — not just
+    the classic lock/denied errnos (EACCES, EPERM, EAGAIN, EBUSY,
+    and PermissionError itself). What answers a read is not
+    Argus's to control: a filesystem filter driver — most often
+    the machine's other antivirus, holding a file back while it
+    decides — can refuse a read with almost any error it likes.
+    The 2026-10-20 field machine answered EINVAL ("Invalid
+    argument") for the EICAR test file, and the old errno
+    allow-list let that failure fall through to a Clean verdict:
+    a file Argus never read, waved through as clean — the exact
+    outcome the NotScanned verdict exists to prevent. So the
+    rule is inverted: unless the error says the file is not
+    there at all, a failed read is a blocked read.
+    """
+    if isinstance(exc, PermissionError):
+        return True
+    return exc.errno not in _NOT_THERE_ERRNOS
 
 
 def _blocked_assessment() -> FileAssessment:
@@ -631,18 +649,30 @@ def scan_file(
 
     if heuristics:
         _apply_heuristics(path, read_size, assessment,
-                          tamper_suspect=tamper_suspect)
-    elif tamper_suspect:
-        # Tamper evidence is not an optional heuristic: even with
-        # heuristic analysis off, a stranger at Argus's own
-        # program address is surfaced on the standard ScannedFile
-        # surface (assessment.signals / notes / verdict) that
-        # every consumer — CLI, realtime, GUI result rows — reads.
-        scored = score_signals([_tamper_signal()])
-        assessment.signals = scored.signals
-        assessment.score = scored.score
-        assessment.heuristic_verdict = scored.verdict
-        assessment.notes.append(_TAMPER_NOTE)
+                          tamper_suspect=tamper_suspect,
+                          sha256=result.sha256)
+    else:
+        sibling = bundletrust.check_sibling(path, result.sha256)
+        if tamper_suspect or sibling.modified:
+            # Tamper evidence is not an optional heuristic: even
+            # with heuristic analysis off, a stranger at Argus's
+            # own program address — or a bundle tool whose
+            # fingerprint no longer matches the bundle's own
+            # record — is surfaced on the standard ScannedFile
+            # surface (assessment.signals / notes / verdict) that
+            # every consumer — CLI, realtime, GUI result rows —
+            # reads.
+            extra: list[Signal] = []
+            if tamper_suspect:
+                extra.append(_tamper_signal())
+                assessment.notes.append(_TAMPER_NOTE)
+            if sibling.modified:
+                extra.append(_sibling_modified_signal())
+                assessment.notes.append(_SIBLING_MODIFIED_NOTE)
+            scored = score_signals(extra)
+            assessment.signals = scored.signals
+            assessment.score = scored.score
+            assessment.heuristic_verdict = scored.verdict
 
     return ScannedFile(
         result=result, assessment=assessment, rules_skipped_reason=rules_skipped_reason
@@ -759,12 +789,42 @@ def _tamper_signal() -> Signal:
     )
 
 
+#: The tamper signal for a bundle tool whose fingerprint no
+#: longer matches the bundle's own integrity record.
+_SIBLING_MODIFIED_SIGNAL_NAME = "bundle_tool_file_modified"
+
+_SIBLING_MODIFIED_NOTE = (
+    "tamper indicator: this file claims a Sentinel tool's place "
+    "in the bundle, but its fingerprint does not match the "
+    "checksum the bundle recorded for it — it was scanned in "
+    "full, not trusted"
+)
+
+
+def _sibling_modified_signal() -> Signal:
+    return Signal(
+        name=_SIBLING_MODIFIED_SIGNAL_NAME,
+        severity="high",
+        points=35,
+        explanation=(
+            "This file sits where a Sentinel Safeguard tool "
+            "belongs in the Technician's Toolkit bundle, but its "
+            "fingerprint does not match the checksum the bundle "
+            "recorded for that tool when the bundle was built. "
+            "The tool has been changed or replaced since. Treat "
+            "this as tampering until proven otherwise, and "
+            "rebuild the bundle from a trusted source."
+        ),
+    )
+
+
 def _apply_heuristics(
     path: Path,
     size: int,
     assessment: FileAssessment,
     *,
     tamper_suspect: bool = False,
+    sha256: str | None = None,
 ) -> None:
     """Run heuristic analysis and merge its outcome into *assessment*.
 
@@ -779,6 +839,18 @@ def _apply_heuristics(
     if tamper_suspect:
         report.signals.append(_tamper_signal())
         assessment.notes.append(_TAMPER_NOTE)
+    # Bundle sibling trust (v1.2.4): a file the bundle's own
+    # integrity record vouches for, fingerprint-matched, gets its
+    # heuristic score zeroed on the Microsoft-trust terms — the
+    # signals stay listed, signature/rule detections are combined
+    # separately and never cleared. A fingerprint MISMATCH on a
+    # recorded place is tamper evidence, added as a signal.
+    sibling = bundletrust.check_sibling(path, sha256)
+    if sibling.modified:
+        report.signals.append(_sibling_modified_signal())
+        assessment.notes.append(_SIBLING_MODIFIED_NOTE)
+    if sibling.verified:
+        assessment.notes.append(bundletrust.SIBLING_VERIFIED_NOTE)
     # Oversize script floor waiver (script-routing spot audit,
     # fix-round-3 follow-up): the heuristic half is the report's
     # own flag; the rule half is decided here — the rule layer
@@ -798,6 +870,7 @@ def _apply_heuristics(
         # structurally valid certificate table.
         signed=getattr(report, "signed_trim_eligible", report.signed),
         trusted_system_file=report.trusted_system_file,
+        trusted_bundle_sibling=sibling.verified,
     )
     assessment.signals = scored.signals
     assessment.score = scored.score
