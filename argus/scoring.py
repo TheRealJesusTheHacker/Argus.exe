@@ -41,23 +41,31 @@ Two adjustments keep the model honest:
   exactly as a system file's is, with the same never-zeroed
   exceptions, and the same signature/rule independence.
 - **Packaging traits corroborate; they cannot convict alone.**
-  A small family of signals describes how a program is PACKAGED,
-  not what it DOES: the in-memory-loader import combination and
-  its ordinal-hidden shadow, debugger-detection imports, and
-  packer section names. Every PyInstaller-built program on Earth
-  carries them — the calibration audit behind v1.2.4 measured
-  them on the whole Sentinel kit and on ordinary legitimate
-  bootloader-shaped binaries: summed together they reached 75
-  points, over the Malicious line, on files whose only offence
-  was their runtime. When a file's ENTIRE profile is packaging
-  traits, its score is held just below the Malicious line
-  (Suspicious — "worth a closer look" is the honest verdict for
-  a packed, injection-capable stranger). The moment ANY other
-  signal is present — persistence, credential access, a
-  high-entropy executable section, a download-and-execute pair,
-  anything behavioural or structural — full arithmetic applies
-  and the same traits corroborate at full weight; the critical
-  combinations short-circuit exactly as before.
+  A family of signals describes how a program is PACKAGED, not
+  what it DOES: the in-memory-loader import combination and its
+  ordinal-hidden shadow, debugger-detection imports, packer
+  section names — and the shape of one-file packaging itself:
+  a giant overlay carrying the bundled program, high-entropy
+  data outside every declared section, a flooded string table,
+  virtual-machine names shipped inside common runtimes, and an
+  unsigned request for administrator rights in the manifest.
+  Measured on the real published binaries of the whole
+  Technician's Toolkit (the measurement is pinned as tests in
+  ``tests/test_fieldfix_v125.py``), the kit's own tools summed
+  to 70 points of exactly these traits and nothing else — over
+  the Malicious line for files whose only offence was how they
+  were built. (v1.2.4's first calibration round covered only
+  the import-combination family: it had been aimed at a crafted
+  profile instead of the measured one. v1.2.5 corrects the
+  aim.) When a file's ENTIRE profile is packaging traits, its
+  score is held just below the Malicious line (Suspicious —
+  "worth a closer look" is the honest verdict for a packed
+  stranger). The moment ANY other signal is present —
+  persistence, credential access, a high-entropy executable
+  section, a download-and-execute pair, anything behavioural —
+  full arithmetic applies and the same traits corroborate at
+  full weight; the critical combinations short-circuit exactly
+  as before.
 
 Every point in a score traces back to a named signal with a
 plain-language explanation. No opaque math, no scareware inflation.
@@ -110,21 +118,49 @@ HOT_POCKET_SIGNAL_NAMES = frozenset({
     "high_entropy_outside_sections",
 })
 
-#: Packaging-trait signals (v1.2.4 calibration): properties of a
-#: program's RUNTIME/packaging rather than its behaviour. Each is
-#: honest evidence — worth points, worth listing — but they are
-#: ubiquitous in legitimate software (every PyInstaller
-#: bootloader imports the in-memory-loader combination and
-#: debugger-detection APIs; packer section names ship with whole
-#: toolchains). A profile consisting ONLY of these corroborates
-#: suspicion; it cannot carry a file over the Malicious line by
-#: itself. Any signal outside this set lifts the cap and full
-#: arithmetic applies.
+#: Packaging-trait signals (calibration v1.2.4, corrected
+#: v1.2.5): properties of a program's RUNTIME/packaging rather
+#: than its behaviour. Each is honest evidence — worth points,
+#: worth listing — but they are ubiquitous in legitimate
+#: software. Two families:
+#:
+#: * the loader family — the in-memory-loader import combination
+#:   and its ordinal-hidden shadow, debugger-detection imports,
+#:   packer section names (every PyInstaller bootloader imports
+#:   the combination and the debugger checks; packer names ship
+#:   with whole toolchains);
+#: * the one-file family — the traits of carrying a whole
+#:   program inside one file: a huge overlay, high-entropy data
+#:   outside the declared sections, a string table past the
+#:   extraction cap, virtual-machine names bundled inside
+#:   common runtimes, and an unsigned elevation manifest.
+#:
+#: The one-file family was measured on the REAL published
+#: bundle binaries in v1.2.5 (the six signal lists are pinned
+#: verbatim in tests/test_fieldfix_v125.py): five kit tools
+#: scored 70 — Malicious — on these traits alone, the sixth 55.
+#: v1.2.4's class covered only the loader family, so the cap
+#: never intersected the real profiles; that is the error
+#: v1.2.5 corrects. A profile consisting ONLY of these traits
+#: corroborates suspicion; it cannot carry a file over the
+#: Malicious line by itself. Any signal outside this set lifts
+#: the cap and full arithmetic applies. Note
+#: ``high_entropy_outside_sections`` keeps its hot-pocket
+#: membership above: the pocket floor still guards the signed
+#: trim, and the cap below is applied after it — the pocket
+#: counts in full toward Suspicious either way, and
+#: corroborates at full weight the moment any behavioural
+#: signal is present.
 CORROBORATION_ONLY_SIGNAL_NAMES = frozenset({
     "process_injection_combo",
     "ordinal_hidden_combo_suspect",
     "anti_debug_imports",
     "packer_section_name",
+    "huge_overlay",
+    "high_entropy_outside_sections",
+    "string_extraction_truncated",
+    "vm_evasion_strings",
+    "unsigned_elevation_request",
 })
 
 
@@ -257,13 +293,14 @@ def score_signals(
         and names
         and names <= CORROBORATION_ONLY_SIGNAL_NAMES
     ):
-        # Calibration (v1.2.4): a profile made ONLY of packaging
-        # traits — the bootloader shape shared by every
-        # PyInstaller-built program — corroborates suspicion but
-        # cannot convict alone. Held at the top of Suspicious:
-        # the file is still flagged for a closer look, its
-        # signals still listed at full weight, and any single
-        # behavioural or structural signal lifts this cap.
+        # Calibration (v1.2.4, corrected v1.2.5): a profile made
+        # ONLY of packaging traits — the shape shared by every
+        # one-file-packaged program, measured on the real kit —
+        # corroborates suspicion but cannot convict alone. Held
+        # at the top of Suspicious: the file is still flagged
+        # for a closer look, its signals still listed at full
+        # weight, and any single behavioural or structural
+        # signal lifts this cap.
         score = MALICIOUS_THRESHOLD - 1
 
     return ScoredSignals(
