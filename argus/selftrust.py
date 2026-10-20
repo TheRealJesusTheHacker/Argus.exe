@@ -31,20 +31,27 @@ read):
     1. *Primary and decisive:* the SHA-256 the setup engine
        recorded in the trusted data root at install time. When a
        record exists, it alone decides: a match exempts the file;
-       a mismatch at the canonical program path is a **tamper
-       indicator** (scanned in full + tamper signal) — even if the
-       Service Control Manager's ImagePath points at that path,
-       because an SCM entry can be repointed at a replacement
-       binary, while the recorded fingerprint cannot be satisfied
-       by one.
+       a mismatch at a program address is a **tamper indicator**
+       (scanned in full + tamper signal) — even if the Service
+       Control Manager's ImagePath points at that path, because
+       an SCM entry can be repointed at a replacement binary,
+       while the recorded fingerprint cannot be satisfied by one.
     2. *When no record exists:* the file is the very executable
        this process is running (``sys.executable`` of the packaged
-       build). Nothing else exempts it. In particular the SCM
-       ImagePath is NOT an identity proof at all — it only helps
-       *locate* the candidate program address — so a file whose
-       only claim is an SCM entry is scanned normally, with no
-       exclusion and no tamper signal (absence of a record is not
-       evidence of replacement).
+       build) — **at whatever address it lives**. The running-
+       process proof is a property of the process, not of the
+       install layout: the portable and bundle editions never
+       went through setup, so their program file never sits at
+       the canonical install address, and gating this proof on
+       that address left the portable program a stranger to
+       itself (field finding, 2026-10-20: Argus running from the
+       Technician's Toolkit bundle flagged its own exe). Nothing
+       else exempts it. In particular the SCM ImagePath is NOT an
+       identity proof at all — it only helps *locate* the
+       candidate program address — so a file whose only claim is
+       an SCM entry is scanned normally, with no exclusion and no
+       tamper signal (absence of a record is not evidence of
+       replacement).
   The file's NAME never earns anything: an ``Argus.exe`` in any
   other folder is scanned like any stranger's binary.
 - **Support files in the install folder scan normally.** Only the
@@ -292,13 +299,28 @@ class SelfExclusions:
             if candidate == _norm(protected):
                 return SelfCheck(excluded=True, source=SOURCE_SIGNATURE_DB)
 
-        if self.own_exe is not None and candidate == _norm(self.own_exe):
-            # The program's own address: identity decides.
+        # The program's addresses: the canonical install address
+        # (own_exe) AND — for the packaged build — the address of
+        # the very file this process is running as (running_exe).
+        # The two coincide in an installed layout; in the portable
+        # and bundle layouts only running_exe exists, and the
+        # identity gate must still be entered for it (see the
+        # module docstring's portable-mode note).
+        program_addresses = set()
+        if self.own_exe is not None:
+            program_addresses.add(_norm(self.own_exe))
+        if self.running_exe is not None:
+            program_addresses.add(_norm(self.running_exe))
+        if candidate in program_addresses:
+            # A program address: identity decides.
             if self.recorded_exe_sha256:
                 # PRIMARY and DECISIVE: when a fingerprint record
                 # exists, it alone rules. A mismatch is tamper
                 # evidence even if the SCM ImagePath (or any other
-                # locator) points at this very path.
+                # locator) points at this very path — and even at
+                # the running file's own address: a record that the
+                # running file fails means the file on disk is not
+                # the file setup vouched for.
                 digest = self._hash(Path(path))
                 if digest is not None and digest == self.recorded_exe_sha256.lower():
                     return SelfCheck(
@@ -307,8 +329,10 @@ class SelfExclusions:
                 return SelfCheck(excluded=False, tamper_suspect=True)
             # No record: the running-process proof is the only one
             # left (the packaged build exempts the file it is
-            # actually running as). An SCM match alone exempts
-            # nothing and accuses nothing.
+            # actually running as, wherever that file lives). An
+            # SCM match alone exempts nothing and accuses nothing,
+            # and the canonical address on its own — an at-rest
+            # copy Argus is not running — earns nothing either.
             if self.running_exe is not None and candidate == _norm(
                 self.running_exe
             ):
