@@ -5,95 +5,237 @@
   <p align="center"><em>Security For Everyone.</em></p>
 </p>
 
+<p align="center">
+  <a href="https://github.com/TheRealJesusTheHacker/Argus.exe/releases/latest"><img src="https://img.shields.io/github/v/release/TheRealJesusTheHacker/Argus.exe?style=flat-square" alt="Latest release"></a>
+  <a href="https://github.com/TheRealJesusTheHacker/Argus.exe/actions/workflows/build-windows.yml"><img src="https://github.com/TheRealJesusTheHacker/Argus.exe/actions/workflows/build-windows.yml/badge.svg" alt="build-release workflow status"></a>
+  <a href="https://github.com/TheRealJesusTheHacker/Argus.exe/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Proprietary-red?style=flat-square" alt="License: Proprietary"></a>
+  <a href="https://www.python.org"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square" alt="Python 3.11 or newer"></a>
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-0078D6?style=flat-square" alt="Platforms: Windows and Linux">
+  <a href="https://doc.qt.io/qtforpython-6/"><img src="https://img.shields.io/badge/GUI-PySide6-41CD52?style=flat-square" alt="GUI: PySide6"></a>
+</p>
+
 ---
 
-## What is Argus?
+## Overview
 
 In Greek myth, **Argus** was the hundred-eyed giant — nothing escaped his gaze. **ARGUS.EXE** carries that name for the same reason: a watcher that never blinks.
 
 Argus is Sentinel Safeguard LLC's antivirus and malware detector for Windows and Linux. It is built for the people enterprise security forgot — home users, single-PC shops, and small businesses that need real protection without a per-seat enterprise contract, a bloated install, or a sales call.
 
-**Two editions, one product:** the Windows edition (`Argus.exe`, a single self-installing file) and — new in v1.2.0 — the Linux edition (`Argus.deb`) for Debian-based systems: **Kali Linux, Parrot OS, Debian, and Ubuntu**. The Linux edition is the same product translated to its platform, not a port of leftovers: a systemd protection service instead of the Windows service, a kernel-verified Unix socket instead of the named pipe, inotify watching instead of polling, and dpkg package records standing where Windows uses code signatures. The detection engine — signatures, heuristics, behaviour rules, the encrypted vault — is shared, line for line.
+Argus is **not** a portable download-and-run scanner that you open once and forget. On Windows it installs itself, starts at boot as a service, and registers with Windows Security Center as the machine's antivirus provider. A portable edition exists for carrying Argus on a USB stick, and it is honest about what it does not do (see [Editions](#editions)).
 
-## What it does
+**Two editions, one product:**
 
-- **Signature scanning** — known-malware detection against a curated signature database (hashes + pattern rules), updated regularly.
-- **Heuristic & behavioral watch** — unknown threats caught by what they *do*, not just what they're *named*: suspicious process chains, persistence tricks, ransomware-style file churn.
-- **Real-time protection** — files watched as they're written, downloaded, or executed; threats stopped before they run.
-- **Quarantine** — detected threats are isolated safely, never silently deleted. Review, restore, or remove on your terms.
-- **Plain-language reporting** — every detection explained in words a person can act on, with a full scan history and clean audit trail.
-- **It knows itself** — Argus never scans its own program or its own data (the quarantine vault holds neutralised threat samples; scanning them would be noise). The exemption is by *identity*, never by name: the program file is skipped only when it provably is Argus (the running program, the copy registered with Windows, or the fingerprint recorded at setup). A file merely *named* `Argus.exe` anywhere else is scanned like any stranger — and a file sitting at Argus's own address that fails the identity check is scanned in full and reported as a tamper indicator.
-- **It knows Windows** — a file with a structurally valid Microsoft signature, living in its proper place under the Windows folder, is recognised as a system file: its behaviour-based suspicion is cleared (normal system files do system things). The findings stay listed on the report — nothing is hidden — and the recognition clears *only* behaviour suspicion: a signature-database match or pattern-rule detection on the same file still stands in full.
-- **It knows Linux** — the same recognition, in the platform's own terms: a file the package manager (dpkg) records as an installed package's own file, living in a system location (`/usr`, `/bin`, `/sbin`, `/lib*` — never `/usr/local` or a home folder), is recognised as a system file with the same limits: behaviour suspicion cleared, findings still listed, signature and rule detections fully in force. And the Linux service verifies who is asking for privileged actions exactly as strictly as the Windows one — the kernel itself (SO_PEERCRED) vouches for the calling process, which must prove it is the genuine installed Argus program by its recorded SHA-256 fingerprint.
+- **Windows** — `Argus.exe`, a single self-installing file, plus `ArgusPortable.zip`, the same executable in portable mode.
+- **Linux** — `Argus.deb` for Debian-based systems: **Kali Linux, Parrot OS, Debian, and Ubuntu** (new in v1.2.0).
+
+The Linux edition is the same product translated to its platform, not a port of leftovers: a systemd protection service instead of the Windows service, a kernel-verified Unix socket instead of the named pipe, inotify watching instead of polling, and dpkg package records standing where Windows uses code signatures. The detection engine — signatures, pattern rules, heuristics, risk scoring, the encrypted vault — is shared.
+
+| | |
+|---|---|
+| **Current release** | v1.2.3 — see [Status](#status) and the [release page](https://github.com/TheRealJesusTheHacker/Argus.exe/releases/latest) |
+| **Release assets** | `Argus.exe`, `ArgusPortable.zip`, `Argus.deb`, `SHA256SUMS.txt` (one checksum file covering all three downloads) |
+| **Requirements (source)** | Python 3.11 or newer; the engine core is pure Python standard library |
+| **Optional layers** | PySide6 for the GUI; pywin32 for the Windows service and Security Center registration (Windows only) |
+| **License** | Proprietary — see [License](#license) |
+
+## Features
+
+- **Signature scanning** — known-malware detection against a curated SQLite signature database (SHA-256 hashes) that carries an HMAC-SHA256 authenticity tag and is integrity-checked on load. A freshly built database is seeded with the industry-standard, harmless EICAR test file so the whole pipeline can be verified end to end.
+- **Pattern rules** — YARA-style pattern rules evaluated alongside the hash database; a rule hit is a detection in its own right and is never cleared by any trust recognition.
+- **Heuristic analysis** — entropy analysis (whole-file, sliding-window, and per-section), a pure-standard-library PE parser (sections, imports, exports, TLS callbacks, signature presence, overlay), and a catalog of 43 weighted behaviour signals in `argus/devtools.py` covering persistence, process injection, credential access, keylogging, download-and-execute, masquerading, packers, and script / LOLBin abuse. Every signal is weighted, carries its own severity, and is explained in plain language.
+- **Risk scoring you can audit** — signals add up to a verdict: **Clean** below 25 points, **Suspicious** from 25–59, **Malicious** at 60 or more. A critical signal combination short-circuits straight to Malicious, and a digital signature trims points but never erases a score to Clean and never cancels a critical combination. Every point traces back to a named signal — no opaque math.
+- **Severity on every detection** — Critical / High / Medium / Low, on top of the verdict. Signature hits inherit the signature's severity; rule and heuristic detections carry their own. Severity drives the action Argus offers.
+- **Real-time protection** — folders where threats land (Downloads, Desktop, Documents, temp by default) are watched as files are written, and a process monitor scans a program as it starts. On Linux an inotify backend feeds the same debounce logic; if inotify is unavailable the watcher falls back to polling and reports that honestly in its status.
+- **Encrypted quarantine vault** — detections are isolated, never silently deleted. The vault uses authenticated encryption (an HMAC-SHA256 keystream, encrypt-then-MAC, pure standard library): a blob is verified end to end before the original file is removed, and a tampered blob refuses to restore. Restore never overwrites a file that has taken the original's place.
+- **Actions always ask first** — quarantine, permanent delete, and allow / ignore all go through an explicit confirmation. **Deletion is never automatic under any policy or setting.** The most a real-time policy may do unattended is quarantine a Critical file — and only when the user has configured exactly that.
+- **Pending-actions queue** — under the default `ask` policy, real-time action requests wait for a human approve / reject decision instead of acting on their own.
+- **Plain-language reporting** — every detection is explained in words a person can act on. Every scan, manual and real-time, is recorded in a SQLite history with an audit trail; `argus report` and `argus history` render it as text or JSON.
+- **Premium GUI** — a PySide6 interface in Sentinel green/black with seven pages — Dashboard, Scan, Quarantine, Pending Actions, History, Settings, and a Dev Toolkit — plus a system tray presence and a first-run onboarding wizard with an EICAR self-test.
+- **Dev Toolkit** — the workbench inside the GUI: a heuristic-sensitivity slider, per-signal enable / weight steering (kept identical to the engine's signal library by a drift-guard test), an exclusions manager, a rule test bench that breaks a file's score down signal by signal, verbose logging, simulation mode (detect-only; actions are recorded as intent and nothing on disk is touched), and the EICAR self-test.
+- **It knows itself** — Argus never scans its own program or its own data (the quarantine vault holds neutralised threat samples; scanning them would be noise). The exemption is by *identity*, never by name: the program file is skipped only when it provably is Argus — the running program, the copy registered with the service manager, or the fingerprint recorded at setup. A file merely *named* `Argus.exe` anywhere else is scanned like any stranger, and a file sitting at Argus's own address that fails the identity check is scanned in full and reported as a tamper indicator.
+- **It knows Windows** — a file is recognised as a trusted system file only when all three hold: a valid Authenticode signature (verified by Windows itself through WinVerifyTrust, which fails closed on Windows), a Microsoft signer, and a home under the Windows folder. Recognition zeroes the *heuristic* score only — the findings stay listed on the report with an explanatory note, and a signature-database match or pattern-rule detection on the same file still stands in full.
+- **It knows Linux** — the same recognition in the platform's own terms: a file is a system file when dpkg records it as an installed package's own file, its resolved path is a system location (`/usr`, `/bin`, `/sbin`, `/lib*` — never `/usr/local` or a home folder), and, since v1.2.3, its contents still match what the package shipped. The same limits apply: behaviour suspicion cleared, findings still listed, signature and rule detections fully in force. A missing or failing dpkg fails closed.
+- **Caller-verified privileged actions** — on an installed system, restore / allow / delete / approve / reject execute only over the verified channel (a named pipe on Windows, a Unix socket on Linux) and only after the service verifies the calling process: its image must resolve to the canonical installed Argus program and hash to the fingerprint recorded at install. On Linux the kernel itself vouches for the peer first (SO_PEERCRED: PID and UID). A dropped request file alone can never carry a privileged action in the installed layout.
 
 ## Design principles
 
-1. **Security For Everyone.** No enterprise gatekeeping. If it runs Windows, it deserves protection.
-2. **Lightweight.** Protection shouldn't eat the machine it's protecting.
-3. **Honest.** Argus says what it found, why it flagged it, and what it did — no scareware tactics, no fake "threats detected" upsells. Ever.
-4. **User in control.** Quarantine-first. Nothing is deleted behind your back.
+1. **Security For Everyone.** No enterprise gatekeeping. If it runs Windows or Debian-based Linux, it deserves protection.
+2. **Lightweight.** Protection shouldn't eat the machine it's protecting. The engine core is pure standard library, hashing is streamed, and files are never loaded whole just to be scanned.
+3. **Honest.** Argus says what it found, why it flagged it, and what it did — no scareware tactics, no fake "threats detected" upsells, and no capability claims the code doesn't back. Known limits are written down in this README and in `docs/ROADMAP.md`, not buried.
+4. **User in control.** Quarantine-first. Nothing is deleted behind your back, under any setting.
 
-## Development phases
+## Editions
 
-| Phase | Scope |
-|-------|-------|
-| **Phase 1 — Detection engine** | Core scanner: file walking, hashing (SHA-256), signature database format + loader, YARA-style pattern rules. CLI scan. |
-| **Phase 2 — Heuristics** | Behavioral rules engine: entropy analysis, PE inspection, suspicious API/import patterns, packer detection. Risk scoring. |
-| **Phase 3 — Real-time watch** | Filesystem watcher with write-debounce + process monitor, built as an always-on background component that becomes a Windows service (starts at boot). |
-| **Phase 4 — Quarantine & actions** | Encrypted quarantine vault, per-severity actions (quarantine / delete / allow), scan reports, detection explanations, history/audit log. Every action user-confirmed — never silent. |
-| **Phase 5 — Product** | Premium GUI (Sentinel green/black) with a Dev Toolkit panel, background service with system tray, Windows Security Center registration as the system's antivirus, signature auto-updates. Since v1.1.0 the installer is Argus itself: one self-installing `Argus.exe`, no separate installer (the earlier installer is retired). Argus installs and becomes the machine's default security app — not a portable scanner. |
+| Edition | Asset | How it runs | Always-on service | Security Center registration |
+|---|---|---|---|---|
+| Windows, installed | `Argus.exe` | Download, open, choose **Set up protection**, allow the single UAC prompt | Yes — `ArgusProtection`, starts at boot | Yes |
+| Windows, portable | `ArgusPortable.zip` | Unzip, launch `Argus-Portable.bat`; settings, vault, and history live in the `ArgusData` folder beside it | No — real-time protection runs while the app is open | No |
+| Linux | `Argus.deb` | `sudo apt install ./Argus.deb` | Yes — `argus-protection` (systemd) | No Linux equivalent exists; not claimed |
 
-## Status
-
-**Current version: 1.2.3** (see `argus/__init__.py` and `pyproject.toml`). v1.2.3 ships the fixes from the fleet-wide bug-and-security audit of 2026-10-19 — no new features; the same product, made harder to fool and harder to break. On Linux, a system file now earns its trust by its actual contents: a file replaced in place at a trusted path no longer inherits trust it hasn't earned. Folders can no longer silently go unwatched when the system's watch limit is reached — the watcher falls back to a full check and logs it openly. A restore interrupted by a crash or power loss can no longer lock a vault entry forever. Installing a `.deb` upgrade now restarts the protection service, so the new version is the one protecting the machine immediately. The verified channel also caps concurrent sessions, and the Linux service unit gained `NoNewPrivileges`. Before it, v1.2.2 was a build fix only — it repaired a wrong file path in the Linux packaging step that left the v1.2.1 release incomplete (its Linux package and checksums never attached); the product was unchanged from v1.2.0, whose defining change was:
-
-**v1.2.0 — the Linux edition.** Argus now ships for Debian-based Linux as `Argus.deb`, built for **Kali Linux and Parrot OS** (and Debian/Ubuntu): install it with apt and the `argus-protection` systemd service starts protecting the machine — real-time watching via inotify, the same scanner, heuristics, rules and encrypted vault, the same window. The platform translation is conservative in the same places the Windows edition is: privileged actions (quarantine / delete / restore / whitelist) travel over a Unix socket where the kernel vouches for the caller (SO_PEERCRED) and the caller must match the installed program's recorded fingerprint — a file-drop request alone can never carry them, exactly as on Windows; Argus recognises itself by recorded identity, never by name; and dpkg-owned system files in system locations get their behaviour suspicion cleared while signature and rule detections stand. The package is honest about its evidence: it is verified on the project's Linux build VM and CI (full test suite, packaged `--self-check` / `--self-check-qt`, a live daemon run, and a real `dpkg` install with the service running under systemd); the first run on physical Kali/Parrot hardware is the remaining verification step and is tracked as such in `docs/ROADMAP.md` — nothing here claims otherwise. The Windows edition is unchanged in behaviour by this release.
-
-The defining change of the previous line arrived in v1.1.0:
-
-**v1.1.0 — one file that installs itself.** Argus is now a single `Argus.exe`: the app, the protection service, and the setup engine in one file. Download it, open it, choose **Set up protection**, allow the one Windows permission prompt — Argus places itself in `Program Files\Sentinel Safeguard\Argus`, sets up the always-on `ArgusProtection` service, registers with Windows Security, starts protection, and *verifies each of those steps before it calls itself done*. No installer wizard, no separate service download, no command line, nothing to configure to be protected. Uninstalling is just as plain — from the Argus window or Windows Settings — and **keeps your quarantine vault and history** unless you explicitly ask to remove them. This release exists because the v1.0.5 installer's hidden service step silently failed on a real machine (the service was never installed, and the old GUI then dead-ended against the locked vault); v1.1.0 removes that entire class of failure — every setup step is performed by Argus itself, checked, and reported in plain language. Underneath: machine data under `C:\ProgramData\Argus` with the v1.0.4 trust split (the service never trusts user-writable state; the signature database carries an HMAC authenticity tag), so the service and the app always see the same vault and history. The portable edition is the *same* exe in portable mode (ArgusPortable.zip — unzip and run; it never installs, protection runs while the app is open). This build also teaches Argus to recognise **itself** and **Windows**: it never scans its own program or data (by proven identity, never by name — an impostor `Argus.exe` is scanned like any stranger, and a replaced program file is reported as tampering), and it recognises genuine Microsoft-signed system files in their system home, clearing their behaviour suspicion while leaving signature and rule detections fully in force.
-
-The rest of the product, from Phase 5: the premium Sentinel green/black **GUI** (Dashboard, Scan, Quarantine, Pending Actions, History, Settings, and a **Dev Toolkit**), a real **Windows service** (`ArgusProtection`, starts at boot), **Windows Security Center registration** so Argus is listed as the machine's antivirus in Windows Security, a **system tray** presence, and a first-run **onboarding wizard** with an EICAR self-test. The Dev Toolkit is the workbench: detection-sensitivity slider, per-signal enable/weight steering, a rule test bench that dissects any file down to every point of its score, **simulation mode** (detect-only — actions are recorded as intent and nothing is ever touched), verbose logging, and the EICAR self-test. The rules from day one still hold in every layer, GUI included: **nothing happens to your files behind your back** — destructive actions always ask first, and deletion is never automatic under any setting. Honest remainders: the process monitor scans a program *as* it starts (pre-execution blocking and kernel tamper protection need Microsoft's driver signing programs — future work), and the vault's encryption exists to neutralize threats, not to store secrets.
+The installed Windows edition is **one self-installing file**: the GUI, the protection service, and the setup engine are all in `Argus.exe`. There is no separate installer — the Inno Setup installer used before v1.1.0 is retired. During setup Argus places itself in `Program Files\Sentinel Safeguard\Argus`, stores machine data under `C:\ProgramData\Argus`, installs and starts the service, registers with Windows Security Center, and **verifies each step before it calls itself done** — no step may fail silently.
 
 ## Install
 
-**From a release (Windows):** download `Argus.exe` from the latest GitHub release and open it. Choose **Set up protection** and allow the Windows permission prompt; Argus installs itself, starts protection, and confirms it's running — that's the whole process. To remove it later, use the uninstall entry in Windows Settings → Apps (or run Argus and use its own uninstall), and your vault and history are kept unless you check "also remove my Argus data". The portable edition (`ArgusPortable.zip`, the same exe) is attached to the same release for carrying Argus on a USB stick; `SHA256SUMS.txt` covers all downloads.
+### Windows — from a release
 
-**From a release (Linux — Kali, Parrot, Debian, Ubuntu):** download `Argus.deb` from the same GitHub release and install it the Debian way:
+1. Download `Argus.exe` from the [latest release](https://github.com/TheRealJesusTheHacker/Argus.exe/releases/latest). Optionally verify it against `SHA256SUMS.txt` from the same release.
+2. Open it and choose **Set up protection**.
+3. Allow the one Windows permission (UAC) prompt. Argus installs itself, starts protection, and confirms it is running — that is the whole process.
 
-```
+To remove it later, use the uninstall entry in Windows Settings → Apps, or Argus's own uninstall in the app. Your quarantine vault and history are kept unless you check "also remove my Argus data".
+
+**Portable:** download `ArgusPortable.zip` from the same release, unzip it anywhere (a USB stick works), and launch `Argus-Portable.bat` — not `Argus.exe` directly, because the launcher is what points Argus at its portable `ArgusData` folder. Portable Argus never installs anything; delete the folder and it is gone.
+
+### Linux — from a release (Kali, Parrot, Debian, Ubuntu)
+
+```bash
 sudo apt install ./Argus.deb
 ```
 
-That's the whole process: the package places the program in `/usr/lib/argus`, its data in `/var/lib/argus`, records the program's fingerprint, and enables + starts the `argus-protection` service; Argus appears in the desktop's application menu (Xfce on Kali, MATE on Parrot). Check protection any time with `argus service status`. Remove it with `sudo apt remove argus` (your vault and history are kept) or `sudo apt purge argus` (everything Argus owns is removed).
+That is the whole process: the package places the program in `/usr/lib/argus`, its data in `/var/lib/argus`, its configuration in `/etc/argus`, records the program's fingerprint, and enables and starts the `argus-protection` service. Argus appears in the desktop application menu (Xfce on Kali, MATE on Parrot). Check protection any time with:
 
-**From source:**
-
-```
-pip install ".[gui,windows]"     # engine + GUI + Windows service layers (Windows)
-pip install ".[gui]"             # engine + GUI (Linux: the platform layer is stdlib)
-python -m argus.gui               # the GUI (or: argus-gui)
-python -m argus sigdb init        # build a signature database
-python -m argus scan <path>       # scan from the command line
-python -m argus watch             # real-time protection in the foreground
-python -m argus service install   # (Windows, admin) install the service
+```bash
+argus service status
 ```
 
-The engine core is pure Python standard library; PySide6 is the GUI layer, pywin32 serves only the Windows service/registration modules, and the Linux platform layer (systemd, the verified socket, inotify, dpkg trust) is standard library too — `ctypes` and `dpkg-query`/`systemctl`, nothing else.
+Remove it with `sudo apt remove argus` (vault and history are kept) or `sudo apt purge argus` (everything Argus owns is removed).
+
+### From source
+
+Requires Python 3.11 or newer.
+
+```bash
+pip install ".[gui,windows]"   # engine + GUI + Windows service layers (Windows)
+pip install ".[gui]"            # engine + GUI (Linux: the platform layer is stdlib)
+python -m argus.gui             # the GUI (or: argus-gui)
+python -m argus sigdb init      # build a signature database
+python -m argus scan <path>     # scan from the command line
+python -m argus watch           # real-time protection in the foreground
+python -m argus service install # (Windows, admin) install the service
+```
+
+The engine core is pure Python standard library; PySide6 is the GUI layer, pywin32 serves only the Windows service / registration modules, and the Linux platform layer (systemd, the verified socket, inotify, dpkg trust) is standard library too — `ctypes` and `dpkg-query` / `systemctl`, nothing else.
 
 ## Usage
 
-- **GUI:** open `Argus.exe` (installed or portable) — Dashboard, Scan, Quarantine, Pending Actions, History, and Settings are all in the main window.
-- **CLI:** `python -m argus scan <path>` scans a file or folder; `python -m argus watch` runs real-time protection in the foreground; `python -m argus sigdb init` builds a signature database.
-- **Service (Windows, admin):** `python -m argus service install` installs the `ArgusProtection` service from source; the packaged `Argus.exe` sets the same service up itself during "Set up protection".
+### GUI
+
+Open `Argus.exe` (installed or portable) on Windows, or launch Argus from the application menu on Linux. The main window has seven pages:
+
+- **Dashboard** — protection status, last scan, and detections by severity: "am I safe?" at a glance.
+- **Scan** — scan a file or folder on demand and read the result, signal by signal.
+- **Quarantine** — review vault entries; restore or remove them, always through the confirmation flow.
+- **Pending Actions** — real-time action requests waiting for your approve / reject decision.
+- **History** — past scans and detections, with the plain-language explanation each one carried.
+- **Settings** — watched folders, exclusions (by path and by SHA-256 fingerprint), per-severity actions, and the real-time policy.
+- **Dev Toolkit** — sensitivity and per-signal tuning, the rule test bench, simulation mode, verbose logging, and the EICAR self-test.
+
+The system tray icon shows live protection state and offers quick actions (scan now, open quarantine, pause / resume). The first launch shows a one-time onboarding wizard that ends with the EICAR self-test, so a new user can watch the whole detection pipeline work before trusting it.
+
+### CLI
+
+The CLI entry point is `argus` (or `python -m argus` from source):
+
+| Command | What it does |
+|---|---|
+| `argus scan <path>` | Scan a file or folder. Options include `--db`, `--rules`, `--no-heuristics`, `--config`, `--quarantine` / `--delete` (explicit post-scan actions on Malicious files, via the vault), `--vault-dir`, `--history-db`, and `--json` for machine-readable output. |
+| `argus watch` | Run real-time protection in the foreground. |
+| `argus watch-status` | Show real-time protection status from the service heartbeat. |
+| `argus service <action>` | Manage the protection service: `install`, `uninstall`, `start`, `stop`, `restart`, `status`, `run`, `register`, `unregister`. On Linux, install / uninstall belong to apt; `status`, `start`, `stop`, and `restart` work against systemd. |
+| `argus sigdb init` / `argus sigdb info` | Create a signature database (seeded with EICAR), or show an existing database's details. |
+| `argus quarantine list` | List vault entries. |
+| `argus quarantine restore` / `delete` / `allow` | Put a quarantined file back, permanently delete it, or restore it and vouch for it (adds an exclusion). |
+| `argus pending …` | Review and decide actions waiting in the pending-actions queue. |
+| `argus report` / `argus history` | Plain-language report of Argus activity and recent scans / detections (JSON export available). |
+| `argus --version` | Print the version (`1.2.3`). |
 
 ## How it works
 
-- **Detection layers, in order:** signature matching against the signature database (SHA-256 hashes plus pattern rules), then heuristic analysis — entropy analysis, PE structure inspection, and weighted behaviour signals — combined by the risk-scoring model into a verdict (clean / suspicious / malicious) where every point traces back to a named signal. Every detection also carries a severity (Critical / High / Medium / Low) that drives the action offered.
-- **Real-time watch:** a filesystem watcher with write-debounce plus a process monitor that scans a program as it starts. Pre-execution blocking and kernel tamper protection are not claimed — they need Microsoft's driver signing programs and are listed as future work in the Status section above.
-- **Quarantine & actions:** detected threats go to the encrypted quarantine vault under `C:\ProgramData\Argus`; actions (quarantine / delete / allow) are always user-confirmed, and deletion is never automatic. Reports explain each detection in plain language, with full scan history and an audit trail.
-- **Trust boundaries:** the service never trusts user-writable state, and the signature database carries an HMAC authenticity tag. Argus's self-recognition and Windows system-file recognition work as described under "What it does" — by proven identity, never by name or path alone.
-- **Layout:** the detection engine, heuristics, quarantine, real-time watch, service, and reporting live in `argus/` (the Linux platform layer — `linuxservice`, `socket_channel`, `platform_dpkg`, `inotify_watcher`, the FHS half of `paths` — sits beside its Windows twins there); the PySide6 GUI in `argus/gui/`; packaging (the Windows and Linux PyInstaller specs, the `.deb` builder under `packaging/linux/`, the portable launcher) in `packaging/`; the test suite in `tests/`; and the full phase-by-phase plan in `docs/ROADMAP.md`.
+**Detection layers, in order.** A file is hashed (SHA-256, streamed) and matched against the signature database; pattern rules are evaluated; then heuristic analysis runs — entropy, PE structure, and the weighted behaviour signals — and the scoring model combines the heuristic signals into a verdict. Every detection also carries a severity (Critical / High / Medium / Low) that drives the action offered. Signature and rule detections decide on their own and are never cleared by trust recognition.
+
+**Real-time watch.** The watcher uses write-debounce: a file is scanned only once its size and modification time are stable across consecutive polls, so half-written downloads are never judged mid-write. Symlinks are never followed; vanished or locked files are counted and reported, never fatal. A process monitor (Toolhelp32 on Windows, `/proc` on Linux) notices programs starting and scans the file each launched from. On Linux, inotify supplies the change feed for the same debounce logic, with an honest polling fallback.
+
+**Quarantine and actions.** Detected threats go to the encrypted vault (under `C:\ProgramData\Argus` on Windows, `/var/lib/argus` on Linux). The action layer raises without an explicit confirmation token — there is no code path where Argus quietly moves or deletes a user's file, and deletion routes through the vault first so the index keeps the audit record even then.
+
+**Trust boundaries.** The protection service never trusts user-writable state: machine data uses a trust split in which the signature database carries an HMAC authenticity tag, privileged actions are caller-verified over the pipe / socket channel described under [Features](#features), and legacy queue records migrate only when their provenance can be proven against the vault itself. Self-recognition and system-file recognition work by proven identity — resolved path plus recorded fingerprint, valid Microsoft signature plus system location, dpkg ownership plus system location plus content match — never by filename.
+
+**Repository layout.**
+
+| Path | Contents |
+|---|---|
+| `argus/` | The product: scanner, signatures, rules, scoring, quarantine, actions, reporting, real-time engine, service hosts, setup engine, and the platform layers — `winservice` / `winregister` / `pipe_channel` / `platform_authenticode` for Windows, `linuxservice` / `socket_channel` / `platform_dpkg` / `inotify_watcher` for Linux, with `paths` and `selftrust` shared. |
+| `argus/heuristics/` | Entropy analysis, the PE parser, and the behaviour-signal library. |
+| `argus/gui/` | The PySide6 GUI: main window, dashboard, scan page, management pages, settings and Dev Toolkit pages, onboarding wizard, tray, and theme. |
+| `packaging/` | The Windows and Linux PyInstaller specs, the portable launcher (`packaging/portable/`), and the Debian packaging under `packaging/linux/` (control file, maintainer scripts, systemd unit, desktop entry, `build-deb.sh`). |
+| `tests/` | The pytest suite (42 test modules). |
+| `docs/ROADMAP.md` | The full phase-by-phase product record and the detection-depth backlog. |
+| `.github/workflows/build-windows.yml` | The `build-release` workflow: builds and smoke-tests both platform editions on release and attaches the assets and the single `SHA256SUMS.txt`. |
+
+## Configuration
+
+Argus runs correctly with no configuration at all. Settings live in a JSON file (`argus-config.json` in the Argus data folder) that a person can read and edit; the GUI and the `argus` services read the same file. Loading is tolerant by design: an unreadable value falls back to its default **per key**, every problem is collected as a loud warning, and a bad config never crashes protection.
+
+The keys Argus itself writes (from `argus/config.py`):
+
+| Key | Meaning | Default |
+|---|---|---|
+| `watch_dirs` | Folders real-time protection watches | Downloads, Desktop, Documents, and the system temp folder |
+| `poll_interval_seconds` | Filesystem polling interval | `1.0` |
+| `stable_polls` | Consecutive unchanged polls before a file is judged stable and scanned | `2` |
+| `process_monitor_enabled` / `process_poll_interval_seconds` | On-execute scanning of newly started programs | enabled / `2.0` |
+| `heartbeat_interval_seconds` | How often the service writes its status heartbeat | `5.0` |
+| `heuristics` | Turn heuristic analysis on or off | `true` |
+| `severity_actions` | Default action per severity | Critical / High → `quarantine`, Medium → `alert`, Low → `log` |
+| `realtime_default` | How real-time action requests are handled: `ask`, `auto-quarantine-critical`, or `log-only` | `ask` |
+| `exclusions` | `paths` and SHA-256 `hashes` Argus leaves alone — honoured by real-time and on-demand scans alike | empty |
+| `max_realtime_file_size_mb` | Largest file the real-time engine will scan | `256` |
+| `max_dwell_seconds` | A file that keeps changing is scanned anyway after this long | `30.0` |
+| `signature_db`, `rules_file` | Signature database and optional extra / replacement rules file locations | data-folder defaults |
+| `vault_dir`, `history_db`, `pending_db` | Vault, history, and pending-actions locations | standard data-folder locations |
+| `onboarding_completed` | Set once the first-run wizard has been finished, so it shows exactly once | `false` |
+
+Exclusions added by choosing **Allow** are merged into the on-disk config rather than overwriting it, so a vouch made in one Argus window is never silently erased by a save from another.
+
+## Development
+
+```bash
+git clone https://github.com/TheRealJesusTheHacker/Argus.exe.git
+cd Argus.exe
+pip install ".[gui]"        # add the "windows" extra on Windows
+python -m pytest            # the full suite
+```
+
+The suite's size depends on whether the GUI layer is importable, because the GUI tests skip themselves when PySide6 is absent. Verified on a fresh checkout of v1.2.3 (commit `70e019d`):
+
+- **System Python (no Qt): 657 passed, 28 skipped** — `python -m pytest -q` with the standard-library engine only; the skips are the Qt-dependent tests.
+- **GUI environment (PySide6 venv, `QT_QPA_PLATFORM=offscreen`): 709 passed, 1 skipped** — the same suite with the GUI layer present, including the GUI smoke, theme, and setup tests.
+
+State a count only if you have just run the suite and seen the summary line — the numbers above are the ones from the runs quoted, not a target.
+
+Releases are built by the `build-release` GitHub Actions workflow (`.github/workflows/build-windows.yml`) when a release is published: the Windows job builds `Argus.exe` and `ArgusPortable.zip` with PyInstaller and smoke-tests the packaged binary (`--self-check`, and `--self-check-qt` offscreen); the Linux job builds `Argus.deb`, inspects the package with `dpkg-deb`, verifies the systemd unit, and runs the same packaged self-checks; a final job then publishes the single `SHA256SUMS.txt` covering all three assets.
+
+## Status
+
+**Current version: 1.2.3** (`argus/__init__.py` and `pyproject.toml` agree). All five development phases in `docs/ROADMAP.md` are complete: detection engine, heuristics, real-time protection, quarantine / actions / reporting, and the product phase (premium GUI, Dev Toolkit, service, Security Center registration, self-installing executable, and the Linux edition).
+
+- **v1.2.3** — the fixes from the fleet-wide bug-and-security audit of 2026-10-19; no new features, the same product made harder to fool and harder to break. On Linux, a system file now earns trust by its actual contents — a file replaced in place at a trusted path no longer inherits trust it hasn't earned. Folders can no longer silently go unwatched when the system's inotify watch limit is reached — the watcher falls back to a full check and logs it openly. A restore interrupted by a crash or power loss can no longer lock a vault entry forever. Installing a `.deb` upgrade now restarts the protection service, so the new version is the one protecting the machine immediately. The verified channel also caps concurrent sessions, and the Linux service unit gained `NoNewPrivileges`.
+- **v1.2.2** — a build fix only: it repaired a wrong file path in the Linux packaging step that left the v1.2.1 release incomplete (its Linux package and checksums never attached). The product was unchanged.
+- **v1.2.0** — the Linux edition: `Argus.deb` for Kali, Parrot, Debian, and Ubuntu, with the systemd service, the SO_PEERCRED-verified socket channel, inotify watching, dpkg-based system-file trust, and content-bound self-trust — the Windows design translated, with zero behaviour changes on Windows.
+- **v1.1.0** — one self-installing `Argus.exe` (the separate installer and service executable retired), self-recognition and Windows system-file recognition by proven identity, machine data under `C:\ProgramData\Argus` with the trust split, and caller-verified privileged actions over the named pipe.
+
+**Verification status — stated plainly.** The Linux edition is verified on the project's Linux build VM and in CI: the full test suite, the packaged `--self-check` / `--self-check-qt`, a live daemon run, and a real `dpkg` install with the service running under systemd. The first run on physical Kali / Parrot hardware — and the Windows edition's equivalent on-hardware checklist, including Security Center registration on a real machine (the aroura install) — is still pending and is tracked as such in `docs/ROADMAP.md`. Nothing here claims field verification that hasn't happened.
+
+**Known limits, not hidden:**
+
+- Both watchers poll (Linux: inotify-fed, with polling debounce). A file created, executed, and deleted entirely inside one poll interval can complete its run before Argus sees it. Shortening the interval only narrows that window; the real fix is a filesystem minifilter driver, which is in the roadmap backlog below. Argus's copy never claims otherwise.
+- The process monitor scans a program *as* it starts. True pre-execution blocking and kernel tamper protection need Microsoft's driver-signing programmes and are future work, not current features.
+- The vault's encryption exists to neutralise threats, not to store secrets.
+- Signature auto-updates are not shipped: they are deferred until a signed update-feed design (where updates live, how they are signed and verified) exists. The signature database is local today.
+
+**Roadmap** (from `docs/ROADMAP.md` — planned, not shipped): a filesystem minifilter driver; fuzzy hashing (ssdeep / TLSH-style) to catch variants of known malware; archive scanning with zip-bomb limits; document and macro scanning; scheduled scans and quick / full / custom scan modes; removable-media auto-scan; and community signature feeds (for example MalwareBazaar) imported under the same integrity checks as local builds. Full Authenticode verification on Windows shipped in the v1.1.0 fix rounds — on Windows, system-file trust now requires Windows itself to vouch for the signature via WinVerifyTrust, failing closed.
+
+Development history, in one line per phase: Phase 1, detection engine (v0.2.0); Phase 2, heuristics and risk scoring (v0.3.0); Phase 3, real-time protection (v0.4.0); Phase 4, quarantine, actions, and reporting (v0.5.0); Phase 5, the product — GUI, Dev Toolkit, service, registration, and installation.
 
 ## The family
 
@@ -101,7 +243,12 @@ Argus is a Sentinel Safeguard product, alongside **Hellhound.exe** (malware educ
 
 ## License
 
-Argus is proprietary software of Sentinel Safeguard LLC — see [LICENSE](LICENSE). All rights reserved; no copying, redistribution, resale, or derivative works without prior written permission from Sentinel Safeguard LLC.
+Argus is proprietary software of Sentinel Safeguard LLC — see [LICENSE](LICENSE). Copyright © 2026 Sentinel Safeguard LLC. All rights reserved; no copying, redistribution, resale, republication, or derivative works without prior written permission from Sentinel Safeguard LLC. The software is provided "as is", without warranty of any kind.
+
+## Contact
+
+**Sentinel Safeguard LLC** — Kansas City, MO · *Security For Everyone.*
+Business contact details are published on Sentinel Safeguard's public homepage and business listings.
 
 ---
 
