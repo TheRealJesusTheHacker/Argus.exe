@@ -114,6 +114,11 @@ class _Inotify:
             )
         self.fd = fd
         self._wd_dirs: dict[int, Path] = {}
+        #: errno of the most recent add_watch failure (None after
+        #: a success) — callers distinguish "the folder vanished
+        #: mid-walk" (a race) from "the kernel watch limit is
+        #: exhausted" (a coverage gap that must change strategy).
+        self.last_add_error: int | None = None
 
     def add_watch(self, directory: Path) -> int | None:
         """Watch one directory; None (logged) when it cannot be
@@ -124,10 +129,12 @@ class _Inotify:
         )
         if wd < 0:
             err = ctypes.get_errno()
+            self.last_add_error = err
             log.warning(
                 "inotify cannot watch %s: %s", directory, os.strerror(err)
             )
             return None
+        self.last_add_error = None
         self._wd_dirs[wd] = directory
         return wd
 
@@ -198,6 +205,12 @@ class InotifyDirectoryWatcher(DirectoryWatcher):
         self._inotify: _Inotify | None = None
         self._inotify_failed = False
         self._watches_ready = False
+        #: True when the kernel refused a watch for lack of watch
+        #: descriptors (ENOSPC — max_user_watches exhausted):
+        #: folders past that point report NO events, so the
+        #: incremental cache can never be trusted for them and
+        #: every snapshot falls back to a full walk (hunt #2).
+        self._watches_incomplete = False
         self._cache: dict[Path, Signature] = {}
         self._cache_primed = False
         self._structure_dirty = True
@@ -246,6 +259,23 @@ class InotifyDirectoryWatcher(DirectoryWatcher):
         while stack:
             current = stack.pop()
             if inotify.add_watch(current) is None:
+                if (
+                    getattr(inotify, "last_add_error", None)
+                    == errno.ENOSPC
+                    and not self._watches_incomplete
+                ):
+                    # The watch limit is exhausted: this subtree
+                    # (and any like it) will never produce events.
+                    # Snapshots must full-walk from now on — the
+                    # polling cost, honestly paid, instead of a
+                    # silent detection blind spot.
+                    self._watches_incomplete = True
+                    log.warning(
+                        "inotify watch limit reached — some watched "
+                        "folders cannot be event-watched, so this "
+                        "watcher re-walks them in full on every "
+                        "poll (same detection, polling cost)"
+                    )
                 continue
             try:
                 entries = list(os.scandir(current))
@@ -343,6 +373,18 @@ class InotifyDirectoryWatcher(DirectoryWatcher):
         if self._get_inotify() is None:
             return super().snapshot()
         self.drain_events(timeout=0.0)
+        if self._watches_incomplete:
+            # Some folders could not be watched (descriptor
+            # limit): their contents can change without a single
+            # event arriving, so the incremental cache is not
+            # evidence about them. Full walk, every poll — the
+            # parent's polling behaviour for exactly the folders
+            # events cannot cover (hunt #2).
+            self._cache = super().snapshot()
+            self._cache_primed = True
+            self._structure_dirty = False
+            self._dirty_paths.clear()
+            return dict(self._cache)
         if self._structure_dirty or not self._cache_primed:
             self._cache = super().snapshot()
             self._cache_primed = True
@@ -407,9 +449,21 @@ class InotifyDirectoryWatcher(DirectoryWatcher):
                 # stability is still proven across polls, never
                 # assumed from a single event.
                 self.drain_events(timeout=self.poll_interval)
+                if self._inotify_failed:
+                    # inotify never became available on this
+                    # machine: drain_events could not wait on a
+                    # kernel queue that does not exist, so the
+                    # cadence must be kept explicitly — without
+                    # this wait the fallback loop spins at full
+                    # CPU, re-walking the folders continuously
+                    # (hunt #2).
+                    stop_event.wait(self.poll_interval)
                 self.poll_once()
             except Exception:  # the watch must survive any bad cycle
                 log.exception("inotify watcher cycle failed; continuing")
+                # A cycle that fails instantly (e.g. the inotify
+                # fd died) must not become a busy error loop.
+                stop_event.wait(0.1)
             # poll_once already consumed the elapsed interval via
             # the event wait; no additional blind sleep.
         if self._inotify is not None:
