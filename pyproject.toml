@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "argus-exe"
-version = "1.2.4"
+version = "1.2.5"
 description = "ARGUS.EXE — antivirus & malware detection by Sentinel Safeguard LLC. All eyes. All detection."
 readme = "README.md"
 requires-python = ">=3.11"
