@@ -101,7 +101,8 @@ CREATE TABLE IF NOT EXISTS entries (
     restored_path  TEXT,
     note           TEXT,
     mode           INTEGER,
-    row_mac        TEXT
+    row_mac        TEXT,
+    claimed_at     TEXT
 );
 """
 
@@ -192,14 +193,28 @@ def _load_or_create_key(vault_dir: Path) -> bytes:
     """Read the vault key, creating it (0600 where supported) if absent."""
     key_path = vault_dir / KEY_FILENAME
     if key_path.is_file():
-        key = key_path.read_bytes()
-        if len(key) != KEY_SIZE:
-            raise QuarantineError(
-                f"vault key file {key_path} is damaged (expected {KEY_SIZE} "
-                f"bytes, found {len(key)}). Vault contents cannot be read "
-                "without the original key."
-            )
-        return key
+        # A key being created by ANOTHER Argus process right now
+        # exists before its bytes land (the creator's O_EXCL open
+        # precedes its write): a reader arriving in that window
+        # sees a short file and must not mistake a birth for
+        # damage. Wait briefly for the write to land; a key that
+        # is STILL the wrong size after the wait is genuinely
+        # damaged and errors exactly as before (hunt #2).
+        deadline = time.monotonic() + 2.5
+        while True:
+            try:
+                key = key_path.read_bytes()
+            except FileNotFoundError:
+                break  # vanished mid-race — fall through to creation
+            if len(key) == KEY_SIZE:
+                return key
+            if time.monotonic() >= deadline:
+                raise QuarantineError(
+                    f"vault key file {key_path} is damaged (expected "
+                    f"{KEY_SIZE} bytes, found {len(key)}). Vault "
+                    "contents cannot be read without the original key."
+                )
+            time.sleep(0.05)
     key = os.urandom(KEY_SIZE)
     try:
         # O_BINARY matters on Windows: without it the fd is text-mode and
@@ -582,6 +597,8 @@ class Vault:
                 conn.execute("ALTER TABLE entries ADD COLUMN mode INTEGER")
             if "row_mac" not in columns:
                 conn.execute("ALTER TABLE entries ADD COLUMN row_mac TEXT")
+            if "claimed_at" not in columns:
+                conn.execute("ALTER TABLE entries ADD COLUMN claimed_at TEXT")
             pending_conn.executescript(_PENDING_SCHEMA)
             conn.commit()
             pending_conn.commit()
@@ -597,6 +614,7 @@ class Vault:
             ) from exc
         vault = cls(root, key, conn, pending_conn, pending_path)
         vault._adopt_legacy_entry_macs()
+        vault._recover_stale_restore_claims()
         cutoff = time.time() - STALE_TEMP_AGE_SECONDS
         for stale in blobs.glob("*.tmp"):
             try:
@@ -640,6 +658,77 @@ class Vault:
             )
         conn.execute("DROP TABLE pending_actions")
         conn.commit()
+
+    def _recover_stale_restore_claims(self) -> None:
+        """Return entries stuck in ``restoring`` to ``quarantined``
+        when their restore claim is provably stale (hunt #2).
+
+        A restore claims its entry (status ``restoring`` +
+        ``claimed_at``) so exactly one restore proceeds. If the
+        claiming process dies mid-restore — crash, power loss —
+        nothing ever releases the claim, and the entry used to be
+        bricked: neither restorable nor deletable, forever. A
+        claim older than :data:`STALE_TEMP_AGE_SECONDS` (the same
+        staleness horizon as the temp-file sweep) cannot belong
+        to a restore still running — restores are single-file
+        decrypt-and-publish operations — so at open it is
+        released. A FRESH claim is left untouched: another live
+        Argus process may be mid-restore with this very vault.
+        Rows with no timestamp predate the claim clock (a crash
+        under an older build) and are definitionally stale.
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=STALE_TEMP_AGE_SECONDS
+        )
+        try:
+            stuck = [
+                entry
+                for entry in self.list_entries()
+                if entry.status == "restoring"
+            ]
+        except Exception:
+            return
+        for entry in stuck:
+            claimed_at = None
+            try:
+                with self._lock:
+                    row = self._conn.execute(
+                        "SELECT claimed_at FROM entries WHERE id = ?",
+                        (entry.id,),
+                    ).fetchone()
+                if row is not None:
+                    claimed_at = row[0]
+            except sqlite3.Error:
+                return
+            stale = True
+            if claimed_at:
+                try:
+                    stamp = datetime.fromisoformat(str(claimed_at))
+                    if stamp.tzinfo is None:
+                        stamp = stamp.replace(tzinfo=timezone.utc)
+                    stale = stamp <= cutoff
+                except ValueError:
+                    stale = True
+            if not stale:
+                continue
+            try:
+                self._update_entry(
+                    entry.id, status="quarantined", claimed_at=None
+                )
+                log.warning(
+                    "vault entry %s was left mid-restore by a "
+                    "process that never finished; its claim was "
+                    "released and it can be acted on again",
+                    entry.id,
+                )
+            except QuarantineError:
+                log.warning(
+                    "could not release the stale restore claim on "
+                    "vault entry %s",
+                    entry.id,
+                )
 
     def _sweep_stale_restore_staging(self, cutoff: float) -> None:
         """Remove abandoned restore staging files
@@ -990,7 +1079,9 @@ class Vault:
             try:
                 current = self.get_entry(entry.id)
                 if current is not None and current.status == "restoring":
-                    self._update_entry(entry.id, status="quarantined")
+                    self._update_entry(
+                        entry.id, status="quarantined", claimed_at=None
+                    )
             except QuarantineError:
                 pass
             raise
@@ -999,9 +1090,10 @@ class Vault:
         with self._lock:
             try:
                 cur = self._conn.execute(
-                    "UPDATE entries SET status = 'restoring'"
+                    "UPDATE entries SET status = 'restoring',"
+                    " claimed_at = ?"
                     " WHERE id = ? AND status = 'quarantined'",
-                    (entry_id,),
+                    (_utcnow_iso(), entry_id),
                 )
                 self._conn.commit()
             except sqlite3.Error as exc:
@@ -1071,6 +1163,7 @@ class Vault:
                 resolved_at=_utcnow_iso(),
                 restored_path=str(destination),
                 blob_name=None,
+                claimed_at=None,
             )
         except QuarantineError as exc:
             note = (
