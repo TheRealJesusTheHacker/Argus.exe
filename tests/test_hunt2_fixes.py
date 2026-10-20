@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import os
 import json
 import shutil
 import socket
@@ -277,6 +278,57 @@ def test_damaged_key_still_raises(tmp_path):
     (vault_dir / "vault.key").write_bytes(b"too short")
     with pytest.raises(QuarantineError):
         _load_or_create_key(vault_dir)
+
+
+def test_vault_key_write_survives_short_writes_and_rejects_no_progress(
+    tmp_path, monkeypatch
+):
+    """A short os.write must not persist a truncated vault key.
+
+    os.write may legally write fewer bytes than requested; the key
+    creation must loop until the whole key lands, and a writer that
+    makes no progress must raise instead of silently succeeding.
+    """
+    from argus.quarantine import KEY_SIZE
+
+    real_open = os.open
+    real_write = os.write
+    opened = {}
+
+    def tracking_open(path, flags, mode=0o777, *args, **kwargs):
+        fd = real_open(path, flags, mode, *args, **kwargs)
+        if str(path).endswith("vault.key"):
+            opened["fd"] = fd
+        return fd
+
+    monkeypatch.setattr(os, "open", tracking_open)
+
+    # Partial writer: only 5 bytes land per call.
+    def partial_write(fd, data):
+        if fd == opened.get("fd"):
+            return real_write(fd, data[:5])
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", partial_write)
+    vault_dir = tmp_path / "vault-partial"
+    vault_dir.mkdir()
+    key = _load_or_create_key(vault_dir)
+    persisted = (vault_dir / "vault.key").read_bytes()
+    assert len(persisted) == KEY_SIZE
+    assert persisted == key
+    assert _load_or_create_key(vault_dir) == key
+
+    # No-progress writer: returns 0 — must raise, not loop or succeed.
+    def zero_write(fd, data):
+        if fd == opened.get("fd"):
+            return 0
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", zero_write)
+    vault_dir2 = tmp_path / "vault-no-progress"
+    vault_dir2.mkdir()
+    with pytest.raises((OSError, QuarantineError)):
+        _load_or_create_key(vault_dir2)
 
 
 # ======================================================================

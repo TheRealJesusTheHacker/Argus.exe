@@ -228,7 +228,20 @@ def _load_or_create_key(vault_dir: Path) -> bytes:
     except FileExistsError:  # lost a creation race — read the winner's key
         return _load_or_create_key(vault_dir)
     try:
-        os.write(fd, key)
+        # Write-all: os.write may legally write fewer bytes than
+        # requested, and a short write would persist a truncated key
+        # that the loader later reports as "damaged", stranding the
+        # vault. Loop over a memoryview until the whole key lands,
+        # and raise if a write makes no progress.
+        view = memoryview(key)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(
+                    f"could not write the vault key file {key_path}: "
+                    f"os.write returned {written}"
+                )
+            view = view[written:]
         os.fsync(fd)
     finally:
         os.close(fd)
