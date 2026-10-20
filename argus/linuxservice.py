@@ -119,6 +119,18 @@ def render_unit() -> str:
     same one Windows setup verifies after SCM start.
     RuntimeDirectory gives the service its root-owned /run/argus
     (the verified-action socket's home), recreated on every start.
+
+    Hardening is deliberately narrow (hunt #2): the service runs
+    as root because its job is watching, scanning, quarantining
+    and restoring files across the WHOLE filesystem — user homes,
+    /tmp restore destinations, system trees — so the usual
+    sandbox directives (ProtectSystem, ProtectHome, PrivateTmp,
+    PrivateDevices) would break protection itself, and are NOT
+    used. ``NoNewPrivileges`` costs the product nothing (nothing
+    it launches relies on setuid/setgid elevation — its helpers
+    run as the service's own root) and keeps any helper it spawns
+    from gaining privileges the service did not already hold, so
+    it is set.
     """
     exe = canonical_exe_path()
     return (
@@ -137,6 +149,7 @@ def render_unit() -> str:
         "RuntimeDirectory=argus\n"
         "RuntimeDirectoryMode=0755\n"
         "UMask=0022\n"
+        "NoNewPrivileges=true\n"
         "\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n"
