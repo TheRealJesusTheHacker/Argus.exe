@@ -209,7 +209,7 @@ python -m pytest            # the full suite
 The suite's size depends on whether the GUI layer is importable, because the GUI tests skip themselves when PySide6 is absent. Verified on a fresh checkout of v1.2.5:
 
 - **System Python (no Qt): 721 passed, 28 skipped** — `python -m pytest -q` with the standard-library engine only; the skips are the Qt-dependent tests.
-- **Windows CI (pre-tag gate): the v1.2.4 field-fix tests (35) run green on `windows-latest`** — the affected suites (self-test, self-trust, sibling trust, scoring calibration) exercised on real Windows before the tag was cut.
+- **Windows CI (release gate): the full suite ran green on `windows-latest` in the v1.2.5 release build (run `39439711040`)** — the same run that built the shipped assets; its test step covers the v1.2.5 correction tests (the six measured bundle profiles, the rebuilt one-file-packaging fixture, the calibration safety invariants) alongside the v1.2.4 field-fix tests (35) and everything else.
 - **GUI environment (PySide6 venv, `QT_QPA_PLATFORM=offscreen`): 709 passed, 1 skipped** — verified at v1.2.3; the same suite with the GUI layer present, including the GUI smoke, theme, and setup tests.
 
 State a count only if you have just run the suite and seen the summary line — the numbers above are the ones from the runs quoted, not a target.
