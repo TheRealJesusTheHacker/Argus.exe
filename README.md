@@ -33,7 +33,7 @@ The Linux edition is the same product translated to its platform, not a port of 
 
 | | |
 |---|---|
-| **Current release** | v1.2.3 — see [Status](#status) and the [release page](https://github.com/TheRealJesusTheHacker/Argus.exe/releases/latest) |
+| **Current release** | v1.2.4 — see [Status](#status) and the [release page](https://github.com/TheRealJesusTheHacker/Argus.exe/releases/latest) |
 | **Release assets** | `Argus.exe`, `ArgusPortable.zip`, `Argus.deb`, `SHA256SUMS.txt` (one checksum file covering all three downloads) |
 | **Requirements (source)** | Python 3.11 or newer; the engine core is pure Python standard library |
 | **Optional layers** | PySide6 for the GUI; pywin32 for the Windows service and Security Center registration (Windows only) |
@@ -148,7 +148,7 @@ The CLI entry point is `argus` (or `python -m argus` from source):
 | `argus quarantine restore` / `delete` / `allow` | Put a quarantined file back, permanently delete it, or restore it and vouch for it (adds an exclusion). |
 | `argus pending …` | Review and decide actions waiting in the pending-actions queue. |
 | `argus report` / `argus history` | Plain-language report of Argus activity and recent scans / detections (JSON export available). |
-| `argus --version` | Print the version (`1.2.3`). |
+| `argus --version` | Print the version (`1.2.4`). |
 
 ## How it works
 
@@ -206,10 +206,11 @@ pip install ".[gui]"        # add the "windows" extra on Windows
 python -m pytest            # the full suite
 ```
 
-The suite's size depends on whether the GUI layer is importable, because the GUI tests skip themselves when PySide6 is absent. Verified on a fresh checkout of v1.2.3 (commit `70e019d`):
+The suite's size depends on whether the GUI layer is importable, because the GUI tests skip themselves when PySide6 is absent. Verified on a fresh checkout of v1.2.4:
 
-- **System Python (no Qt): 657 passed, 28 skipped** — `python -m pytest -q` with the standard-library engine only; the skips are the Qt-dependent tests.
-- **GUI environment (PySide6 venv, `QT_QPA_PLATFORM=offscreen`): 709 passed, 1 skipped** — the same suite with the GUI layer present, including the GUI smoke, theme, and setup tests.
+- **System Python (no Qt): 693 passed, 28 skipped** — `python -m pytest -q` with the standard-library engine only; the skips are the Qt-dependent tests.
+- **Windows CI (pre-tag gate): the v1.2.4 field-fix tests (35) run green on `windows-latest`** — the affected suites (self-test, self-trust, sibling trust, scoring calibration) exercised on real Windows before the tag was cut.
+- **GUI environment (PySide6 venv, `QT_QPA_PLATFORM=offscreen`): 709 passed, 1 skipped** — verified at v1.2.3; the same suite with the GUI layer present, including the GUI smoke, theme, and setup tests.
 
 State a count only if you have just run the suite and seen the summary line — the numbers above are the ones from the runs quoted, not a target.
 
@@ -217,8 +218,9 @@ Releases are built by the `build-release` GitHub Actions workflow (`.github/work
 
 ## Status
 
-**Current version: 1.2.3** (`argus/__init__.py` and `pyproject.toml` agree). All five development phases in `docs/ROADMAP.md` are complete: detection engine, heuristics, real-time protection, quarantine / actions / reporting, and the product phase (premium GUI, Dev Toolkit, service, Security Center registration, self-installing executable, and the Linux edition).
+**Current version: 1.2.4** (`argus/__init__.py` and `pyproject.toml` agree). All five development phases in `docs/ROADMAP.md` are complete: detection engine, heuristics, real-time protection, quarantine / actions / reporting, and the product phase (premium GUI, Dev Toolkit, service, Security Center registration, self-installing executable, and the Linux edition).
 
+- **v1.2.4** — the field fixes from the first real-machine run of the Technician's Toolkit bundle (2026-10-20), found by the owner on real Windows and fixed the same day. (1) A file Argus cannot read is never waved through as Clean again: when another program — most often the computer's other antivirus software — keeps Argus from reading a file, the scan now says plainly that the file could not be checked, and the first-run self-test answers honestly ("another program kept Argus from reading the test file; Argus cannot prove detection either way") with one automatic retry, instead of reporting a failure of Argus itself. (2) Argus now recognises its own verified family: inside the bundle, a Sentinel tool whose fingerprint matches the bundle's own checksum record is verified family — its program traits stay listed but are not scored against it — while a changed fingerprint on a tool's place is treated as tampering and scanned in full. A file's name still earns nothing. (3) Argus no longer flags itself in portable mode: the "this is the very program that is running" proof now applies wherever the portable program actually lives, not only at the installed address. (4) Scoring calibration: the packaging traits every PyInstaller-built program carries (the loader's import combination, debugger-detection imports, packer section names) corroborate but can no longer convict a file on their own — any real behaviour signal restores full scoring, and the detection corpus (EICAR, the pattern rules, the packed-injector profile, the critical combinations) is unchanged at full strength. One confirmation remains on real hardware, by design: after updating, re-run the first-run wizard's "Prove it works" self-test — it should pass, and Argus running beside the bundle should not flag any tool in its own kit.
 - **v1.2.3** — the fixes from the fleet-wide bug-and-security audit of 2026-10-19; no new features, the same product made harder to fool and harder to break. On Linux, a system file now earns trust by its actual contents — a file replaced in place at a trusted path no longer inherits trust it hasn't earned. Folders can no longer silently go unwatched when the system's inotify watch limit is reached — the watcher falls back to a full check and logs it openly. A restore interrupted by a crash or power loss can no longer lock a vault entry forever. Installing a `.deb` upgrade now restarts the protection service, so the new version is the one protecting the machine immediately. The verified channel also caps concurrent sessions, and the Linux service unit gained `NoNewPrivileges`.
 - **v1.2.2** — a build fix only: it repaired a wrong file path in the Linux packaging step that left the v1.2.1 release incomplete (its Linux package and checksums never attached). The product was unchanged.
 - **v1.2.0** — the Linux edition: `Argus.deb` for Kali, Parrot, Debian, and Ubuntu, with the systemd service, the SO_PEERCRED-verified socket channel, inotify watching, dpkg-based system-file trust, and content-bound self-trust — the Windows design translated, with zero behaviour changes on Windows.
