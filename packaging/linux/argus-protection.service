@@ -13,6 +13,7 @@ Environment=ARGUS_DATA_DIR=/var/lib/argus
 RuntimeDirectory=argus
 RuntimeDirectoryMode=0755
 UMask=0022
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
