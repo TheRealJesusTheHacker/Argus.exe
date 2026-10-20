@@ -53,16 +53,22 @@ case "$1" in
             mv "$TMP_IDENTITY" "$DATA_DIR/self-identity.json"
         fi
 
-        # Enable the protection service at boot, and start it
-        # now when systemd is actually running this machine
+        # Enable the protection service at boot, and (re)start
+        # it now when systemd is actually running this machine
         # (in a chroot/container install there is no live
         # systemd to talk to — enabling still applies, and the
-        # service starts at the first real boot).
+        # service starts at the first real boot). RESTART, not
+        # start: on upgrade prerm deliberately leaves the service
+        # running, and a plain `systemctl start` of a running
+        # unit is a no-op — the old binary would keep serving
+        # indefinitely while the identity record above already
+        # names the new one (hunt #2). On first install restart
+        # simply starts the stopped unit.
         if command -v systemctl >/dev/null 2>&1; then
             systemctl enable "$UNIT"
             if [ -d /run/systemd/system ]; then
                 systemctl daemon-reload || true
-                systemctl start "$UNIT" || \
+                systemctl restart "$UNIT" || \
                     echo "argus: the protection service did not start;" \
                          "check 'systemctl status $UNIT'." >&2
             fi
