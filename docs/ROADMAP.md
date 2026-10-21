@@ -92,9 +92,10 @@ Everything Argus ships is judged against four pillars:
   machine Argus is meant to stay lightweight on. This is an
   inherent limit of the polling design, not a bug being tracked:
   it is accepted for the current product, and Argus's copy must
-  never claim otherwise. The real fix is a **filesystem minifilter
-  driver** (below), which receives file and process events from
-  the kernel as they happen — no interval, no window.
+  never claim otherwise. A filesystem minifilter driver would
+  receive file and process events from the kernel as they happen
+  — no interval, no window — but see the decision below: it is
+  not being built, and this polling posture is permanent.
 - [x] Download/execute interception points — the watched folders are
       exactly the landing zones (Downloads, Desktop, Documents, temp);
       launches are intercepted by the process monitor above.
@@ -128,15 +129,11 @@ Everything Argus ships is judged against four pillars:
 Depth Argus grows into after the core product ships — pillar 1
 (maximum detection power) made concrete:
 
-- [ ] **Filesystem minifilter driver** — the real fix for the
-      hit-and-run window documented in Phase 3 (a file created,
-      executed, and deleted inside one poll interval is invisible
-      to any polling watcher). A signed minifilter receives
-      create/execute callbacks from the kernel synchronously, so
-      nothing runs unscanned and nothing vanishes unseen. Needs
-      Microsoft's driver signing/attestation pipeline and a
-      kernel-code maintenance commitment — scheduled as its own
-      program of work, not a patch.
+- [ ] **Filesystem minifilter driver** — **CLOSED 2026-10-21,
+      decided not to build (B-2).** Reason: kernel code +
+      Microsoft attestation is a company-level commitment, not
+      backlog; the documented polling posture (P1-23) is
+      permanent.
 
 - [ ] **Fuzzy hashing** (ssdeep/TLSH-style) — catch *variants* of
       known malware, not just byte-identical copies
