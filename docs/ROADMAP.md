@@ -135,19 +135,35 @@ Depth Argus grows into after the core product ships — pillar 1
       backlog; the documented polling posture (P1-23) is
       permanent.
 
+**Decision 2026-10-21 (B-3) — decided build order:** scan modes
+first, archive scanning second — spec'd and scheduled as their
+own audited phases, NOT started in this wave; nothing in this
+bundle is built. Community signature feeds are CLOSED (with
+B-1). Fuzzy hashing, document/macro scanning, and
+removable-media auto-scan remain named roadmap backlog (not
+closed, not started).
+
 - [ ] **Fuzzy hashing** (ssdeep/TLSH-style) — catch *variants* of
-      known malware, not just byte-identical copies
+      known malware, not just byte-identical copies. Backlog
+      retained 2026-10-21 (B-3) — not closed, not started.
 - [ ] **Archive scanning** — threats arrive zipped: look inside
-      .zip (and kin) during scans, with zip-bomb limits
+      .zip (and kin) during scans, with zip-bomb limits.
+      **Decided build order #2 (2026-10-21, B-3)** — spec'd and
+      scheduled as its own audited phase; not started.
 - [ ] **Document & macro scanning** — Office/PDF carriers, macro
-      droppers, embedded-object inspection
+      droppers, embedded-object inspection. Backlog retained
+      2026-10-21 (B-3) — not closed, not started.
 - [ ] **Scan modes** — scheduled scans plus quick / full / custom
-      modes for on-demand runs
+      modes for on-demand runs. **Decided build order #1
+      (2026-10-21, B-3)** — spec'd and scheduled as its own
+      audited phase; not started.
 - [ ] **Removable-media auto-scan** — USB drives and cards scanned
-      on insertion
-- [ ] **Community signature feeds** — import public hash feeds
-      (e.g. abuse.ch MalwareBazaar) into the signature DB builder,
-      with the same integrity checks as local builds
+      on insertion. Backlog retained 2026-10-21 (B-3) — not
+      closed, not started.
+- [ ] **Community signature feeds** — **CLOSED 2026-10-21
+      (B-3, with B-1).** Reason: signature updates ride
+      releases; importing public hash feeds depends on the
+      signed-feed trust root closed in B-1.
 - [x] **Full Authenticode verification (Windows-live)** — chain-of-
       trust + signed digest verification for the system-file
       recognition, via the operating system's own WinVerifyTrust
