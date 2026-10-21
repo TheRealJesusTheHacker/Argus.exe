@@ -39,6 +39,7 @@ a = Analysis(
         "argus.socket_channel",
         "argus.platform_dpkg",
         "argus.inotify_watcher",
+        "argus.cli",
     ],
     hookspath=[],
     hooksconfig={},

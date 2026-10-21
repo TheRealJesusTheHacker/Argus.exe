@@ -34,12 +34,12 @@ ROOT = Path(SPECPATH).parent
 
 # Windows version resource for the exe: File Explorer, the task
 # manager, and SmartScreen all read THIS — an exe with no version
-# info looks anonymous. Version 1.2.6 matches argus.__version__
+# info looks anonymous. Version 1.2.7 matches argus.__version__
 # (the release workflow's tag check keeps them from drifting).
 version_info = VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(1, 2, 6, 0),
-        prodvers=(1, 2, 6, 0),
+        filevers=(1, 2, 7, 0),
+        prodvers=(1, 2, 7, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -60,7 +60,7 @@ version_info = VSVersionInfo(
                             "FileDescription",
                             "ARGUS.EXE — antivirus & malware detector",
                         ),
-                        StringStruct("FileVersion", "1.2.6.0"),
+                        StringStruct("FileVersion", "1.2.7.0"),
                         StringStruct("InternalName", "Argus"),
                         StringStruct(
                             "LegalCopyright",
@@ -68,7 +68,7 @@ version_info = VSVersionInfo(
                         ),
                         StringStruct("OriginalFilename", "Argus.exe"),
                         StringStruct("ProductName", "ARGUS.EXE"),
-                        StringStruct("ProductVersion", "1.2.6"),
+                        StringStruct("ProductVersion", "1.2.7"),
                     ],
                 )
             ]
@@ -90,6 +90,7 @@ a = Analysis(
         "win32com",
         "win32com.client",
         "servicemanager",
+        "argus.cli",
         "pywintypes",
     ],
     hookspath=[],

@@ -262,6 +262,7 @@ Depth Argus grows into after the core product ships — pillar 1
       recognizes Argus as the system's antivirus provider
       (`argus/winregister.py`, mock-tested; exact productState
       semantics to be confirmed on a real machine)
+- [x] **Packaged-executable scan entry (v1.2.7)** — `Argus.exe scan <path>` / `--scan` runs a real headless scan through the CLI engine (`argus.entry` routes to `argus.cli`), so the frozen build can demonstrate a scan (of itself, its kit, or anything else) with the scan's own exit codes. Before v1.2.7 the packaged executable had no scan entry point at all.
 - [ ] Signature auto-updates running as a service task — deferred:
       needs a signed update-feed design (where updates live, how
       they are signed and verified) before it can be built honestly.

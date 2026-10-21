@@ -27,6 +27,14 @@ decides what it does:
   with a plain message. The pipeline runs it next to
   ``--self-check`` so a build whose GUI would die on launch fails
   in CI, not on a user's machine.
+- ``scan`` (or ``--scan``) as the first word → a real headless
+  scan through the same command-line engine ``python -m argus``
+  uses (:func:`argus.cli.main` with the ``scan`` subcommand):
+  the packaged executable can scan a file or folder from a
+  terminal or a script and reports the scan's own exit code
+  (0 clean, 1 detections, 2 error). Added in v1.2.7 — before
+  that, the packaged executable had no scan entry point at all,
+  so a frozen build could never demonstrate a scan of itself.
 - a management word (``install`` / ``start`` / ``stop`` /
   ``status`` / ``register`` / …) → the service support commands.
   Plumbing for the GUI's own helpers and for support — never a
@@ -79,6 +87,7 @@ SELF_CHECK_MODULES = (
     "argus.service",
     "argus.pipe_channel",
     "argus.platform_authenticode",
+    "argus.cli",
     "argus.gui.backend",
     "argus.gui.setup_app",
     "argus.gui.app",
@@ -106,6 +115,7 @@ SELF_CHECK_MODULES_LINUX = (
     "argus.setup_engine",
     "argus.service",
     "argus.pipe_channel",
+    "argus.cli",
     "argus.gui.backend",
     "argus.gui.setup_app",
     "argus.gui.app",
@@ -266,7 +276,8 @@ def route_invocation(argv: list[str]) -> str:
 
     Returns one of: ``"service"`` (host for the SCM), ``"setup"``,
     ``"uninstall"``, ``"manage"`` (support commands),
-    ``"self-check"``, ``"self-check-qt"``, ``"gui"``.
+    ``"self-check"``, ``"self-check-qt"``, ``"scan"`` (headless
+    scan through the CLI engine), ``"gui"``.
     """
     args = [str(a) for a in argv]
     if SERVICE_EXE_ARGS in args:
@@ -279,9 +290,62 @@ def route_invocation(argv: list[str]) -> str:
         return "self-check-qt"
     if "--self-check" in args:
         return "self-check"
+    if args and args[0].lower() in ("scan", "--scan"):
+        return "scan"
     if args and args[0].lower() in _MANAGEMENT_WORDS:
         return "manage"
     return "gui"
+
+
+def _attach_parent_console() -> None:
+    """Give a frozen Windows scan a real console to print to.
+
+    The Windows build is a windowed (no-console) executable, so a
+    scan launched from a terminal would otherwise have nowhere
+    for its results to go — the exit code would arrive but the
+    report would not. When this process is frozen on Windows and
+    has no usable standard streams, attach to the parent process's
+    console and reopen stdout/stderr onto it. Everywhere else
+    (source runs, the Linux build — which is a console build —
+    and any process that already has streams) this is a no-op.
+    Best-effort: a failure leaves the streams as they are and the
+    scan still runs and still returns its exit code.
+    """
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        import ctypes
+        import io
+
+        # ATTACH_PARENT_PROCESS = -1
+        ctypes.windll.kernel32.AttachConsole(-1)
+        if sys.stdout is None:
+            sys.stdout = io.TextIOWrapper(
+                open("CONOUT$", "wb"), encoding="utf-8", errors="replace"
+            )
+        if sys.stderr is None:
+            sys.stderr = io.TextIOWrapper(
+                open("CONOUT$", "wb"), encoding="utf-8", errors="replace"
+            )
+    except Exception:
+        pass
+
+
+def run_scan(args: list[str]) -> int:
+    """Run one headless scan through the real CLI engine.
+
+    *args* are the words after ``scan``/``--scan`` — a target path
+    plus any of the scan subcommand's own options (``--json``,
+    ``--db``, ``--quarantine``, …). This is the identical code
+    path ``python -m argus scan`` runs: same engine, same exit
+    codes (0 clean, 1 detections found, 2 error).
+    """
+    _attach_parent_console()
+    from .cli import main as cli_main
+
+    return cli_main(["scan", *args])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -332,6 +396,9 @@ def main(argv: list[str] | None = None) -> int:
             # platform (that is the seam the test suite pins).
             return run_self_check(modules=SELF_CHECK_MODULES_LINUX)
         return run_self_check()
+
+    if route == "scan":
+        return run_scan(args[1:])
 
     if route == "manage":
         words = args[1:] if args and args[0].lower() == "service" else args
