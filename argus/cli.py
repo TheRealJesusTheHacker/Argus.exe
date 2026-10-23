@@ -163,9 +163,19 @@ def _print_human(report: ScanReport) -> None:
 
 
 def _report_to_dict(report: ScanReport) -> dict:
+    verdict = report.verdict
+    if verdict is Verdict.CLEAN and any(
+        f.archive_not_fully_scanned for f in report.files
+    ):
+        # ScanReport.verdict ranks NotScanned level with Clean (a
+        # locked file has never raised the report verdict), but an
+        # archive Argus could not fully check must not be reported
+        # as a clean scan on the machine-readable surface either —
+        # the same rule the human output and the exit code follow.
+        verdict = Verdict.NOT_SCANNED
     return {
         "root": str(report.root),
-        "verdict": report.verdict.value,
+        "verdict": verdict.value,
         "stats": {
             "files_seen": report.stats.files_seen,
             "files_scanned": report.stats.files_scanned,

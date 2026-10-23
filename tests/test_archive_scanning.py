@@ -510,6 +510,129 @@ def test_history_db_from_before_archive_scanning_still_opens(tmp_path):
     assert recent[0].files_not_fully_scanned == 0
 
 
+# ----------------------------------------------------------------------
+# Release-gate audit fixes: honest surfaces, pinned
+# ----------------------------------------------------------------------
+def test_member_temps_are_generated_names_inside_the_temp_root(
+    tmp_path, db, monkeypatch
+):
+    """Pin the zip-slip guard's CONSTRUCTION, not just its outcome:
+    every member the engine scans must arrive as a generated
+    ``member_NNNNNN`` file directly inside the archive temp root.
+    (A name-derived destination also deletes its own evidence after
+    the scan, so existence checks alone cannot pin this.)"""
+    seen: list[Path] = []
+    real_impl = scanner._scan_file_impl
+
+    def spy(path, *args, **kwargs):
+        seen.append(Path(path))
+        return real_impl(path, *args, **kwargs)
+
+    monkeypatch.setattr(scanner, "_scan_file_impl", spy)
+    archive = _make_zip(
+        tmp_path / "slip.zip",
+        {"../../evil.txt": b"x", "sub/dir/file.txt": b"y"},
+    )
+    scan_file(archive, db, BUILTIN_RULES)
+    assert seen and seen[0] == archive
+    member_temps = seen[1:]
+    assert len(member_temps) == 2
+    for temp in member_temps:
+        assert temp.name.startswith("member_")
+        assert temp.parent.name.startswith("argus-archive-")
+        assert ".." not in temp.parts
+
+
+def test_zip_folder_entry_carrying_data_is_not_fully_scanned(tmp_path, db):
+    archive = tmp_path / "dirdata.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("clean.txt", b"hello")
+        zf.writestr(zipfile.ZipInfo("direntry/"), EICAR)
+    scanned = scan_file(archive, db, BUILTIN_RULES)
+    assert scanned.archive_not_fully_scanned is True
+    assert scanned.verdict is Verdict.NOT_SCANNED
+    assert any(
+        "folder entry" in r for r in scanned.archive_incomplete_reasons
+    )
+
+
+def test_tar_folder_entry_carrying_data_is_not_fully_scanned(tmp_path, db):
+    archive = tmp_path / "dirdata.tar"
+    with tarfile.open(archive, "w") as tf:
+        data = b"hello"
+        info = tarfile.TarInfo("clean.txt")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+        dinfo = tarfile.TarInfo("direntry")
+        dinfo.type = tarfile.DIRTYPE
+        dinfo.size = len(EICAR)
+        tf.addfile(dinfo, io.BytesIO(EICAR))
+    scanned = scan_file(archive, db, BUILTIN_RULES)
+    assert scanned.archive_not_fully_scanned is True
+    assert scanned.verdict is Verdict.NOT_SCANNED
+    assert any(
+        "folder entry" in r for r in scanned.archive_incomplete_reasons
+    )
+
+
+def test_member_name_cannot_forge_output_lines(tmp_path, db, capsys):
+    evil = 'evil"\nFAKE LINE: Everything scanned came back clean.txt'
+    archive = tmp_path / "inj.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        info = zipfile.ZipInfo(evil)
+        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+        info.create_system = 3
+        zf.writestr(info, b"/etc/passwd")
+    scanned = scan_file(archive, db, BUILTIN_RULES)
+    assert scanned.archive_not_fully_scanned is True
+    for reason in scanned.archive_incomplete_reasons:
+        assert "\n" not in reason
+    assert any("\\x0aFAKE LINE" in r for r in scanned.archive_incomplete_reasons)
+    # …and through the CLI's human output, the name stays on its
+    # own single (escaped) line.
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "inj.zip").write_bytes(archive.read_bytes())
+    db_path = tmp_path / "sigs2.sigdb"
+    assert cli_main(["sigdb", "init", str(db_path)]) == EXIT_CLEAN
+    capsys.readouterr()
+    assert cli_main(["scan", str(tree), "--db", str(db_path)]) == EXIT_DETECTIONS
+    out = capsys.readouterr().out
+    assert "\nFAKE LINE" not in out
+    assert "\\x0aFAKE LINE" in out
+
+
+def test_cli_json_top_verdict_not_clean_for_partial_only_scan(
+    tmp_path, capsys
+):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "bad.zip").write_bytes(b"PK\x03\x04" + b"\xff" * 64)
+    db_path = tmp_path / "sigs.sigdb"
+    assert cli_main(["sigdb", "init", str(db_path)]) == EXIT_CLEAN
+    capsys.readouterr()
+    code = cli_main(["scan", str(tree), "--db", str(db_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert code == EXIT_DETECTIONS
+    # The machine-readable headline agrees with the exit code and
+    # the per-file verdict — never "Clean" for a partial archive.
+    assert payload["verdict"] == "NotScanned"
+
+
+def test_history_text_report_does_not_call_partial_period_clean(tmp_path):
+    from argus.reporting import History, render_text_report
+
+    hist_path = tmp_path / "history.db"
+    with History.open(hist_path) as history:
+        history.record_scan(
+            kind="ondemand", root="x", files_scanned=1,
+            files_not_fully_scanned=1,
+        )
+        text = render_text_report(history, days=1)
+    assert "could not be fully checked" in text
+    assert "came back clean" not in text
+
+
 def test_history_record_counts_not_fully_scanned(tmp_path, db):
     from argus.reporting import History
 

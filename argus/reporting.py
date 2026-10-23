@@ -490,10 +490,17 @@ def render_text_report(history: History, days: int = 7) -> str:
         )
     lines.append("")
     if not detections:
-        lines.append(
-            "Nothing was flagged. Everything Argus checked in this "
-            "period came back clean."
-        )
+        if summary["files_not_fully_scanned"]:
+            lines.append(
+                "Nothing was flagged in what Argus could check — "
+                "but the archives above could not be fully "
+                "checked, so they are not known to be clean."
+            )
+        else:
+            lines.append(
+                "Nothing was flagged. Everything Argus checked in this "
+                "period came back clean."
+            )
         return "\n".join(lines)
 
     lines.append(f"Flagged files: {len(detections)}")

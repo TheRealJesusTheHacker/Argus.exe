@@ -823,6 +823,19 @@ _MEMBER_CHUNK = 256 * 1024
 _SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
 
 
+def _display_safe(text: str) -> str:
+    """Make attacker-controlled text (archive member names, and
+    error strings that quote them) safe to print in reports:
+    control characters are escaped, so a crafted member name
+    cannot forge lines in CLI output, history reports, or GUI
+    rows. Ordinary names — spaces and printable Unicode
+    included — pass through unchanged."""
+    return "".join(
+        ch if (ch == " " or ch.isprintable()) else f"\\x{ord(ch):02x}"
+        for ch in text
+    )
+
+
 @dataclass
 class _ArchiveBudget:
     """The shared budgets + findings for ONE top-level archive."""
@@ -836,6 +849,10 @@ class _ArchiveBudget:
     next_index: int = 0
 
     def add_reason(self, reason: str) -> None:
+        # Reasons quote member names and library error strings —
+        # both attacker-controlled — so every reason is made
+        # display-safe at this single funnel.
+        reason = _display_safe(reason)
         if reason in self.reasons:
             return
         if len(self.reasons) >= 50:
@@ -1070,10 +1087,21 @@ def _scan_zip_members(scanned: ScannedFile, path: Path,
         for info in zf.infolist():
             if budget.stopped:
                 break
-            chain = f"{display} → {info.filename}"
+            chain = f"{display} → {_display_safe(info.filename)}"
             if not _count_member(budget, chain):
                 break
             if info.is_dir():
+                if info.file_size:
+                    # A folder entry carrying bytes is anomalous:
+                    # those bytes are never extracted as a file
+                    # by any tool, Argus does not check them, and
+                    # the archive must not pass as fully scanned
+                    # while they sit unexamined.
+                    budget.add_reason(
+                        f"{chain} is a folder entry carrying "
+                        f"{info.file_size} bytes of data — data "
+                        "stored on a folder entry was not checked"
+                    )
                 continue
             mode = info.external_attr >> 16
             if stat.S_ISLNK(mode):
@@ -1160,10 +1188,16 @@ def _scan_tar_members(scanned: ScannedFile, path: Path,
             if info is None:
                 break
             saw_member = True
-            chain = f"{display} → {info.name}"
+            chain = f"{display} → {_display_safe(info.name)}"
             if not _count_member(budget, chain):
                 break
             if info.isdir():
+                if info.size:
+                    budget.add_reason(
+                        f"{chain} is a folder entry carrying "
+                        f"{info.size} bytes of data — data "
+                        "stored on a folder entry was not checked"
+                    )
                 continue
             if info.issym() or info.islnk():
                 budget.add_reason(
