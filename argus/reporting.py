@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS scans (
     files_skipped   INTEGER NOT NULL DEFAULT 0,
     files_excluded  INTEGER NOT NULL DEFAULT 0,
     bytes_scanned   INTEGER NOT NULL DEFAULT 0,
-    detections_count INTEGER NOT NULL DEFAULT 0
+    detections_count INTEGER NOT NULL DEFAULT 0,
+    files_not_fully_scanned INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS detections (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +112,10 @@ class ScanRecord:
     files_excluded: int
     bytes_scanned: int
     detections_count: int
+    #: Archives Argus could not finish checking (B-3 Phase 2's
+    #: not-fully-scanned state, counted at scan level). Defaulted
+    #: so history written before archive scanning reads back as 0.
+    files_not_fully_scanned: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -124,6 +129,7 @@ class ScanRecord:
             "files_excluded": self.files_excluded,
             "bytes_scanned": self.bytes_scanned,
             "detections_count": self.detections_count,
+            "files_not_fully_scanned": self.files_not_fully_scanned,
         }
 
 
@@ -181,6 +187,18 @@ class History:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
             conn.executescript(_SCHEMA)
+            # Migration for history files written before archive
+            # scanning (B-3 Phase 2): CREATE TABLE IF NOT EXISTS
+            # does not add new columns to an existing table.
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(scans)")
+            }
+            if "files_not_fully_scanned" not in columns:
+                conn.execute(
+                    "ALTER TABLE scans ADD COLUMN "
+                    "files_not_fully_scanned INTEGER NOT NULL DEFAULT 0"
+                )
             conn.commit()
         except sqlite3.Error as exc:
             conn.close()
@@ -214,6 +232,7 @@ class History:
         detections: list[DetectionRecord] | None = None,
         started_at: str | None = None,
         finished_at: str | None = None,
+        files_not_fully_scanned: int = 0,
     ) -> int:
         """Record one finished scan and its detections. Returns scan id."""
         detections = detections or []
@@ -223,12 +242,14 @@ class History:
                 cursor = self._conn.execute(
                     "INSERT INTO scans (kind, root, started_at, finished_at,"
                     " files_scanned, files_skipped, files_excluded,"
-                    " bytes_scanned, detections_count)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " bytes_scanned, detections_count,"
+                    " files_not_fully_scanned)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         kind, root, started_at or now, finished_at or now,
                         files_scanned, files_skipped, files_excluded,
                         bytes_scanned, len(detections),
+                        files_not_fully_scanned,
                     ),
                 )
                 scan_id = int(cursor.lastrowid)
@@ -323,6 +344,7 @@ class History:
                 files_excluded=r["files_excluded"],
                 bytes_scanned=r["bytes_scanned"],
                 detections_count=r["detections_count"],
+                files_not_fully_scanned=r["files_not_fully_scanned"] or 0,
             )
             for r in rows
         ]
@@ -358,6 +380,7 @@ class History:
                 files_excluded=r["files_excluded"],
                 bytes_scanned=r["bytes_scanned"],
                 detections_count=r["detections_count"],
+                files_not_fully_scanned=r["files_not_fully_scanned"] or 0,
             )
             for r in rows
         ]
@@ -383,6 +406,9 @@ class History:
             "files_scanned": sum(s.files_scanned for s in scans),
             "files_skipped": sum(s.files_skipped for s in scans),
             "files_excluded": sum(s.files_excluded for s in scans),
+            "files_not_fully_scanned": sum(
+                s.files_not_fully_scanned for s in scans
+            ),
             "bytes_scanned": sum(s.bytes_scanned for s in scans),
             "detections": len(detections),
             "by_severity": by_severity,
@@ -455,6 +481,12 @@ def render_text_report(history: History, days: int = 7) -> str:
     if summary["files_skipped"]:
         lines.append(
             f"Files that could not be read: {summary['files_skipped']}"
+        )
+    if summary["files_not_fully_scanned"]:
+        lines.append(
+            "Archives that could not be fully checked: "
+            f"{summary['files_not_fully_scanned']} — their contents "
+            "were only partly scanned, so they are not known to be clean"
         )
     lines.append("")
     if not detections:

@@ -81,6 +81,14 @@ def scan_result_row(scanned) -> dict:
             worst = det.severity
     for sig in assessment.signals:
         reasons.append(f"{sig.name}: {sig.explanation} (+{sig.points})")
+    # The archive partial state rides the same row: its notes are
+    # the "why" a person sees for a not-fully-scanned archive, and
+    # the flags travel as data for any surface that wants them.
+    archive_reasons = [
+        note for note in assessment.notes
+        if note.startswith("Archive not fully scanned:")
+    ]
+    reasons.extend(archive_reasons)
     return {
         "path": str(result.path),
         "name": Path(result.path).name,
@@ -92,6 +100,13 @@ def scan_result_row(scanned) -> dict:
         "reasons": reasons,
         "error": result.error,
         "excluded": scanned.excluded,
+        "archive_not_fully_scanned": bool(
+            getattr(scanned, "archive_not_fully_scanned", False)
+        ),
+        "archive_incomplete_reasons": list(
+            getattr(scanned, "archive_incomplete_reasons", ())
+        ),
+        "notes": list(assessment.notes),
         "scanned": scanned,
     }
 

@@ -304,7 +304,11 @@ class ScanPage(QWidget):
                         )
                     ),
                     reasons=[d.reason for d in sf.assessment.detections]
-                    + [s.explanation for s in sf.assessment.signals],
+                    + [s.explanation for s in sf.assessment.signals]
+                    + [
+                        note for note in sf.assessment.notes
+                        if note.startswith("Archive not fully scanned:")
+                    ],
                     sha256=sf.result.sha256,
                 )
             )
@@ -321,6 +325,10 @@ class ScanPage(QWidget):
                 detections=records,
                 started_at=datetime.now(timezone.utc).isoformat(),
                 finished_at=datetime.now(timezone.utc).isoformat(),
+                files_not_fully_scanned=sum(
+                    1 for sf in summary["scanned_files"]
+                    if sf.archive_not_fully_scanned
+                ),
             )
         except Exception:  # bookkeeping never hides a scan result
             log.exception("scan history could not be saved")

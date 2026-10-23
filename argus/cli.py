@@ -65,7 +65,12 @@ from .reporting import (
     report_dict,
 )
 from .rules import BUILTIN_RULES, Rule, RuleError, load_rules
-from .scanner import ScanReport, ScannedFile, scan_path
+from .scanner import (
+    ARCHIVE_NOT_FULLY_SCANNED_PREFIX,
+    ScanReport,
+    ScannedFile,
+    scan_path,
+)
 from .service import ArgusService, read_status_file
 from .signatures import (
     DEFAULT_DB_NAME,
@@ -123,6 +128,25 @@ def _print_human(report: ScanReport) -> None:
         print(f"Not scanned: {len(not_scanned)} file(s) could not be "
               "read (locked or unreadable) — they were NOT cleared "
               "as safe; close the program using them and scan again.")
+    partial_archives = [
+        f for f in report.files if f.archive_not_fully_scanned
+    ]
+    undetailed_partials = [
+        f for f in partial_archives if f not in report.detections
+    ]
+    if undetailed_partials:
+        print("\nNot fully scanned:")
+        for scanned in undetailed_partials:
+            print(f"  - {scanned.path}")
+            for reason in scanned.archive_incomplete_reasons:
+                print(f"    {reason}")
+    if partial_archives:
+        print(f"Archives not fully scanned: {len(partial_archives)} "
+              "archive(s) could not be checked completely — they were "
+              "NOT cleared as safe.")
+    if stats.archives_seen:
+        print(f"Archives checked: {stats.archives_seen} "
+              f"({stats.archive_members_scanned} file(s) inside them)")
     print(f"Data scanned: {stats.bytes_scanned / (1024 * 1024):.1f} MB")
     n = len(report.detections)
     if n:
@@ -130,6 +154,10 @@ def _print_human(report: ScanReport) -> None:
         print("Argus never deletes anything on its own. Malicious files "
               "can be quarantined (--quarantine) or reviewed later with: "
               "argus quarantine list")
+    elif partial_archives:
+        print("Detections: none — but some archives were not fully "
+              "scanned (see above), so this is not a clean bill of "
+              "health for them.")
     else:
         print("Detections: none. Everything scanned came back clean.")
 
@@ -145,6 +173,10 @@ def _report_to_dict(report: ScanReport) -> dict:
             "files_excluded": report.stats.files_excluded,
             "dirs_skipped": report.stats.dirs_skipped,
             "bytes_scanned": report.stats.bytes_scanned,
+            "archives_seen": report.stats.archives_seen,
+            "archive_members_scanned": report.stats.archive_members_scanned,
+            "archives_not_fully_scanned":
+                report.stats.archives_not_fully_scanned,
         },
         "files": [
             {
@@ -153,6 +185,10 @@ def _report_to_dict(report: ScanReport) -> dict:
                 "sha256": f.result.sha256,
                 "error": f.result.error,
                 "excluded": f.excluded,
+                "archive_not_fully_scanned": f.archive_not_fully_scanned,
+                "archive_incomplete_reasons":
+                    list(f.archive_incomplete_reasons),
+                "archive_members_scanned": f.archive_members_scanned,
                 "verdict": f.verdict.value,
                 "max_severity": f.assessment.max_severity,
                 "score": f.assessment.score,
@@ -418,7 +454,11 @@ def _record_scan_history(
                               if f.assessment.signals else None)
                     ),
                     reasons=[d.reason for d in f.assessment.detections]
-                    + [s.explanation for s in f.assessment.signals],
+                    + [s.explanation for s in f.assessment.signals]
+                    + [
+                        note for note in f.assessment.notes
+                        if note.startswith(ARCHIVE_NOT_FULLY_SCANNED_PREFIX)
+                    ],
                     sha256=f.result.sha256,
                     action_taken=action_taken.get(str(f.path), "none"),
                 )
@@ -434,6 +474,8 @@ def _record_scan_history(
                 detections=records,
                 started_at=started_at,
                 finished_at=_utcnow_iso(),
+                files_not_fully_scanned=
+                report.stats.archives_not_fully_scanned,
             )
         finally:
             history.close()
@@ -532,6 +574,10 @@ def _cmd_scan(args: argparse.Namespace) -> int:
     _record_scan_history(args, report, config, started_at, action_taken)
 
     if report.verdict is Verdict.CLEAN:
+        # An archive that could not be fully scanned is never a
+        # clean result, even when nothing inside it was flagged.
+        if any(f.archive_not_fully_scanned for f in report.files):
+            return EXIT_DETECTIONS
         return EXIT_CLEAN
     return EXIT_DETECTIONS
 

@@ -829,6 +829,27 @@ class RealtimeEngine:
                 )
             )
 
+        if getattr(scanned, "archive_not_fully_scanned", False) \
+                and not assessment.flagged:
+            # A readable archive Argus could only partly check is
+            # not a detection, but it is never silent either: say
+            # plainly that it was not cleared as safe.
+            reasons = "; ".join(scanned.archive_incomplete_reasons)
+            self._emit(
+                RealtimeEvent(
+                    kind="info",
+                    source=item.source,
+                    path=str(path),
+                    verdict=scanned.verdict.value,
+                    message=(
+                        f"Argus could not fully scan {path.name}: "
+                        f"{reasons}. The archive was NOT cleared as "
+                        "safe."
+                    ),
+                )
+            )
+            return
+
         if not assessment.flagged:
             return
 
