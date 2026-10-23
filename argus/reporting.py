@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .textsafe import display_safe
+
 log = logging.getLogger("argus.reporting")
 
 
@@ -518,14 +520,21 @@ def render_text_report(history: History, days: int = 7) -> str:
         verdict = (det.verdict or "Flagged").upper()
         severity = (det.severity or "unknown").capitalize()
         lines.append("")
-        lines.append(f"[{verdict} — {severity}] {det.path}")
+        # Stored paths/names/reasons keep their true text in the
+        # history database; the RENDERED report escapes them, so a
+        # crafted file name cannot forge report lines (the B-3
+        # archive-member fix, extended to loose files — a Linux
+        # file name may itself contain a newline).
+        lines.append(f"[{verdict} — {severity}] {display_safe(det.path)}")
         if det.name:
-            lines.append(f"  What: {det.name}")
+            lines.append(f"  What: {display_safe(det.name)}")
         for reason in det.reasons:
-            lines.append(f"  Why: {reason}")
+            lines.append(f"  Why: {display_safe(reason)}")
         if det.score:
             lines.append(f"  Heuristic risk score: {det.score}")
-        phrase = _ACTION_PHRASES.get(det.action_taken, det.action_taken)
+        phrase = _ACTION_PHRASES.get(
+            det.action_taken, display_safe(det.action_taken)
+        )
         lines.append(f"  What happened: {phrase}.")
         if det.sha256:
             lines.append(f"  SHA-256: {det.sha256}")

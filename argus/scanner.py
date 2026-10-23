@@ -95,6 +95,7 @@ from .scoring import score_signals
 from .selftrust import SelfExclusions, default_self_exclusions
 from . import bundletrust
 from .signatures import SignatureDB
+from .textsafe import display_safe
 
 CHUNK_SIZE = 1024 * 1024  # 1 MiB
 
@@ -825,15 +826,12 @@ _SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
 
 def _display_safe(text: str) -> str:
     """Make attacker-controlled text (archive member names, and
-    error strings that quote them) safe to print in reports:
-    control characters are escaped, so a crafted member name
-    cannot forge lines in CLI output, history reports, or GUI
-    rows. Ordinary names — spaces and printable Unicode
-    included — pass through unchanged."""
-    return "".join(
-        ch if (ch == " " or ch.isprintable()) else f"\\x{ord(ch):02x}"
-        for ch in text
-    )
+    error strings that quote them) safe to print in reports.
+    The implementation lives in :mod:`argus.textsafe` so every
+    display surface (scanner, CLI, history reports) escapes the
+    same way; this alias keeps the archive code's call sites —
+    and the funnel's single-escape guarantee — unchanged."""
+    return display_safe(text)
 
 
 @dataclass

@@ -72,6 +72,7 @@ from .scanner import (
     scan_path,
 )
 from .service import ArgusService, read_status_file
+from .textsafe import display_safe
 from .signatures import (
     DEFAULT_DB_NAME,
     SignatureDB,
@@ -90,24 +91,28 @@ EXIT_ERROR = 2
 # Human-readable output
 # ----------------------------------------------------------------------
 def _print_human(report: ScanReport) -> None:
-    print(f"ARGUS scan of {report.root}")
+    # Every file-derived string below (paths, detection names and
+    # reasons, signal text, notes, read errors) passes through
+    # display_safe: a crafted file name must not forge output
+    # lines — the archive-member lesson, applied to loose files.
+    print(f"ARGUS scan of {display_safe(str(report.root))}")
     print("=" * 60)
     for scanned in report.detections:
         verdict = scanned.verdict.value.upper()
-        print(f"\n[{verdict}] {scanned.path}")
+        print(f"\n[{verdict}] {display_safe(str(scanned.path))}")
         assessment = scanned.assessment
         if assessment.max_severity:
             print(f"  Highest severity: {assessment.max_severity.capitalize()}")
         for det in assessment.detections:
-            print(f"  - {det.name} ({det.severity.capitalize()})")
-            print(f"    {det.reason}")
+            print(f"  - {display_safe(det.name)} ({det.severity.capitalize()})")
+            print(f"    {display_safe(det.reason)}")
         if assessment.signals:
             print(f"  Heuristic signals (risk score: {assessment.score}):")
             for sig in assessment.signals:
-                print(f"  - {sig.name} ({sig.severity.capitalize()}, +{sig.points})")
-                print(f"    {sig.explanation}")
+                print(f"  - {display_safe(sig.name)} ({sig.severity.capitalize()}, +{sig.points})")
+                print(f"    {display_safe(sig.explanation)}")
         for note in assessment.notes:
-            print(f"  Note: {note}")
+            print(f"  Note: {display_safe(note)}")
         if scanned.result.sha256:
             print(f"    SHA-256: {scanned.result.sha256}")
 
@@ -115,7 +120,7 @@ def _print_human(report: ScanReport) -> None:
     if skipped:
         print("\nCould not read:")
         for scanned in skipped:
-            print(f"  - {scanned.path}: {scanned.result.error}")
+            print(f"  - {display_safe(str(scanned.path))}: {display_safe(str(scanned.result.error))}")
 
     stats = report.stats
     print("\n" + "-" * 60)
@@ -137,9 +142,9 @@ def _print_human(report: ScanReport) -> None:
     if undetailed_partials:
         print("\nNot fully scanned:")
         for scanned in undetailed_partials:
-            print(f"  - {scanned.path}")
+            print(f"  - {display_safe(str(scanned.path))}")
             for reason in scanned.archive_incomplete_reasons:
-                print(f"    {reason}")
+                print(f"    {display_safe(reason)}")
     if partial_archives:
         print(f"Archives not fully scanned: {len(partial_archives)} "
               "archive(s) could not be checked completely — they were "
@@ -360,7 +365,7 @@ def _open_vault(args, config: ArgusConfig | None) -> Vault:
 def _prompt_scan_action(scanned: ScannedFile) -> str | None:
     """Ask what to do with one Malicious file. Returns "quarantine",
     "delete", or None (leave it). EOF/Ctrl-C means leave everything."""
-    print(f"\n{scanned.path} was flagged MALICIOUS.")
+    print(f"\n{display_safe(str(scanned.path))} was flagged MALICIOUS.")
     try:
         choice = input(
             "  [q]uarantine it, [d]elete it permanently, or press "
@@ -602,7 +607,9 @@ def _print_event(event: RealtimeEvent) -> None:
         "process": "PROCESS  ",
         "info": "INFO     ",
     }.get(event.kind, event.kind.upper())
-    print(f"[{tag}] {event.message}", flush=True)
+    # Event messages embed the watched file's name — escape it
+    # here, the one funnel every real-time event prints through.
+    print(f"[{tag}] {display_safe(event.message)}", flush=True)
 
 
 def _cmd_watch(args: argparse.Namespace) -> int:
@@ -790,13 +797,13 @@ def _cmd_quarantine_list(args: argparse.Namespace) -> int:
         for entry in entries:
             severity = (entry.severity or "unknown").capitalize()
             print(f"\n  {entry.id[:12]}…  [{entry.status.upper()}] "
-                  f"{entry.original_path}")
-            print(f"    Caught: {entry.detection_name} "
+                  f"{display_safe(str(entry.original_path))}")
+            print(f"    Caught: {display_safe(str(entry.detection_name))} "
                   f"(severity: {severity}, verdict: {entry.verdict})")
             print(f"    Taken: {entry.quarantined_at}  "
                   f"Size: {entry.size} bytes")
             for reason in entry.reasons:
-                print(f"    Why: {reason}")
+                print(f"    Why: {display_safe(reason)}")
             print(f"    Full id: {entry.id}")
         return EXIT_CLEAN
     finally:
@@ -821,8 +828,8 @@ def _quarantine_list_from_view(args: argparse.Namespace) -> int:
     for entry in entries:
         print(f"\n  {str(entry.get('id', ''))[:12]}…  "
               f"[{str(entry.get('status', '')).upper()}] "
-              f"{entry.get('original_path')}")
-        print(f"    Caught: {entry.get('detection_name')} "
+              f"{display_safe(str(entry.get('original_path') or ''))}")
+        print(f"    Caught: {display_safe(str(entry.get('detection_name') or ''))} "
               f"(severity: {entry.get('severity')}, "
               f"verdict: {entry.get('verdict')})")
         print(f"    Full id: {entry.get('id')}")
@@ -1015,12 +1022,12 @@ def _print_pending_list(args: argparse.Namespace, pending) -> int:
     print(f"{len(pending)} action(s) waiting for your decision:")
     for item in pending:
         severity = (item.severity or "unknown").capitalize()
-        print(f"\n  {item.id[:12]}…  {item.action.upper()} {item.path}")
-        print(f"    Flagged: {item.detection_name} "
+        print(f"\n  {item.id[:12]}…  {item.action.upper()} {display_safe(str(item.path))}")
+        print(f"    Flagged: {display_safe(str(item.detection_name))} "
               f"(severity: {severity}, verdict: {item.verdict})")
         print(f"    Since: {item.created_at}  Source: {item.source}")
         for reason in item.reasons:
-            print(f"    Why: {reason}")
+            print(f"    Why: {display_safe(reason)}")
         print(f"    Decide: argus pending approve {item.id[:12]}  |  "
               f"argus pending reject {item.id[:12]}")
     return EXIT_CLEAN
@@ -1273,13 +1280,13 @@ def _cmd_history(args: argparse.Namespace) -> int:
         print("Recent scans:")
         for scan in scans:
             print(f"  #{scan.id} [{scan.kind}] {scan.started_at}  "
-                  f"{scan.root or ''} — {scan.files_scanned} file(s), "
+                  f"{display_safe(scan.root or '')} — {scan.files_scanned} file(s), "
                   f"{scan.detections_count} flagged")
         if detections:
             print("\nRecent detections:")
             for det in detections:
                 verdict = (det.verdict or "Flagged").upper()
-                print(f"  [{verdict}] {det.path}")
+                print(f"  [{verdict}] {display_safe(det.path)}")
                 print(f"      {det.recorded_at} — action: {det.action_taken}")
         return EXIT_CLEAN
     finally:

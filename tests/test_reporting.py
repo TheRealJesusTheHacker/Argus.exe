@@ -148,3 +148,34 @@ def test_history_survives_reopen(tmp_path):
         assert len(second.recent_detections()) == 1
     finally:
         second.close()
+
+
+def test_text_report_escapes_crafted_path_and_name(history):
+    """Sweep #4: a loose file's name is attacker-controlled text
+    too (a Linux file name may contain a newline). The rendered
+    report must keep it on its own line — the B-3 archive-member
+    forging fix, extended to every detection the history holds."""
+    history.record_scan(
+        kind="ondemand",
+        root="/downloads",
+        files_scanned=1,
+        detections=[
+            DetectionRecord(
+                path="/downloads/innocent.txt\n[MALICIOUS — Critical] /forged.exe",
+                verdict="Malicious",
+                severity="high",
+                name="Forged\nName",
+                reasons=["reason with\nan injected line"],
+                sha256="b" * 64,
+                action_taken="none",
+            )
+        ],
+    )
+    out = render_text_report(history, days=7)
+    assert "\n[MALICIOUS — Critical] /forged.exe" not in out
+    assert "\\x0a[MALICIOUS" in out
+    assert "Forged\\x0aName" in out
+    assert "reason with\\x0aan injected line" in out
+    # Storage is untouched: the record still holds the true path.
+    det = history.recent_detections()[0]
+    assert det.path == "/downloads/innocent.txt\n[MALICIOUS — Critical] /forged.exe"

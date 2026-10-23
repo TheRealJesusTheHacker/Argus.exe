@@ -132,3 +132,26 @@ def test_scan_respects_config_exclusions(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["stats"]["files_excluded"] == 1
     assert payload["files"][0]["excluded"] is True
+
+
+def test_scan_loose_file_name_cannot_forge_output_lines(tmp_path, capsys):
+    """Sweep #4: the B-3 member-name forging class, for a loose
+    file. A file whose NAME carries a newline and a fake verdict
+    line must print escaped, on one line, in the human scan
+    output (Linux permits such names; Windows forbids control
+    characters in file names, so creation is attempted and the
+    test skips where the platform refuses it)."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    evil_name = "innocent.txt\n[MALICIOUS] forged.exe was flagged"
+    try:
+        (tree / evil_name).write_bytes(EICAR)
+    except OSError:
+        pytest.skip("platform forbids control characters in file names")
+    db = tmp_path / "sigs.sigdb"
+    assert main(["sigdb", "init", str(db)]) == EXIT_CLEAN
+    capsys.readouterr()
+    assert main(["scan", str(tree), "--db", str(db)]) == EXIT_DETECTIONS
+    out = capsys.readouterr().out
+    assert "\n[MALICIOUS] forged.exe" not in out
+    assert "\\x0a[MALICIOUS] forged.exe" in out
