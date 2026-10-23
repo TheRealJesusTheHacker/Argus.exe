@@ -168,7 +168,7 @@ The CLI entry point is `argus` (or `python -m argus` from source):
 | `argus/heuristics/` | Entropy analysis, the PE parser, and the behaviour-signal library. |
 | `argus/gui/` | The PySide6 GUI: main window, dashboard, scan page, management pages, settings and Dev Toolkit pages, onboarding wizard, tray, and theme. |
 | `packaging/` | The Windows and Linux PyInstaller specs, the portable launcher (`packaging/portable/`), and the Debian packaging under `packaging/linux/` (control file, maintainer scripts, systemd unit, desktop entry, `build-deb.sh`). |
-| `tests/` | The pytest suite (42 test modules). |
+| `tests/` | The pytest suite (46 test modules). |
 | `docs/ROADMAP.md` | The full phase-by-phase product record and the detection-depth backlog. |
 | `.github/workflows/build-windows.yml` | The `build-release` workflow: builds and smoke-tests both platform editions on release and attaches the assets and the single `SHA256SUMS.txt`. |
 

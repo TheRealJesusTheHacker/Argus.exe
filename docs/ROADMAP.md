@@ -2,7 +2,7 @@
 
 **Vendor:** Sentinel Safeguard LLC
 **Tagline:** Security For Everyone.
-**Platform:** Windows (.exe)
+**Platform:** Windows (.exe) and Linux (.deb)
 
 Argus is **not** a portable download-and-run scanner. It installs on
 the machine and becomes its default security app: always on, running
@@ -138,7 +138,9 @@ Depth Argus grows into after the core product ships — pillar 1
 **Decision 2026-10-21 (B-3) — decided build order:** scan modes
 first, archive scanning second — spec'd and scheduled as their
 own audited phases, NOT started in this wave; nothing in this
-bundle is built. Community signature feeds are CLOSED (with
+bundle was built at decision time. (Archive scanning has since
+been built on `main` as B-3 Phase 2 — see the Archive scanning
+bullet below; scan modes remain unbuilt.) Community signature feeds are CLOSED (with
 B-1). Fuzzy hashing, document/macro scanning, and
 removable-media auto-scan remain named roadmap backlog (not
 closed, not started).
@@ -146,10 +148,14 @@ closed, not started).
 - [ ] **Fuzzy hashing** (ssdeep/TLSH-style) — catch *variants* of
       known malware, not just byte-identical copies. Backlog
       retained 2026-10-21 (B-3) — not closed, not started.
-- [ ] **Archive scanning** — threats arrive zipped: look inside
+- [x] **Archive scanning** — threats arrive zipped: look inside
       .zip (and kin) during scans, with zip-bomb limits.
-      **Decided build order #2 (2026-10-21, B-3)** — spec'd and
-      scheduled as its own audited phase; not started.
+      **Decided build order #2 (2026-10-21, B-3)** — built as
+      B-3 Phase 2 on `main` (ZIP and TAR including gzip-compressed
+      TAR, shared budgets for members / extracted bytes / nesting
+      depth, in `argus/scanner.py`, covered by
+      `tests/test_archive_scanning.py`); not yet in a release
+      (the latest release is v1.2.7).
 - [ ] **Document & macro scanning** — Office/PDF carriers, macro
       droppers, embedded-object inspection. Backlog retained
       2026-10-21 (B-3) — not closed, not started.
@@ -230,7 +236,7 @@ closed, not started).
 
 ### Dev Toolkit panel
 - [x] Heuristic sensitivity control (slider → scoring thresholds)
-- [x] Per-signal enable/disable and weight tuning (all 30 signals;
+- [x] Per-signal enable/disable and weight tuning (all 43 signals;
       a drift-guard test keeps the editor's catalog identical to
       the engine's signal library)
 - [x] Exclusions manager (paths + SHA-256 fingerprints, in Settings)
