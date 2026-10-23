@@ -49,6 +49,17 @@ Hard rules learned from real-world scanner bugs:
   Microsoft-signed binary in its system location has its heuristic
   suspicion cleared (see :mod:`argus.scoring`) — signature and
   pattern-rule detections on it still stand.
+- **Archives are opened, never trusted.** A ZIP (and TAR, including
+  gzip-compressed TAR) file's members are scanned through this same
+  path — extracted by index to generated flat names inside one
+  dedicated temporary folder, never to a path taken from a member
+  name, and never executed. Shared hard budgets bound the work
+  (member count, total extracted bytes, nesting depth, per-member
+  time), enforced while bytes stream, not after. Anything Argus
+  could not check — a limit hit, a damaged or encrypted member, a
+  link member it will not follow — marks the archive **not fully
+  scanned** on the result itself: it is never reported clean and
+  never silently skipped.
 """
 
 from __future__ import annotations
@@ -57,13 +68,19 @@ import ctypes
 import errno
 import hashlib
 import os
+import re
+import stat
 import sys
+import tarfile
+import tempfile
+import time
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
 from .config import Exclusions
-from .detections import FileAssessment, Verdict, assess
+from .detections import Detection, FileAssessment, Verdict, assess
 from .heuristics.analyze import (
     SCRIPT_EXTENSIONS,
     _looks_like_script,
@@ -91,6 +108,38 @@ _NOT_THERE_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
 
 #: Cap on named data streams scanned per file (abuse-proofing).
 MAX_STREAMS_PER_FILE = 32
+
+# ----------------------------------------------------------------------
+# Archive scanning budgets (B-3 Phase 2)
+#
+# One set of budgets is shared by a whole top-level archive: nested
+# archives draw from the SAME counters, so wrapping a payload in
+# layers cannot multiply the allowance. Extraction is streaming —
+# a budget trips WHILE bytes are being read, never after a member
+# has been fully written out.
+# ----------------------------------------------------------------------
+#: Max archive members (files, folders, links — every entry counts)
+#: enumerated for one top-level archive.
+MAX_ARCHIVE_MEMBERS = 512
+#: Max total extracted (decompressed) bytes for one top-level archive.
+MAX_ARCHIVE_TOTAL_BYTES = 256 * 1024 * 1024  # 256 MB
+#: Max archive nesting depth: the scanned file itself is depth 1,
+#: an archive inside it is depth 2, and so on.
+MAX_ARCHIVE_DEPTH = 3
+#: Max seconds spent on one archive member (extract + scan), checked
+#: cooperatively at every streamed chunk and again before its scan.
+ARCHIVE_MEMBER_TIMEOUT_SECONDS = 30.0
+
+#: Prefix of the one dedicated temp root created per top-level
+#: archive scan. Member bytes only ever land inside it, under
+#: generated flat names, and it is removed when the scan ends —
+#: on success, on error, and on exception paths alike.
+ARCHIVE_TEMP_PREFIX = "argus-archive-"
+
+#: The note prefix that marks the designed "not fully scanned"
+#: archive state on a result. Reporting surfaces (CLI history
+#: records, GUI rows) filter notes by this exact prefix.
+ARCHIVE_NOT_FULLY_SCANNED_PREFIX = "Archive not fully scanned:"
 
 
 def _is_scan_blocked(exc: OSError) -> bool:
@@ -261,6 +310,22 @@ class ScannedFile:
     #: Argus program itself", ... Set only for self-exclusions;
     #: user-configured exclusions explain themselves in the notes.
     exclusion_source: str | None = None
+    #: True when this file was recognised (by content) as an archive
+    #: and its members were enumerated for scanning.
+    is_archive: bool = False
+    #: How many archive members were fully scanned for this file
+    #: (nested members included, all levels counted together).
+    archive_members_scanned: int = 0
+    #: The designed partial state: True when ANY part of the archive
+    #: could not be scanned (a budget hit, a damaged or encrypted
+    #: member, an unfollowed link, ...). Such a file also carries
+    #: ``assessment.not_scanned`` and one note per reason — it is
+    #: never a clean result.
+    archive_not_fully_scanned: bool = False
+    #: The plain-language reasons the archive is not fully scanned,
+    #: without the shared note prefix (also on the assessment notes,
+    #: with the prefix, for surfaces that read notes).
+    archive_incomplete_reasons: tuple[str, ...] = ()
 
     @property
     def path(self) -> Path:
@@ -279,6 +344,9 @@ class ScanStats:
     files_excluded: int = 0  # left alone by user-configured exclusions
     dirs_skipped: int = 0  # unreadable dirs + dir symlinks not followed
     bytes_scanned: int = 0
+    archives_seen: int = 0  # files recognised as archives and opened
+    archive_members_scanned: int = 0  # members scanned, all levels
+    archives_not_fully_scanned: int = 0  # archives in the partial state
 
 
 @dataclass
@@ -402,7 +470,40 @@ def scan_file(
     and reused. A file at the program's own address that fails the
     identity proofs is scanned in full and reported as a tamper
     indicator.
+
+    Archives (ZIP, and TAR including gzip-compressed TAR) are not
+    an exception to any of the above: the archive file itself is
+    scanned exactly as any other file, and then its members are
+    scanned through this same function (see
+    :func:`_merge_archive_members`) under shared hard budgets.
     """
+    return _scan_file_impl(
+        path, db, rules, chunk_size,
+        heuristics=heuristics, exclusions=exclusions,
+        self_exclusions=self_exclusions,
+    )
+
+
+def _scan_file_impl(
+    path: Path,
+    db: SignatureDB,
+    rules: list[Rule],
+    chunk_size: int = CHUNK_SIZE,
+    *,
+    heuristics: bool = True,
+    exclusions: Exclusions | None = None,
+    self_exclusions: SelfExclusions | None = None,
+    _archive_budget: "_ArchiveBudget | None" = None,
+    _archive_depth: int = 0,
+    _archive_chain: str = "",
+) -> ScannedFile:
+    """The scan itself. :func:`scan_file` is the public entry point
+    (its signature is the contract); archive member scans call this
+    directly so a nested member shares the top archive's budgets
+    (``_archive_budget``), knows its nesting depth
+    (``_archive_depth`` = the depth of the archive that contained
+    it, 0 at the top), and carries its attribution chain
+    (``_archive_chain``, e.g. "outer.zip → inner.zip")."""
     result = FileResult(path=path)
 
     # --- self-exclusion, before the file is touched ---------------
@@ -674,9 +775,517 @@ def scan_file(
             assessment.score = scored.score
             assessment.heuristic_verdict = scored.verdict
 
-    return ScannedFile(
+    scanned = ScannedFile(
         result=result, assessment=assessment, rules_skipped_reason=rules_skipped_reason
     )
+    # Archive members ride the SAME result: detections and signals
+    # found inside merge into this assessment (member-attributed),
+    # and anything that could not be checked marks this file not
+    # fully scanned. Non-archives return from here untouched.
+    _merge_archive_members(
+        scanned, path, db, rules, chunk_size,
+        heuristics=heuristics, exclusions=exclusions,
+        self_exclusions=self_exclusions,
+        budget=_archive_budget, depth=_archive_depth, chain=_archive_chain,
+    )
+    return scanned
+
+
+# ----------------------------------------------------------------------
+# Archive scanning (B-3 Phase 2)
+#
+# Members are enumerated through one small abstraction (name +
+# kind + a byte stream) with two backends — ZIP and TAR — so both
+# formats get identical guards:
+#
+# * **Zip-slip is impossible by construction.** Member bytes are
+#   written by INDEX to generated flat names (``member_000001``
+#   plus a sanitised extension) inside the one temp root. A member
+#   name is reporting data only; it never becomes a path.
+# * **Links are never materialised or followed.** A symlink /
+#   hardlink member is noted as unscanned (the archive is not
+#   fully scanned) and its content is never treated as a file.
+# * **Bombs die against the streaming budgets.** The shared byte
+#   budget is checked BEFORE each chunk is written; the moment it
+#   trips, extraction stops for the whole top-level archive.
+# * **Nothing survives the scan.** The temp root belongs to the
+#   top-level archive, each member temp is deleted right after its
+#   scan, and the root is removed in a ``finally`` that runs on
+#   success, error, timeout, and exception paths alike. Extracted
+#   temps are only ever READ by the scanner — never executed, and
+#   quarantine (if a caller asks) targets the archive file itself,
+#   whose path is the result's path.
+# ----------------------------------------------------------------------
+_ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_GZIP_MAGIC = b"\x1f\x8b"
+_TAR_SUFFIXES = (".tar.gz", ".tgz", ".tar")
+_MEMBER_CHUNK = 256 * 1024
+_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
+
+
+@dataclass
+class _ArchiveBudget:
+    """The shared budgets + findings for ONE top-level archive."""
+
+    members_seen: int = 0
+    members_scanned: int = 0
+    total_bytes: int = 0
+    stopped: bool = False
+    reasons: list[str] = field(default_factory=list)
+    temp_root: Path | None = None
+    next_index: int = 0
+
+    def add_reason(self, reason: str) -> None:
+        if reason in self.reasons:
+            return
+        if len(self.reasons) >= 50:
+            summary = "and more problems were found inside this archive"
+            if summary not in self.reasons:
+                self.reasons.append(summary)
+            return
+        self.reasons.append(reason)
+
+
+def _archive_kind(path: Path) -> str | None:
+    """Sniff *path*'s CONTENT for an archive format Argus opens.
+
+    Returns "zip", "tar", "gzip" (a gzip stream that may or may not
+    wrap a tar — probed by the tar backend), or None. Detection is
+    by magic bytes, never by name: a zip wearing a .dat name is
+    opened, and a text file wearing a .zip name is not.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return None
+    if head[:4] in _ZIP_MAGICS:
+        return "zip"
+    if len(head) >= 262 and head[257:262] == b"ustar":
+        return "tar"
+    if head[:2] == _GZIP_MAGIC:
+        return "gzip"
+    return None
+
+
+def _member_suffix(member_name: str) -> str:
+    """The one piece of a member name allowed anywhere near a temp
+    path: its final extension, and only when it is a short plain
+    suffix. It exists so a member .ps1/.exe still routes through
+    the scanner's content+extension logic exactly as a loose file
+    would. It can never contain a separator or a dot-dot."""
+    suffix = Path(member_name.replace("\\", "/")).suffix
+    return suffix if _SUFFIX_RE.match(suffix) else ""
+
+
+def _extract_member_stream(stream, dest: Path, budget: _ArchiveBudget,
+                           started: float, chain: str) -> bool:
+    """Stream one member's bytes to *dest* under the shared budgets.
+
+    Returns True when the member was written out in full. On a
+    budget or timeout trip the partial temp is deleted, the reason
+    is recorded, ``budget.stopped`` is set (the whole archive stops
+    — more members cannot change an exhausted budget), and False
+    is returned.
+    """
+    written = 0
+    try:
+        with open(dest, "wb") as out:
+            while True:
+                chunk = stream.read(_MEMBER_CHUNK)
+                if not chunk:
+                    break
+                if time.monotonic() - started > ARCHIVE_MEMBER_TIMEOUT_SECONDS:
+                    budget.add_reason(
+                        f"checking {chain} took too long (over "
+                        f"{ARCHIVE_MEMBER_TIMEOUT_SECONDS:g} seconds per "
+                        "file inside an archive) — it was not fully checked"
+                    )
+                    budget.stopped = True
+                    break
+                if budget.total_bytes + len(chunk) > MAX_ARCHIVE_TOTAL_BYTES:
+                    budget.add_reason(
+                        f"the total size limit for files inside one "
+                        f"archive ({MAX_ARCHIVE_TOTAL_BYTES // (1024 * 1024)} "
+                        f"MB) was reached while reading {chain} — the rest "
+                        "of the archive was not checked"
+                    )
+                    budget.stopped = True
+                    break
+                out.write(chunk)
+                budget.total_bytes += len(chunk)
+                written += len(chunk)
+    except Exception:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    if budget.stopped:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _merge_member_result(scanned: ScannedFile, member: ScannedFile,
+                         chain: str) -> None:
+    """Merge one scanned member's findings into the archive's own
+    assessment: detections and signals keep their identity, with
+    the member chain attributed in their text ("archive.zip →
+    inner/eicar.com"). Worst heuristic verdict wins; the score
+    keeps the strongest member's score (points are per-file
+    evidence, not additive across different files)."""
+    assessment = scanned.assessment
+    for det in member.assessment.detections:
+        assessment.detections.append(
+            Detection(
+                kind=det.kind,
+                name=det.name,
+                severity=det.severity,
+                family=det.family,
+                reason=f"Found inside archive: {chain}: {det.reason}",
+            )
+        )
+    for sig in member.assessment.signals:
+        assessment.signals.append(
+            Signal(
+                name=sig.name,
+                severity=sig.severity,
+                points=sig.points,
+                explanation=f"Inside {chain}: {sig.explanation}",
+            )
+        )
+    if member.assessment.score > assessment.score:
+        assessment.score = member.assessment.score
+    if member.assessment.heuristic_verdict.rank > assessment.heuristic_verdict.rank:
+        assessment.heuristic_verdict = member.assessment.heuristic_verdict
+
+
+def _scan_one_member(scanned: ScannedFile, budget: _ArchiveBudget, *,
+                     member_name: str, stream_factory, chain: str,
+                     db: SignatureDB, rules: list[Rule], chunk_size: int,
+                     heuristics: bool, exclusions, self_exclusions,
+                     depth: int) -> None:
+    """Extract (streaming, budgeted) and scan one regular member."""
+    assert budget.temp_root is not None
+    budget.next_index += 1
+    dest = budget.temp_root / (
+        f"member_{budget.next_index:06d}{_member_suffix(member_name)}"
+    )
+    started = time.monotonic()
+    try:
+        stream = stream_factory()
+        if stream is None:
+            budget.add_reason(
+                f"{chain} could not be read — it was not checked"
+            )
+            return
+        with stream:
+            complete = _extract_member_stream(
+                stream, dest, budget, started, chain
+            )
+    except Exception as exc:
+        budget.add_reason(
+            f"{chain} could not be read ({exc}) — it was not checked"
+        )
+        return
+    if not complete:
+        return  # reason + stopped already recorded by the extractor
+    if time.monotonic() - started > ARCHIVE_MEMBER_TIMEOUT_SECONDS:
+        budget.add_reason(
+            f"checking {chain} took too long (over "
+            f"{ARCHIVE_MEMBER_TIMEOUT_SECONDS:g} seconds per file "
+            "inside an archive) — it was not checked"
+        )
+        budget.stopped = True
+        return
+    try:
+        member = _scan_file_impl(
+            dest, db, rules, chunk_size,
+            heuristics=heuristics, exclusions=exclusions,
+            self_exclusions=self_exclusions,
+            _archive_budget=budget, _archive_depth=depth,
+            _archive_chain=chain,
+        )
+    except Exception as exc:  # a member must never take the scan down
+        budget.add_reason(
+            f"{chain} could not be checked ({exc})"
+        )
+        return
+    finally:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if member.excluded:
+        # The user's own exclusion (by fingerprint) claims this
+        # content wherever it appears — left alone, on purpose.
+        return
+    budget.members_scanned += 1
+    scanned.archive_members_scanned = budget.members_scanned
+    if not member.result.ok:
+        budget.add_reason(
+            f"{chain} could not be read — it was not checked"
+        )
+        return
+    if member.assessment.not_scanned and not member.archive_not_fully_scanned:
+        budget.add_reason(
+            f"{chain} could not be read — it was not checked"
+        )
+    _merge_member_result(scanned, member, chain)
+
+
+def _count_member(budget: _ArchiveBudget, chain: str) -> bool:
+    """Count one enumerated entry against the member budget.
+    Returns False when the budget is spent (reason recorded, the
+    archive stops being enumerated)."""
+    budget.members_seen += 1
+    if budget.members_seen > MAX_ARCHIVE_MEMBERS:
+        budget.add_reason(
+            f"the archive holds more than {MAX_ARCHIVE_MEMBERS} files "
+            f"— only the first {MAX_ARCHIVE_MEMBERS} were checked "
+            f"(stopped at {chain})"
+        )
+        budget.stopped = True
+        return False
+    return True
+
+
+def _scan_zip_members(scanned: ScannedFile, path: Path,
+                      budget: _ArchiveBudget, *, display: str,
+                      db, rules, chunk_size, heuristics, exclusions,
+                      self_exclusions, depth: int) -> None:
+    try:
+        zf = zipfile.ZipFile(path)
+    except Exception as exc:
+        budget.add_reason(
+            f"the archive {display} is damaged or unreadable ({exc}) — "
+            "its contents were not checked"
+        )
+        return
+    with zf:
+        for info in zf.infolist():
+            if budget.stopped:
+                break
+            chain = f"{display} → {info.filename}"
+            if not _count_member(budget, chain):
+                break
+            if info.is_dir():
+                continue
+            mode = info.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                budget.add_reason(
+                    f"{chain} is a symbolic link — Argus does not "
+                    "follow links inside archives, so it was not checked"
+                )
+                continue
+            # Many writers (Python's zipfile included) store only
+            # permission bits, with no file-type bits at all: no
+            # type stated means a regular file. A type that IS
+            # stated and is not regular (fifo, device, socket) is
+            # not something Argus materialises.
+            if stat.S_IFMT(mode) and not stat.S_ISREG(mode):
+                budget.add_reason(
+                    f"{chain} is not a regular file — it was not checked"
+                )
+                continue
+            if info.flag_bits & 0x1:
+                budget.add_reason(
+                    f"{chain} is encrypted — Argus cannot check "
+                    "encrypted files inside an archive without the password"
+                )
+                continue
+            if info.compress_type not in (
+                zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED,
+                zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA,
+            ):
+                budget.add_reason(
+                    f"{chain} uses a compression method Argus cannot "
+                    "read — it was not checked"
+                )
+                continue
+            _scan_one_member(
+                scanned, budget,
+                member_name=info.filename,
+                stream_factory=lambda info=info: zf.open(info, "r"),
+                chain=chain, db=db, rules=rules, chunk_size=chunk_size,
+                heuristics=heuristics, exclusions=exclusions,
+                self_exclusions=self_exclusions, depth=depth,
+            )
+
+
+def _scan_tar_members(scanned: ScannedFile, path: Path,
+                      budget: _ArchiveBudget, *, display: str,
+                      mode: str, db, rules, chunk_size, heuristics,
+                      exclusions, self_exclusions,
+                      depth: int) -> bool:
+    """Scan a TAR's members. Returns False only for the gzip probe
+    case where the stream turns out not to be a tar at all (a plain
+    gzip file is not an archive Argus claims); every genuine tar
+    failure is recorded as a not-fully-scanned reason instead."""
+    try:
+        tf = tarfile.open(path, mode)
+    except Exception as exc:
+        if mode == "r:gz" and not path.name.lower().endswith(_TAR_SUFFIXES):
+            return False
+        budget.add_reason(
+            f"the archive {display} is damaged or unreadable ({exc}) — "
+            "its contents were not checked"
+        )
+        return True
+    with tf:
+        saw_member = False
+        while True:
+            if budget.stopped:
+                break
+            try:
+                info = tf.next()
+            except Exception as exc:
+                if (
+                    mode == "r:gz" and not saw_member
+                    and not path.name.lower().endswith(_TAR_SUFFIXES)
+                ):
+                    # The gzip probe's verdict: this stream is not
+                    # a tar at all (a plain gzip file) — not an
+                    # archive Argus claims, so no partial state.
+                    return False
+                budget.add_reason(
+                    f"the archive {display} is damaged or unreadable "
+                    f"({exc}) — the rest of it was not checked"
+                )
+                break
+            if info is None:
+                break
+            saw_member = True
+            chain = f"{display} → {info.name}"
+            if not _count_member(budget, chain):
+                break
+            if info.isdir():
+                continue
+            if info.issym() or info.islnk():
+                budget.add_reason(
+                    f"{chain} is a link — Argus does not follow links "
+                    "inside archives, so it was not checked"
+                )
+                continue
+            if not info.isreg():
+                budget.add_reason(
+                    f"{chain} is not a regular file — it was not checked"
+                )
+                continue
+            _scan_one_member(
+                scanned, budget,
+                member_name=info.name,
+                stream_factory=lambda info=info: tf.extractfile(info),
+                chain=chain, db=db, rules=rules, chunk_size=chunk_size,
+                heuristics=heuristics, exclusions=exclusions,
+                self_exclusions=self_exclusions, depth=depth,
+            )
+    return True
+
+
+def _merge_archive_members(
+    scanned: ScannedFile,
+    path: Path,
+    db: SignatureDB,
+    rules: list[Rule],
+    chunk_size: int,
+    *,
+    heuristics: bool,
+    exclusions: Exclusions | None,
+    self_exclusions: SelfExclusions | None,
+    budget: _ArchiveBudget | None,
+    depth: int,
+    chain: str,
+) -> None:
+    """If *path* is an archive, scan its members into *scanned*.
+
+    ``depth`` is the depth of the archive that CONTAINED this file
+    (0 for a file the user pointed Argus at), so this archive's own
+    depth is ``depth + 1``. ``chain`` is this file's attribution
+    chain from the top archive ("" at the top, where the display
+    name is the file's own name)."""
+    if scanned.excluded or not scanned.result.ok:
+        return
+    kind = _archive_kind(path)
+    if kind is None:
+        return
+    display = chain or path.name
+    own_depth = depth + 1
+    top_level = budget is None
+    if budget is None:
+        budget = _ArchiveBudget()
+    temp_dir: tempfile.TemporaryDirectory | None = None
+    try:
+        if own_depth > MAX_ARCHIVE_DEPTH:
+            budget.add_reason(
+                f"the archive {display} is nested deeper than "
+                f"{MAX_ARCHIVE_DEPTH} levels — it was not opened"
+            )
+            if top_level:
+                _apply_archive_state(scanned, budget, is_archive=False)
+            return
+        if top_level:
+            temp_dir = tempfile.TemporaryDirectory(prefix=ARCHIVE_TEMP_PREFIX)
+            budget.temp_root = Path(temp_dir.name)
+        opened = True
+        if kind == "zip":
+            _scan_zip_members(
+                scanned, path, budget, display=display, db=db,
+                rules=rules, chunk_size=chunk_size, heuristics=heuristics,
+                exclusions=exclusions, self_exclusions=self_exclusions,
+                depth=own_depth,
+            )
+        elif kind == "tar":
+            _scan_tar_members(
+                scanned, path, budget, display=display, mode="r:*",
+                db=db, rules=rules, chunk_size=chunk_size,
+                heuristics=heuristics, exclusions=exclusions,
+                self_exclusions=self_exclusions, depth=own_depth,
+            )
+        else:  # "gzip" — a tar only if the probe says so
+            opened = _scan_tar_members(
+                scanned, path, budget, display=display, mode="r:gz",
+                db=db, rules=rules, chunk_size=chunk_size,
+                heuristics=heuristics, exclusions=exclusions,
+                self_exclusions=self_exclusions, depth=own_depth,
+            )
+        if top_level:
+            _apply_archive_state(scanned, budget, is_archive=opened)
+        elif opened:
+            scanned.is_archive = True
+            scanned.archive_members_scanned = budget.members_scanned
+    finally:
+        if temp_dir is not None:
+            budget.temp_root = None
+            try:
+                temp_dir.cleanup()
+            except OSError:
+                pass
+
+
+def _apply_archive_state(scanned: ScannedFile, budget: _ArchiveBudget,
+                         *, is_archive: bool) -> None:
+    """Stamp the shared budget's outcome onto the top-level result:
+    members counted, and — when anything could not be checked —
+    the designed not-fully-scanned state (flag, tuple of reasons,
+    and one prefixed note per reason, plus the ``not_scanned``
+    assessment flag that keeps the verdict off Clean)."""
+    scanned.is_archive = is_archive
+    scanned.archive_members_scanned = budget.members_scanned
+    if not budget.reasons:
+        return
+    reasons = tuple(dict.fromkeys(budget.reasons))
+    scanned.archive_not_fully_scanned = True
+    scanned.archive_incomplete_reasons = reasons
+    scanned.assessment.not_scanned = True
+    for reason in reasons:
+        note = f"{ARCHIVE_NOT_FULLY_SCANNED_PREFIX} {reason}"
+        if note not in scanned.assessment.notes:
+            scanned.assessment.notes.append(note)
 
 
 # ----------------------------------------------------------------------
@@ -916,6 +1525,11 @@ def scan_path(
                 stats.bytes_scanned += item.result.size or 0
             else:
                 stats.files_skipped += 1
+            if item.is_archive:
+                stats.archives_seen += 1
+                stats.archive_members_scanned += item.archive_members_scanned
+            if item.archive_not_fully_scanned:
+                stats.archives_not_fully_scanned += 1
             report.files.append(item)
 
     return report
