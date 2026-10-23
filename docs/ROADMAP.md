@@ -154,8 +154,7 @@ closed, not started).
       B-3 Phase 2 on `main` (ZIP and TAR including gzip-compressed
       TAR, shared budgets for members / extracted bytes / nesting
       depth, in `argus/scanner.py`, covered by
-      `tests/test_archive_scanning.py`); not yet in a release
-      (the latest release is v1.2.7).
+      `tests/test_archive_scanning.py`); shipped in v1.2.8.
 - [ ] **Document & macro scanning** — Office/PDF carriers, macro
       droppers, embedded-object inspection. Backlog retained
       2026-10-21 (B-3) — not closed, not started.
@@ -282,6 +281,7 @@ closed, not started).
       (`argus/winregister.py`, mock-tested; exact productState
       semantics to be confirmed on a real machine)
 - [x] **Packaged-executable scan entry (v1.2.7)** — `Argus.exe scan <path>` / `--scan` runs a real headless scan through the CLI engine (`argus.entry` routes to `argus.cli`), so the frozen build can demonstrate a scan (of itself, its kit, or anything else) with the scan's own exit codes. Before v1.2.7 the packaged executable had no scan entry point at all.
+- [x] **Archive scanning (v1.2.8, B-3 Phase 2)** — ZIP and TAR (including gzip-compressed TAR) members are scanned through the same engine during on-demand, headless, GUI, and real-time scans, under shared hard budgets (512 members / 256 MB extracted / depth 3 / 30 s per member) with the designed not-fully-scanned state surfaced everywhere a result is shown. See the Detection-depth backlog entry above.
 - [ ] Signature auto-updates running as a service task —
       **CLOSED 2026-10-21, decided not to build (B-1).** Reason:
       signature updates ride releases (the fleet's shipped
