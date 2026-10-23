@@ -25,5 +25,5 @@ pefile==2024.8.26
 altgraph==0.17.5
 pywin32-ctypes==0.2.3
 packaging==25.0
-setuptools==80.10.2
+setuptools==83.0.0
 pytest==9.1.1
