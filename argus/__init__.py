@@ -3,6 +3,6 @@
 All eyes. All detection.
 """
 
-__version__ = "1.2.9"
+__version__ = "1.2.10"
 __product__ = "ARGUS.EXE"
 __vendor__ = "Sentinel Safeguard LLC"

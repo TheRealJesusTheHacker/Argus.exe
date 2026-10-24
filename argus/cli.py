@@ -433,9 +433,11 @@ def _run_scan_actions(
                     )
                     taken[str(scanned.path)] = "deleted"
                 stream = sys.stderr if args.json else sys.stdout
-                print(outcome.message, file=stream)
+                print(display_safe(outcome.message), file=stream)
             except (ActionError, QuarantineError) as exc:
-                print(f"Could not {action} {scanned.path}: {exc}",
+                print(f"Could not {action} "
+                      f"{display_safe(str(scanned.path))}: "
+                      f"{display_safe(str(exc))}",
                       file=sys.stderr)
                 taken[str(scanned.path)] = "none"
         return taken
@@ -849,8 +851,9 @@ def _cmd_quarantine_restore(args: argparse.Namespace) -> int:
         if details is not None:
             print(
                 "The protection service reports: "
-                f"{details['original_path']} "
-                f"(detection: {details.get('detection_name') or '—'})."
+                f"{display_safe(str(details['original_path']))} "
+                f"(detection: "
+                f"{display_safe(str(details.get('detection_name') or '—'))})."
             )
             return _via_service(
                 "restore",
@@ -866,7 +869,8 @@ def _cmd_quarantine_restore(args: argparse.Namespace) -> int:
             print(f"Error: no vault entry matches '{args.id}'.", file=sys.stderr)
             return EXIT_ERROR
         restored = vault.restore(entry.id)
-        print(f"Restored: {entry.original_path} -> {restored}")
+        print(f"Restored: {display_safe(str(entry.original_path))} "
+              f"-> {display_safe(str(restored))}")
         print("The file is back where it was (or next to it, if "
               "something new took its place — Argus never overwrites).")
         return EXIT_CLEAN
@@ -894,12 +898,13 @@ def _cmd_quarantine_delete(args: argparse.Namespace) -> int:
         if details is not None:
             print(
                 "The protection service reports: "
-                f"{shown_path} "
-                f"(detection: {details.get('detection_name') or '—'})."
+                f"{display_safe(str(shown_path))} "
+                f"(detection: "
+                f"{display_safe(str(details.get('detection_name') or '—'))})."
             )
         if not _confirm(
-            f"Permanently delete {shown_path} from the "
-            "vault? This cannot be undone. [y/N] ",
+            f"Permanently delete {display_safe(str(shown_path))} "
+            "from the vault? This cannot be undone. [y/N] ",
             args.yes,
         ):
             print("Left as it is — still safe in the vault.")
@@ -915,14 +920,16 @@ def _cmd_quarantine_delete(args: argparse.Namespace) -> int:
             print(f"Error: no vault entry matches '{args.id}'.", file=sys.stderr)
             return EXIT_ERROR
         if not _confirm(
-            f"Permanently delete {entry.original_path} from the vault? "
-            "This cannot be undone. [y/N] ",
+            f"Permanently delete "
+            f"{display_safe(str(entry.original_path))} from the "
+            "vault? This cannot be undone. [y/N] ",
             args.yes,
         ):
             print("Left as it is — still safe in the vault.")
             return EXIT_CLEAN
         vault.delete_permanent(entry.id)
-        print(f"Permanently deleted: {entry.original_path}")
+        print(f"Permanently deleted: "
+              f"{display_safe(str(entry.original_path))}")
         print("The vault keeps a record that it was here and why; "
               "the file itself is gone.")
         return EXIT_CLEAN
@@ -951,12 +958,14 @@ def _cmd_quarantine_allow(args: argparse.Namespace) -> int:
         if details is not None:
             print(
                 "The protection service reports: "
-                f"{shown_path} "
-                f"(detection: {details.get('detection_name') or '—'})."
+                f"{display_safe(str(shown_path))} "
+                f"(detection: "
+                f"{display_safe(str(details.get('detection_name') or '—'))})."
             )
         if not _confirm(
-            f"Vouch for {shown_path}? Argus will restore "
-            "it and leave this exact file alone from now on. [y/N] ",
+            f"Vouch for {display_safe(str(shown_path))}? Argus "
+            "will restore it and leave this exact file alone "
+            "from now on. [y/N] ",
             args.yes,
         ):
             print("Left as it is — still in the vault.")
@@ -973,8 +982,9 @@ def _cmd_quarantine_allow(args: argparse.Namespace) -> int:
             print(f"Error: no vault entry matches '{args.id}'.", file=sys.stderr)
             return EXIT_ERROR
         if not _confirm(
-            f"Vouch for {entry.original_path}? Argus will restore it "
-            "and leave this exact file alone from now on. [y/N] ",
+            f"Vouch for {display_safe(str(entry.original_path))}? "
+            "Argus will restore it and leave this exact file alone "
+            "from now on. [y/N] ",
             args.yes,
         ):
             print("Left as it is — still in the vault.")
@@ -984,7 +994,7 @@ def _cmd_quarantine_allow(args: argparse.Namespace) -> int:
             config_path=str(resolve_config_path(args)), history=history,
         )
         outcome = engine.allow_entry(entry.id, confirmed=True)
-        print(outcome.message)
+        print(display_safe(outcome.message))
         return EXIT_CLEAN
     except (ActionError, QuarantineError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -1081,7 +1091,7 @@ def _via_service(
         sha256=sha256,
         requested_by="Argus CLI",
     )
-    print(result.message)
+    print(display_safe(result.message))
     return EXIT_CLEAN if result.ok else EXIT_ERROR
 
 
@@ -1166,8 +1176,10 @@ def _cmd_pending_approve(args: argparse.Namespace) -> int:
         if details is not None:
             print(
                 "The protection service reports: "
-                f"{details['action']} {details['path']} "
-                f"(detection: {details.get('detection_name') or '—'})."
+                f"{display_safe(str(details['action']))} "
+                f"{display_safe(str(details['path']))} "
+                f"(detection: "
+                f"{display_safe(str(details.get('detection_name') or '—'))})."
             )
             return _via_service(
                 "approve-pending",
@@ -1189,7 +1201,7 @@ def _cmd_pending_approve(args: argparse.Namespace) -> int:
             config_path=str(resolve_config_path(args)), history=history,
         )
         outcome = engine.approve(pending.id)
-        print(outcome.message)
+        print(display_safe(outcome.message))
         return EXIT_CLEAN
     except (ActionError, QuarantineError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
@@ -1216,8 +1228,10 @@ def _cmd_pending_reject(args: argparse.Namespace) -> int:
         if details is not None:
             print(
                 "The protection service reports: "
-                f"{details['action']} {details['path']} "
-                f"(detection: {details.get('detection_name') or '—'})."
+                f"{display_safe(str(details['action']))} "
+                f"{display_safe(str(details['path']))} "
+                f"(detection: "
+                f"{display_safe(str(details.get('detection_name') or '—'))})."
             )
             return _via_service(
                 "reject-pending",
@@ -1239,7 +1253,8 @@ def _cmd_pending_reject(args: argparse.Namespace) -> int:
             config_path=str(resolve_config_path(args)), history=history,
         )
         engine.reject(pending.id)
-        print(f"Declined. {pending.path} is left exactly as it is.")
+        print(f"Declined. {display_safe(str(pending.path))} is "
+              "left exactly as it is.")
         return EXIT_CLEAN
     except (ActionError, QuarantineError) as exc:
         print(f"Error: {exc}", file=sys.stderr)

@@ -422,7 +422,14 @@ def _looks_like_script(head: bytes) -> bool:
     # (Detection still requires rule/heuristic hits — routing
     # alone flags nothing, so an ordinary UTF-16 document
     # stays Clean.)
-    if _u16le_segment_spans(head):
+    # Only the segment's EXISTENCE is needed here, so the fast
+    # lane test answers instead of the pair regex: the two are
+    # pinned to agree on the first segment by the differential
+    # test in test_fixround3, and the regex costs tens of ms
+    # per window on segment-free data (sweep #5). The full span
+    # list is still computed where it is actually consumed —
+    # the segment-wise decode in _decode_script.
+    if _u16le_segment_offset(head) is not None:
         return True
     return False
 
@@ -532,7 +539,11 @@ def _window_says_script(window: bytes) -> bool:
     lowered = window.lower()
     if any(marker in lowered for marker in _SCRIPT_MARKERS):
         return True
-    if _u16le_segment_spans(window):
+    # Existence only — the fast lane test, as in
+    # _looks_like_script (see its note; the pair regex on a
+    # 256 KB segment-free window measured ~56 ms, the lane
+    # test ~1 ms, with the same verdict).
+    if _u16le_segment_offset(window) is not None:
         return True
     for parity in (0, 1):
         folded = window[parity::2].lower()

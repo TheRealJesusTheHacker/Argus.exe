@@ -48,6 +48,7 @@ from .realtime import RealtimeEngine, RealtimeEvent
 from .reporting import History
 from .rules import BUILTIN_RULES, Rule, load_rules
 from .signatures import SignatureDB, SignatureError, bootstrap_signature_db
+from .textsafe import display_safe
 
 log = logging.getLogger("argus.service")
 
@@ -411,7 +412,10 @@ class ArgusService:
                 log.exception("action layer failed on a real-time event")
                 outcome = None
             if outcome is not None:
-                log.info("real-time action: %s", outcome.message)
+                # The message can carry a file's name; the log is
+                # a line-oriented surface, so it goes through the
+                # same display funnel as the CLI's (sweep #5).
+                log.info("real-time action: %s", display_safe(outcome.message))
                 # The queue and/or vault may have changed — republish
                 # the read-only views the GUI reads (fingerprinted,
                 # so an unchanged view is not rewritten).

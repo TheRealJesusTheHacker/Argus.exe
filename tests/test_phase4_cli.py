@@ -111,6 +111,52 @@ def test_quarantine_list_and_restore_via_cli(cli_env, capsys):
     assert (cli_env["target"] / "eicar.com").read_bytes() == EICAR
 
 
+def test_quarantine_restore_and_delete_escape_forged_names(
+    cli_env, capsys
+):
+    """Sweep #5: the v1.2.9 display funnel missed the quarantine
+    restore/delete surfaces. A quarantined file whose NAME
+    carries a newline and a fake verdict line must print
+    escaped, on one line, in the restore output and the delete
+    confirmation path — while the file itself keeps its true
+    name on disk (escaping is display-only)."""
+    evil_name = "innocent.txt\n[MALICIOUS] forged.exe was flagged"
+    try:
+        (cli_env["target"] / evil_name).write_bytes(EICAR)
+    except OSError:
+        pytest.skip("platform forbids control characters in file names")
+    _scan(cli_env, "--quarantine")
+    capsys.readouterr()
+    vault = Vault.open(cli_env["vault_dir"])
+    entry = next(
+        e for e in vault.list_entries()
+        if e.original_path.endswith(evil_name)
+    )
+    vault.close()
+
+    code = main(["quarantine", "restore", entry.id[:12]])
+    assert code == EXIT_CLEAN
+    out = capsys.readouterr().out
+    assert "\n[MALICIOUS] forged.exe" not in out
+    assert "\\x0a[MALICIOUS] forged.exe" in out
+    # The restored file kept its true (unescaped) name.
+    assert (cli_env["target"] / evil_name).read_bytes() == EICAR
+
+    _scan(cli_env, "--quarantine")
+    capsys.readouterr()
+    vault = Vault.open(cli_env["vault_dir"])
+    entry = next(
+        e for e in vault.list_entries(status="quarantined")
+        if e.original_path.endswith(evil_name)
+    )
+    vault.close()
+    code = main(["quarantine", "delete", entry.id[:12], "--yes"])
+    assert code == EXIT_CLEAN
+    out = capsys.readouterr().out
+    assert "\n[MALICIOUS] forged.exe" not in out
+    assert "\\x0a[MALICIOUS] forged.exe" in out
+
+
 def test_quarantine_delete_via_cli_requires_yes_when_not_tty(cli_env):
     _scan(cli_env, "--quarantine")
     vault = Vault.open(cli_env["vault_dir"])

@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 
 from .entropy import HIGH_ENTROPY_THRESHOLD, EntropySummary
-from .pe import PEInfo
+from .pe import PEInfo, Section
 
 
 @dataclass(frozen=True)
