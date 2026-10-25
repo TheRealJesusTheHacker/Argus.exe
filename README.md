@@ -105,9 +105,17 @@ Remove it with `sudo apt remove argus` (vault and history are kept) or `sudo apt
 
 Requires Python 3.11 or newer.
 
+Install the dependency set hash-verified first (fleet
+`--require-hashes` policy — see `REQUIRE-HASHES.md`), then the
+package itself against that set:
+
 ```bash
-pip install ".[gui,windows]"   # engine + GUI + Windows service layers (Windows)
-pip install ".[gui]"            # engine + GUI (Linux: the platform layer is stdlib)
+# Windows (CPython 3.12):
+pip install --require-hashes -r packaging/requirements-ci.lock.txt
+pip install --no-deps --no-build-isolation ".[gui,windows]"   # engine + GUI + Windows service layers
+# Linux:
+pip install --require-hashes -r packaging/requirements-ci-linux.lock.txt
+pip install --no-deps --no-build-isolation ".[gui]"            # engine + GUI (Linux: the platform layer is stdlib)
 python -m argus.gui             # the GUI (or: argus-gui)
 python -m argus sigdb init      # build a signature database
 python -m argus scan <path>     # scan from the command line
@@ -115,7 +123,7 @@ python -m argus watch           # real-time protection in the foreground
 python -m argus service install # (Windows, admin) install the service
 ```
 
-The engine core is pure Python standard library; PySide6 is the GUI layer, pywin32 serves only the Windows service / registration modules, and the Linux platform layer (systemd, the verified socket, inotify, dpkg trust) is standard library too — `ctypes` and `dpkg-query` / `systemctl`, nothing else.
+The engine core is pure Python standard library; PySide6 is the GUI layer, pywin32 serves only the Windows service / registration modules, and the Linux platform layer (systemd, the verified socket, inotify, dpkg trust) is standard library too — `ctypes` and `dpkg-query` / `systemctl`, nothing else. A plain `pip install ".[gui]"` also works — the pyproject extras are minimums for that convenience path — but the hash-verified sequence above is the reproducible one this project builds and tests with; `REQUIRE-HASHES.md` records the policy, the locks, and the bounded exceptions.
 
 ## Usage
 
@@ -202,7 +210,8 @@ Exclusions added by choosing **Allow** are merged into the on-disk config rather
 ```bash
 git clone https://github.com/TheRealJesusTheHacker/Argus.exe.git
 cd Argus.exe
-pip install ".[gui]"        # add the "windows" extra on Windows
+pip install --require-hashes -r packaging/requirements-ci-linux.lock.txt   # hash-verified deps (Linux; on Windows use packaging/requirements-ci.lock.txt, CPython 3.12)
+pip install --no-deps --no-build-isolation ".[gui]"   # add the "windows" extra on Windows
 python -m pytest            # the full suite
 ```
 

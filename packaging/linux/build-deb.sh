@@ -9,8 +9,9 @@
 # start the protection service.
 #
 # Run from anywhere:  bash packaging/linux/build-deb.sh
-# Requires: python3, PyInstaller (packaging/requirements-ci-linux.txt),
-# dpkg-deb. Output: dist/Argus.deb
+# Requires: python3, PyInstaller (installed hash-verified from
+# packaging/requirements-ci-linux.lock.txt), dpkg-deb.
+# Output: dist/Argus.deb
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -23,7 +24,7 @@ command -v dpkg-deb >/dev/null 2>&1 || {
 }
 command -v pyinstaller >/dev/null 2>&1 || {
     echo "build-deb: pyinstaller not found" \
-         "(pip install -r packaging/requirements-ci-linux.txt)." >&2
+         "(pip install --require-hashes -r packaging/requirements-ci-linux.lock.txt)." >&2
     exit 1
 }
 

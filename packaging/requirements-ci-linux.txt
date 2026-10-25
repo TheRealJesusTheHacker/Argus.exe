@@ -4,6 +4,12 @@
 # build with the same libraries every time. Every version below
 # exists on PyPI (verified 2026-10-19).
 #
+# Hash-verified installs use the sibling lock (fleet
+# --require-hashes policy, 2026-10-25):
+#   pip install --require-hashes -r packaging/requirements-ci-linux.lock.txt
+# This file stays the human-edited pin source; after any deliberate
+# bump here, regenerate the lock before landing (REQUIRE-HASHES.md).
+#
 # The Argus package itself is installed separately with
 # `pip install --no-deps ".[gui]"` so these pins stay the single
 # source of truth. No pywin32 / pefile / pywin32-ctypes here:

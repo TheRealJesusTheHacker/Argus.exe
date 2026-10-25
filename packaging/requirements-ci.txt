@@ -11,6 +11,12 @@
 # single source of truth (the pyproject extras are minimums for
 # end users installing from source, not for the release build).
 #
+# Hash-verified installs use the sibling lock (fleet
+# --require-hashes policy, 2026-10-25):
+#   pip install --require-hashes -r packaging/requirements-ci.lock.txt
+# This file stays the human-edited pin source; after any deliberate
+# bump here, regenerate the lock before landing (REQUIRE-HASHES.md).
+#
 # P1-27: EVERY build-relevant package is pinned here — not just
 # the four headline names. PyInstaller's own dependency tree
 # (hooks-contrib, pefile, altgraph, pywin32-ctypes, packaging,

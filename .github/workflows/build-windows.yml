@@ -65,10 +65,17 @@ jobs:
           }
           Write-Host "Release tag $tag matches argus.__version__ $code."
 
+      # Hash-verified install (fleet --require-hashes policy,
+      # 2026-10-25): the lock is the full resolved set for
+      # packaging/requirements-ci.txt, and any hash mismatch fails
+      # the build. The package itself is then installed with
+      # --no-build-isolation so its exact-pinned build backend
+      # (setuptools==84.1.0, pyproject.toml) is the hash-verified
+      # copy from the lock, not an unverified isolation download.
       - name: Install dependencies
         run: |
-          pip install -r packaging/requirements-ci.txt
-          pip install --no-deps ".[gui,windows]"
+          pip install --require-hashes -r packaging/requirements-ci.lock.txt
+          pip install --no-deps --no-build-isolation ".[gui,windows]"
 
       - name: Run the test suite (GUI offscreen)
         env:
@@ -170,10 +177,13 @@ jobs:
             libegl1 libgl1 libfontconfig1 libglib2.0-0 \
             libxkbcommon0 libdbus-1-3 desktop-file-utils
 
+      # Hash-verified install, same policy as the Windows job:
+      # the lock is the full resolved set for
+      # packaging/requirements-ci-linux.txt.
       - name: Install dependencies
         run: |
-          pip install -r packaging/requirements-ci-linux.txt
-          pip install --no-deps ".[gui]"
+          pip install --require-hashes -r packaging/requirements-ci-linux.lock.txt
+          pip install --no-deps --no-build-isolation ".[gui]"
 
       - name: Run the test suite (GUI offscreen)
         env:

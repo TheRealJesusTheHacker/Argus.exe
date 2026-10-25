@@ -1,0 +1,62 @@
+# Hash lock — fleet --require-hashes rollout (owner policy, 2026-10-25).
+# Every install from this set must verify hashes and fail loudly on
+# any mismatch:
+#     pip install --require-hashes -r packaging/requirements-ci.lock.txt
+# The lock is the full resolved set (direct + transitive) for the
+# source input packaging/requirements-ci.txt, at the exact versions that input pins today.
+# A version bump is not landed until its hashes are locked here:
+# regenerate after any deliberate bump (see REQUIRE-HASHES.md).
+# Target: the Windows release job (windows-latest, CPython 3.12,
+# win_amd64) in .github/workflows/build-windows.yml.
+# Generated on Linux by resolving packaging/requirements-ci.txt with
+#     pip download --platform win_amd64 --python-version 312 \
+#         --implementation cp --abi cp312 --abi abi3 --abi none \
+#         --only-binary=:all:
+# and hashing every downloaded artifact (pip-compile cannot resolve
+# this set on Linux: pywin32 publishes no Linux distribution).
+# Hashes are therefore the win_amd64 artifacts pip selects for
+# CPython 3.12 on Windows — exactly the wired CI target. The one
+# entry no download from Linux can produce, colorama (pytest's
+# win32-only dependency), carries every artifact hash published by
+# the index for colorama==0.4.6 (the version a Windows resolver
+# picks for colorama>=0.4 today), cross-checked against the
+# downloaded wheel.
+altgraph==0.17.5 \
+    --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+colorama==0.4.6; sys_platform == "win32" \
+    --hash=sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44 \
+    --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
+iniconfig==2.3.1 \
+    --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7
+packaging==25.0 \
+    --hash=sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484
+pefile==2024.8.26 \
+    --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
+pluggy==1.7.0 \
+    --hash=sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec
+pygments==2.21.0 \
+    --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+pyinstaller==6.22.3 \
+    --hash=sha256:500bd58c7bf7e584a8435adccbd763a0b918d5c12b08d74ff50fd79b2915458b
+pyinstaller-hooks-contrib==2026.8 \
+    --hash=sha256:6d21d65323ea4467753afc21f52d7d0e69416ae8101dd88269bf273ad48db084
+pyside6==6.12.0 \
+    --hash=sha256:31a8d2893f2f28ab483b1534dde0438f27af6e234593de30425cb4729052d8f8
+pyside6-addons==6.12.0 \
+    --hash=sha256:98d8d62010da6605344cee83e5c96fb846170a1f2d924523f10f5d92078b02b0
+pyside6-essentials==6.12.0 \
+    --hash=sha256:c9a95102aa23c1f86516a30d5a9be37552d324eee7e567eb7508973f1218cb42
+pyside6-pdf==6.12.0.140 \
+    --hash=sha256:4971ba1a0ca15e7c29cfd808e9600aeb46b2305dad01456eb09fa3197166268e
+pyside6-webengine==6.12.0.140 \
+    --hash=sha256:f9b61b1d457a591ee590a6b80515f25a3e61e2576a2a0a70566380f9d9de4ab0
+pytest==9.1.1 \
+    --hash=sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c
+pywin32==312 \
+    --hash=sha256:b457f6d628a47e8a7346ce22acb7e1a46a4a78b52e1d17e1af56871bd19a93bc
+pywin32-ctypes==0.2.3 \
+    --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8
+setuptools==84.1.0 \
+    --hash=sha256:5231689c6ac8156cd155cfb98c3fd6fb252c3e7e9bd3d78b64d3c55f132624c9
+shiboken6==6.12.0 \
+    --hash=sha256:a1906cb8116869178c64b6bab52623bbc8b4ceed7b30bfc3c9aa0f6e67f6438e
