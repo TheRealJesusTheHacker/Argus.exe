@@ -178,11 +178,12 @@ class History:
     @classmethod
     def open(cls, path: Path | str) -> "History":
         db_path = Path(path)
-        if db_path.parent and not db_path.parent.exists():
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        conn: sqlite3.Connection | None = None
         try:
+            if db_path.parent and not db_path.parent.exists():
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
             # The service, the GUI, and the CLI all write history,
             # sometimes at once: WAL + a busy timeout keep concurrent
             # writers from failing each other.
@@ -202,8 +203,20 @@ class History:
                     "files_not_fully_scanned INTEGER NOT NULL DEFAULT 0"
                 )
             conn.commit()
-        except sqlite3.Error as exc:
-            conn.close()
+        except (sqlite3.Error, OSError) as exc:
+            # EVERY open-phase failure lands here as this module's
+            # one error type, naming the path and the cause: the
+            # folder creation (a configured path on a drive that is
+            # gone, a parent that is a file, a folder Windows will
+            # not let this account write), the connect itself, and
+            # the schema setup. Before v1.2.14 the connect sat
+            # outside the translation, so a history file that could
+            # not be opened escaped as a raw sqlite3.OperationalError
+            # ("unable to open database file") and killed the GUI
+            # at launch — history is bookkeeping and must never be
+            # able to do that (see HistoryError's contract above).
+            if conn is not None:
+                conn.close()
             raise HistoryError(
                 f"could not open scan history at {db_path}: {exc}"
             ) from exc

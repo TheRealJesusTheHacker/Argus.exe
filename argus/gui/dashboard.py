@@ -141,6 +141,19 @@ class DashboardPage(QWidget):
         self.sigdb_banner.setStyleSheet(self._sigdb_alarm_style)
         layout.addWidget(self.sigdb_banner)
 
+        # Scan-history disclosure (v1.2.14): when the history store
+        # had to move — the backend's recovery ladder fell back to
+        # the standard location or to a session-only in-memory
+        # history — the dashboard says so in plain language. The
+        # numbers must never silently pretend a complete history
+        # stands behind them. Informational, not an alarm: the
+        # degradation is handled, and protection is unaffected.
+        self.history_banner = QLabel("")
+        self.history_banner.setWordWrap(True)
+        self.history_banner.setStyleSheet(self._sigdb_info_style)
+        self.history_banner.setVisible(False)
+        layout.addWidget(self.history_banner)
+
         # One-time legacy-migration notice (fix round 2, FIX 2):
         # when the service's one-time queue migration dropped
         # unverifiable pending items, say so ONCE per window
@@ -286,6 +299,12 @@ class DashboardPage(QWidget):
         self.pending_button.setVisible(numbers["pending"] > 0)
         self._refresh_sim_banner()
         self._refresh_sigdb_banner()
+        self._refresh_history_banner()
+
+    def _refresh_history_banner(self) -> None:
+        notice = getattr(self._backend, "history_notice", None)
+        self.history_banner.setText(notice or "")
+        self.history_banner.setVisible(bool(notice))
 
     #: The simulation banner's standard text (restored whenever
     #: no settings warning is being surfaced instead).

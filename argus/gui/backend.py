@@ -115,6 +115,17 @@ class GuiBackend:
         self._vault: Vault | None = None
         self._history: History | None = None
         self._actions: ActionEngine | None = None
+        #: Plain-language notice when the scan history is NOT where
+        #: it should be — the dashboard shows it verbatim, so a
+        #: degraded history is honest, never silent. None when
+        #: history opened at its configured/default location and
+        #: reads back fine (see :meth:`history`'s recovery ladder).
+        self.history_notice: str | None = None
+        #: Where the scan history actually opened. None until it is
+        #: first opened — and None again when no file location
+        #: could be opened and history is being kept in memory for
+        #: this session only.
+        self.history_path: Path | None = None
 
     # -- persistence ---------------------------------------------------
     def save_config(self) -> None:
@@ -255,11 +266,77 @@ class GuiBackend:
         )
 
     def history(self) -> History:
+        """The scan history — and it can never take the app down.
+
+        Field failure (fixed in v1.2.14): on a machine whose
+        configured history location could not be opened — a stale
+        path pinned by an older install, a drive that is gone, a
+        parent that is a file, a folder Windows would not let the
+        account write (Controlled Folder Access) — opening history
+        raised, the dashboard's first refresh called it unguarded,
+        and the GUI died at launch behind a raw SQLite error.
+
+        The open now walks a recovery ladder, logging every rung:
+
+        1. the configured location (or the standard one when no
+           location is configured) — a working configured path is
+           NEVER overridden;
+        2. the standard app-data location, created if needed;
+        3. an in-memory history for this session.
+
+        Whenever the ladder had to move, :attr:`history_notice`
+        says so in plain language for the dashboard. This method
+        does not raise.
+        """
         if self._history is None:
-            self._history = History.open(
-                Path(self.config.history_db or _default_history())
-            )
+            self._history = self._open_history()
         return self._history
+
+    def _open_history(self) -> History:
+        configured = self.config.history_db
+        primary = Path(configured or _default_history())
+        standard = Path(_default_history())
+        rungs = [primary]
+        if configured and standard != primary:
+            rungs.append(standard)
+        first_failure: str | None = None
+        for rung in rungs:
+            try:
+                opened = History.open(rung)
+            except Exception as exc:  # HistoryError by contract —
+                # the ladder is the last line, so it trusts nothing
+                log.error(
+                    "scan history could not be opened at %s: %s",
+                    rung, exc,
+                )
+                if first_failure is None:
+                    first_failure = str(exc)
+                continue
+            self.history_path = rung
+            if first_failure is not None:
+                self.history_notice = (
+                    f"Argus couldn't open its scan history — "
+                    f"{first_failure}. It's keeping history at "
+                    f"{rung} instead; history stored at the old "
+                    f"location isn't shown."
+                )
+            return opened
+        # No file location could be opened: keep history in memory
+        # so the app still runs and this session's scans still
+        # record. Nothing is written to disk, and the notice says
+        # exactly that.
+        log.error(
+            "scan history: no file location could be opened — "
+            "keeping history in memory for this session only"
+        )
+        self.history_path = None
+        self.history_notice = (
+            f"Argus couldn't open its scan history — "
+            f"{first_failure}. History is being kept only for this "
+            f"session, so the history numbers start empty. "
+            f"Protection is not affected."
+        )
+        return History.open(":memory:")
 
     def actions(self) -> ActionEngine:
         """The action surface for destructive operations — the
@@ -285,9 +362,28 @@ class GuiBackend:
     # -- dashboard numbers ---------------------------------------------
     def dashboard_numbers(self) -> dict:
         """Counts for the dashboard stat cards, from the real stores."""
-        history = self.history()
-        summary = history.summary(days=7)
-        recent = history.recent_scans(limit=1)
+        try:
+            history = self.history()
+            summary = history.summary(days=7)
+            recent = history.recent_scans(limit=1)
+            last_scan = recent[0] if recent else None
+        except Exception:
+            # The ladder in history() already degrades the OPEN;
+            # this covers a store that opens but cannot be READ
+            # (v1.2.14): the dashboard shows honest zeroes with the
+            # notice set, never a dead launch.
+            log.exception(
+                "scan history could not be read — dashboard "
+                "history numbers show zero"
+            )
+            if self.history_notice is None:
+                self.history_notice = (
+                    "Argus couldn't read its scan history, so the "
+                    "history numbers show zero for now. Protection "
+                    "is not affected."
+                )
+            summary = _empty_history_summary(days=7)
+            last_scan = None
         try:
             quarantined = self.vault().count(status="quarantined")
             pending_rows, _via = self.pending_display()
@@ -311,7 +407,7 @@ class GuiBackend:
             "files_scanned_7d": summary["files_scanned"],
             "quarantined": quarantined,
             "pending": pending,
-            "last_scan": recent[0] if recent else None,
+            "last_scan": last_scan,
             "summary": summary,
         }
 
@@ -357,6 +453,26 @@ def _default_history() -> str:
     from ..paths import default_history_db
 
     return str(default_history_db())
+
+
+def _empty_history_summary(days: int) -> dict:
+    """The zero shape of :meth:`History.summary` — the honest
+    answer when history cannot be read at all (v1.2.14)."""
+    return {
+        "days": days,
+        "scans": 0,
+        "on_demand_scans": 0,
+        "realtime_events": 0,
+        "files_scanned": 0,
+        "files_skipped": 0,
+        "files_excluded": 0,
+        "files_not_fully_scanned": 0,
+        "bytes_scanned": 0,
+        "detections": 0,
+        "by_severity": {},
+        "by_verdict": {},
+        "by_action": {},
+    }
 
 
 def _temp_dir() -> str:

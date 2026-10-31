@@ -537,8 +537,23 @@ class HistoryPage(QWidget):
         self.refresh()
 
     def refresh(self) -> None:
-        history = self._backend.history()
-        summary = history.summary(days=30)
+        try:
+            history = self._backend.history()
+            summary = history.summary(days=30)
+            detections = history.recent_detections(limit=100)
+        except Exception:
+            # A history store that cannot be read shows as EMPTY
+            # with the reason stated (v1.2.14) — this page is
+            # constructed with the main window, so raising here
+            # would kill the launch the same way the dashboard's
+            # unguarded call did.
+            log.exception("history page could not read the scan history")
+            self.summary_label.setText(
+                "History is unavailable right now — Argus couldn't "
+                "read its scan history file."
+            )
+            self.table.setRowCount(0)
+            return
         by_action = summary["by_action"]
         self.summary_label.setText(
             f"Last 30 days: {summary['scans']} scan(s), "
@@ -547,7 +562,6 @@ class HistoryPage(QWidget):
             f"{by_action.get('quarantined', 0)} quarantined, "
             f"{by_action.get('deleted', 0)} deleted."
         )
-        detections = history.recent_detections(limit=100)
         self.table.setRowCount(len(detections))
         for row, record in enumerate(detections):
             self.table.setItem(row, 0, QTableWidgetItem(record.recorded_at))
@@ -561,7 +575,14 @@ class HistoryPage(QWidget):
     def _show_report(self) -> None:
         from PySide6.QtWidgets import QDialog
 
-        text = render_text_report(self._backend.history(), days=30)
+        try:
+            text = render_text_report(self._backend.history(), days=30)
+        except Exception:
+            log.exception("history report could not be rendered")
+            text = (
+                "History is unavailable right now — Argus couldn't "
+                "read its scan history file."
+            )
         dialog = QDialog(self)
         dialog.setWindowTitle("Argus report — last 30 days")
         dialog.resize(640, 480)
